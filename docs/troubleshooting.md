@@ -638,3 +638,226 @@ def test_row_passes_large_drift_ms_is_informational():
 ---
 
 *Последнее обновление: 2026-04 | Фаза: 1.7 — Data Quality*
+
+---
+
+## Фаза 2 — Шаг 2.1–2.2: Nautilus BacktestEngine
+
+Реализация: `src/execution/data_catalog.py`, `src/execution/strategies/baseline_strategy.py`,
+`src/execution/backtest_runner.py`, `scripts/run_backtest.py`, `tests/test_backtest_engine.py`.  
+Итог: 5 ошибок → 26/26 тестов зелёные.
+
+---
+
+### [NT-001] Polars: IsADirectoryError при чтении partitioned Parquet-директории
+**Дата:** 2026-04  
+**Фаза:** 2.1 — Data Catalog
+
+**Ошибка:**
+```
+IsADirectoryError: expected a file path;
+'/mnt/hdd/AtomiCortex/data/features/exchange=BINANCE_UM/
+symbol=BTCUSDT/klines_4h/' is a directory
+```
+
+**Причина:**  
+Данные хранятся в Hive-партициях: `klines_4h/date=YYYY-MM-DD/part-0.parquet`.  
+`pl.read_parquet()` ожидает путь до конкретного файла — передача директории вызывает ошибку ещё до выполнения запроса.
+
+**Решение:**  
+Перейти на `pl.scan_parquet()` с glob-паттерном `**/*.parquet` и lazy evaluation:
+```python
+# Было:
+df = pl.read_parquet('/mnt/hdd/.../klines_4h/')
+
+# Стало:
+df = (
+    pl.scan_parquet('/mnt/hdd/.../klines_4h/**/*.parquet', hive_partitioning=False)
+    .filter((pl.col("open_time") >= start_ms) & (pl.col("open_time") < end_ms))
+    .collect()
+)
+```
+
+**Файл:** `src/execution/data_catalog.py:90–102`  
+**Что не трогали:** структура директорий данных, Parquet-файлы, Фаза 1 pipeline.
+
+---
+
+### [NT-002] Polars: DuplicateError — конфликт Hive-схемы и колонок файла
+**Дата:** 2026-04  
+**Фаза:** 2.1 — Data Catalog
+
+**Ошибка:**
+```
+polars.exceptions.DuplicateError: invalid Hive partition schema
+
+Extending the schema with the Hive partition schema would create
+duplicate fields.
+
+This error occurred with the following context stack:
+    [1] 'parquet scan' failed
+    [2] 'slice' input failed to resolve
+```
+
+**Причина:**  
+Путь `exchange=BINANCE_UM/symbol=BTCUSDT/` содержит Hive-сегменты. Polars по умолчанию
+(`hive_partitioning=True`) парсит их как дополнительные колонки. Но в самих `.parquet`-файлах
+уже есть колонка `symbol` — возникает дублирование при расширении схемы.
+
+**Решение:**  
+`hive_partitioning=False`. Фильтрация по дате — через колонку `open_time` (unix ms) внутри файлов:
+```python
+pl.scan_parquet(pattern, hive_partitioning=False)
+```
+
+**Файл:** `src/execution/data_catalog.py:93` (`load_bar_data`) и `:128` (`load_trade_data`)  
+**Что не трогали:** структура Parquet, колонки в файлах, код Фазы 1.
+
+---
+
+### [NT-003] Nautilus: BarType — неверный kwarg `spec` и int вместо AggregationSource enum
+**Дата:** 2026-04  
+**Фаза:** 2.1 — Data Catalog
+
+**Ошибка:**
+```
+TypeError: __init__() got an unexpected keyword argument 'spec'
+  File "nautilus_trader/model/data.pyx", line 1155, in
+  nautilus_trader.model.data.BarType.__init__
+```
+
+**Причина:**  
+Два независимых несоответствия в одном вызове:
+
+1. Именованный аргумент — `bar_spec`, а не `spec`  
+2. `aggregation_source` ожидает `AggregationSource` enum, не целое число  
+
+`inspect.signature(BarType.__init__)` возвращает `(self, /, *args, **kwargs)` — Cython не
+экспортирует параметры. Правильные имена раскрывает только `help(BarType)`.
+
+```
+# help(BarType) показывает:
+BarType(InstrumentId instrument_id,
+        BarSpecification bar_spec,
+        AggregationSource aggregation_source=AggregationSource.EXTERNAL)
+```
+
+**Решение:**
+```python
+# Было:
+bar_type = BarType(
+    instrument_id=instrument_id,
+    spec=BarSpecification(4, BarAggregation.HOUR, PriceType.LAST),
+    aggregation_source=2,
+)
+
+# Стало:
+from nautilus_trader.model.enums import AggregationSource
+bar_spec = BarSpecification(4, BarAggregation.HOUR, PriceType.LAST)
+bar_type = BarType(instrument_id, bar_spec, AggregationSource.EXTERNAL)
+```
+
+**Правило:** для Cython-классов Nautilus всегда использовать `help()`, а не `inspect.signature()`.
+
+**Файл:** `src/execution/data_catalog.py:74–76`  
+**Что не трогали:** `BarSpecification` (аргументы корректны), `InstrumentId`, `PriceType`.
+
+---
+
+### [NT-004] `inspect.signature` возвращает строку вместо класса — `from __future__ import annotations`
+**Дата:** 2026-04  
+**Фаза:** 2.2 — BacktestRunner
+
+**Ошибка:**
+```
+TypeError: 'str' object is not callable
+  src/execution/backtest_runner.py:119: TypeError
+```
+
+Стектрейс указывал на строку:
+```python
+config_type = sig.parameters["config"].annotation   # -> "BuyAndHoldConfig" (str!)
+strategy = strategy_class(config=config_type(**full_strategy_config))
+#                                 ^^^^^^^^^^ вызов строки → TypeError
+```
+
+**Причина:**  
+В `baseline_strategy.py` объявлено `from __future__ import annotations` (PEP 563).
+Это делает **все** аннотации в модуле ленивыми строками — они не вычисляются при определении
+класса. `inspect.signature().parameters["config"].annotation` возвращает именно строку
+`"BuyAndHoldConfig"`, а не класс. Попытка вызвать строку как функцию → `TypeError`.
+
+Это подводный камень: в модулях без `from __future__ import annotations` тот же код работает.
+
+**Решение:**  
+`typing.get_type_hints()` вычисляет строки в контексте исходного модуля через `__globals__`:
+```python
+# Было:
+import inspect
+sig = inspect.signature(strategy_class.__init__)
+config_type = sig.parameters["config"].annotation   # "BuyAndHoldConfig" — строка
+
+# Стало:
+import typing
+hints = typing.get_type_hints(strategy_class.__init__)
+config_type = hints["config"]                        # <class 'BuyAndHoldConfig'>
+```
+
+**Файл:** `src/execution/backtest_runner.py:107–111`  
+**Что не трогали:** `baseline_strategy.py` (строка `from __future__ import annotations` оставлена),
+сигнатура метода `run(strategy_class, strategy_config: dict)`.
+
+---
+
+### [NT-005] pytest.approx: tolerance ±$1.0 поглотил реальную разницу equity $0.50
+**Дата:** 2026-04  
+**Фаза:** 2.2 — Tests
+
+**Ошибка:**
+```
+AssertionError: 10000.50585595 != 10000.0 ± 1.0e+00
+ +  where 10000.50585595 = BacktestResult(...).end_equity
+ +  and   10000.0 ± 1.0e+00 = pytest.approx(10000.0, rel=0.0001)
+tests/test_backtest_engine.py:197: AssertionError
+```
+
+**Причина:**  
+`pytest.approx(start_equity, rel=1e-4)` вычисляет допуск как `rel × value = 1e-4 × 10 000 = ±1.0 USDT`.
+Реальное изменение equity составило $0.51 — меньше допуска, тест прошёл как «приблизительно равны».
+
+Корень: тестовая позиция 0.001 BTC при $42 300 = $42.3 номинала. BTC вырос на ~1.25% за период
+→ P&L $0.53, минус комиссии $0.04 = $0.49. `leverage=5` не умножает `trade_size` автоматически —
+он лишь определяет доступное плечо; фактический объём всегда равен переданному `trade_size`.
+
+**Решение:**  
+Проверять абсолютную разницу напрямую:
+```python
+# Было:
+assert result.end_equity != pytest.approx(result.start_equity, rel=1e-4)
+
+# Стало:
+assert abs(result.end_equity - result.start_equity) > 0.01
+```
+
+**Файл:** `tests/test_backtest_engine.py:197`  
+**Что не трогали:** логику расчёта equity, `BacktestRunner`, 25 остальных тестов.
+
+---
+
+### Итоговая таблица Фазы 2 (Шаг 2.1–2.2)
+
+| ID | Файл | Суть | Инструмент диагностики |
+|---|---|---|---|
+| NT-001 | `data_catalog.py:90` | `read_parquet` на директорию | Traceback |
+| NT-002 | `data_catalog.py:93,128` | Hive-схема дублирует колонку `symbol` | Polars DuplicateError |
+| NT-003 | `data_catalog.py:74` | BarType: kwarg `spec` → `bar_spec`, int → enum | `help(BarType)` |
+| NT-004 | `backtest_runner.py:107` | `inspect.signature` возвращает строку из-за PEP 563 | TypeError: str not callable |
+| NT-005 | `tests/test_backtest_engine.py:197` | `pytest.approx rel=1e-4` поглощает $0.50 разницу | AssertionError |
+
+**Общий паттерн Nautilus Trader:** для всех Cython-классов (`BarType`, `CryptoPerpetual`,
+`BacktestEngine`, etc.) единственный надёжный способ узнать параметры — `help(ClassName)`.
+`inspect.signature()` возвращает `(self, /, *args, **kwargs)` и бесполезен.
+
+---
+
+*Последнее обновление: 2026-04 | Фаза: 2.2 — BacktestEngine*
