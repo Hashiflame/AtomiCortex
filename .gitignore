@@ -14,10 +14,10 @@ build/
 venv/
 env/
 
-# Environment variables (НИКОГДА не пушить!)
+# Environment variables 
 .env
 
-# Data (слишком большие для git)
+# Data 
 data/
 logs/
 *.log
