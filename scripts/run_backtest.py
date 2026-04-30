@@ -15,9 +15,11 @@ if str(_ROOT) not in sys.path:
 
 from src.execution.backtest_runner import BacktestConfig, BacktestRunner
 from src.execution.strategies.baseline_strategy import BuyAndHoldStrategy
+from src.execution.strategies.random_entry_strategy import RandomEntryStrategy
 
 _STRATEGIES = {
     "buy_and_hold": BuyAndHoldStrategy,
+    "random_entry": RandomEntryStrategy,
 }
 
 _DEFAULT_TRADE_SIZE = {

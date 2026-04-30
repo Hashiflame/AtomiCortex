@@ -16,6 +16,7 @@ from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Money
 from nautilus_trader.trading.strategy import Strategy
 
+from src.execution.cost_model import CostModel, FeeConfig
 from src.execution.data_catalog import AtomiCortexCatalog
 
 
@@ -36,6 +37,9 @@ class BacktestConfig:
     data_dir: Path = field(
         default_factory=lambda: Path("/mnt/hdd/AtomiCortex/data/features")
     )
+    fee_config: FeeConfig = field(default_factory=FeeConfig)
+    avg_daily_volume_usdt: float = 30_000_000_000.0  # $30B default for BTC
+    realized_volatility: float = 0.60  # 60% annualised
 
 
 @dataclass
@@ -49,6 +53,12 @@ class BacktestResult:
     start_equity: float
     end_equity: float
     equity_curve: list[tuple[datetime, float]]
+    # Cost analytics (analytically estimated)
+    total_fees_paid: float = 0.0
+    total_slippage_cost: float = 0.0
+    total_funding_cost: float = 0.0
+    total_cost_usdt: float = 0.0
+    avg_cost_per_trade_bps: float = 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,6 +154,24 @@ class BacktestRunner:
 
         engine.dispose()
 
+        # ── Cost analytics (analytical estimate) ─────────────────────────────
+        total_fees_paid, total_slippage_cost, total_funding_cost = _estimate_costs(
+            cfg=cfg,
+            strategy_config=strategy_config,
+            bars=bars,
+            total_orders=nautilus_result.total_orders,
+        )
+        total_cost_usdt = total_fees_paid + total_slippage_cost + total_funding_cost
+        num_rt = nautilus_result.total_orders // 2
+        trade_size = strategy_config.get("trade_size", 0.001)
+        avg_price = _avg_price(bars)
+        avg_notional = trade_size * avg_price
+        avg_cost_per_trade_bps = (
+            (total_cost_usdt / num_rt / avg_notional * 10_000)
+            if (num_rt > 0 and avg_notional > 0)
+            else 0.0
+        )
+
         return BacktestResult(
             total_return_pct=total_return_pct,
             sharpe_ratio=sharpe,
@@ -154,6 +182,11 @@ class BacktestRunner:
             start_equity=start_equity,
             end_equity=end_equity,
             equity_curve=equity_curve,
+            total_fees_paid=total_fees_paid,
+            total_slippage_cost=total_slippage_cost,
+            total_funding_cost=total_funding_cost,
+            total_cost_usdt=total_cost_usdt,
+            avg_cost_per_trade_bps=avg_cost_per_trade_bps,
         )
 
     def print_report(self, result: BacktestResult) -> None:
@@ -178,6 +211,12 @@ class BacktestRunner:
         print(sep)
         _row("Total Trades", str(result.total_trades))
         _row("Equity Curve Points", str(len(result.equity_curve)))
+        print(sep)
+        _row("Est. Total Fees", f"${result.total_fees_paid:.4f}")
+        _row("Est. Total Slippage", f"${result.total_slippage_cost:.4f}")
+        _row("Est. Funding Cost", f"${result.total_funding_cost:.4f}")
+        _row("Est. Total Cost", f"${result.total_cost_usdt:.4f}")
+        _row("Avg Cost/Trade", f"{result.avg_cost_per_trade_bps:.2f} bps")
         print(sep)
         print()
 
@@ -212,3 +251,47 @@ def _max_drawdown(equity: list[float]) -> float:
             if dd > max_dd:
                 max_dd = dd
     return max_dd
+
+
+def _avg_price(bars: list) -> float:
+    if not bars:
+        return 0.0
+    return (bars[0].open.as_double() + bars[-1].close.as_double()) / 2
+
+
+_TYPICAL_FUNDING_RATE = 0.0001  # 0.01% per 8h — typical BTC perpetual
+
+
+def _estimate_costs(
+    cfg: BacktestConfig,
+    strategy_config: dict[str, Any],
+    bars: list,
+    total_orders: int,
+) -> tuple[float, float, float]:
+    """Return (total_fees, total_slippage, total_funding) using CostModel analytics."""
+    trade_size = strategy_config.get("trade_size", 0.001)
+    avg_price = _avg_price(bars)
+    avg_notional = trade_size * avg_price
+    num_rt = total_orders // 2
+
+    if avg_notional <= 0 or num_rt <= 0:
+        return 0.0, 0.0, 0.0
+
+    cm = CostModel()
+    fee_per_rt = (
+        cm.calculate_fee(avg_notional, is_maker=False, fee_config=cfg.fee_config) * 2
+    )
+    slippage_per_rt = (
+        cm.calculate_slippage(avg_notional, cfg.avg_daily_volume_usdt, cfg.realized_volatility) * 2
+    )
+    total_fees = num_rt * fee_per_rt
+    total_slippage = num_rt * slippage_per_rt
+
+    total_hours = (cfg.end - cfg.start).total_seconds() / 3600
+    total_funding = cm.calculate_funding_cost(
+        position_size=avg_notional,
+        funding_rate=_TYPICAL_FUNDING_RATE,
+        hours_held=total_hours,
+        is_long=True,
+    )
+    return total_fees, total_slippage, total_funding

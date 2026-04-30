@@ -10,8 +10,9 @@ AI-powered crypto futures trading system.
 | **1** | Data Pipeline | ✅ Completed | 62/62 |
 | **2.1** | Data Catalog (Parquet → Nautilus) | ✅ Completed | 26/26 |
 | **2.2** | BacktestEngine + BuyAndHold strategy | ✅ Completed | 26/26 |
-| **2.3** | Feature Engineering | 🔲 Planned | — |
-| **2.4** | ML Models (LightGBM) | 🔲 Planned | — |
+| **2.3** | Cost Model (fees + slippage + funding) | ✅ Completed | 28/28 |
+| **2.4** | Feature Engineering | 🔲 Planned | — |
+| **2.5** | ML Models (LightGBM) | 🔲 Planned | — |
 | **3** | Live Trading (Nautilus LiveNode) | 🔲 Planned | — |
 
 
