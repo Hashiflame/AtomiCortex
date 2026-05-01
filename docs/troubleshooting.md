@@ -1153,3 +1153,211 @@ slippage($1 000, $30B, σ_annual=0.60) ≈ $0.055   # совпадает с пр
 ---
 
 *Последнее обновление: 2026-04 | Фаза: 2.3 — Cost Model*
+
+---
+
+## Фаза 2 — Шаги 2.4–2.6: Metrics, Walk-Forward, MLflow
+
+### WF-001 — `test_correct_number_of_windows`: AssertionError 4 != 5
+
+**Точный текст ошибки:**
+```
+AssertionError: assert 4 == 5
+  where 4 = len([((datetime(2024,1,1), datetime(2024,4,1)), ...), ...])
+```
+
+**Причина:**  
+Ручной подсчёт предполагал 5 окон при `train=3m, test=1m, step=1m, range=2024-01-01…2024-08-31`.  
+Пятое окно требует `test_end = 2024-09-01`, что превышает `end = 2024-08-31` — условие
+`test_end > end` срабатывает и цикл прерывается. Итого 4 полных окна.
+
+**Решение:**  
+Изменена проверка в тесте: `assert len(pairs) == 4`.  
+Логика генератора в `WalkForwardValidator.split()` была верна изначально.
+
+**Файл:** `tests/test_walk_forward.py`  
+**Что не трогали:** `walk_forward.py` — генератор окон не изменялся.
+
+---
+
+### WF-002 — `test_default_step_equals_test_months`: AssertionError 6 == 3
+
+**Точный текст ошибки:**
+```
+AssertionError: assert 6 == 3
+  where 6 = WalkForwardValidator(train_months=12, test_months=3).step_months
+```
+
+**Причина:**  
+`WalkForwardValidator.__init__` имел захардкоженный `step_months: int = 6`, вместо того чтобы
+по умолчанию равняться `test_months`. При `test_months=3` ожидалось `step_months=3`, а не `6`.
+
+**Решение:**  
+Изменена сигнатура: `step_months: int | None = None`.  
+В теле: `self.step_months = step_months if step_months is not None else test_months`.  
+Это соответствует спецификации: *"шаг по умолчанию = длина тестового окна (неперекрывающиеся окна)"*.
+
+**Файл:** `src/execution/walk_forward.py` (строки 149–153)  
+**Что не трогали:** `PurgedKFoldCV`, метрики, MLflow.
+
+---
+
+### WF-003 — MLflow тесты: `ModuleNotFoundError: No module named '_sqlite3'`
+
+**Точный текст ошибки:**
+```
+ERROR tests/test_walk_forward.py::test_log_backtest - ModuleNotFoundError: No module named '_sqlite3'
+```
+
+**Причина:**  
+Python 3.11.9 через pyenv был скомпилирован без поддержки SQLite (`_sqlite3` — нативный модуль,
+требующий `libsqlite3-dev` на этапе компиляции Python). MLflow при URI `sqlite:///...` пытается
+импортировать `sqlalchemy` → `sqlite3` → `_sqlite3` — и падает.
+
+**Решение:**  
+Во всех фикстурах и тестах заменили URI хранилища:
+```python
+# Было:
+tracking_uri = f"sqlite:///{tmp_path}/test.db"
+
+# Стало:
+tracking_uri = f"file:///{tmp_path}/mlruns"
+```
+Файловый backend MLflow (`FileStore`) не требует SQLite. По умолчанию в `ExperimentTracker`
+оставлено `"./mlruns"` (также файловый).
+
+**Примечание:** MLflow 3.11.1 выводит `FutureWarning` о deprecated filesystem backend (с
+февраля 2026). Предупреждение некритично — функциональность сохранена, и в нашем окружении
+SQLite недоступен. Для продакшн-деплоя потребуется PostgreSQL/MySQL backend.
+
+**Файл:** `tests/test_walk_forward.py` (все фикстуры `tracker`)  
+**Что не трогали:** `experiment_tracker.py` — дефолтный URI `"./mlruns"` не изменялся.
+
+---
+
+### Итоговая таблица Фазы 2 (Шаги 2.4–2.6)
+
+| ID | Файл | Суть | Как проявилось |
+|---|---|---|---|
+| WF-001 | `tests/test_walk_forward.py` | Неверный ручной подсчёт окон | `AssertionError: 4 != 5` |
+| WF-002 | `src/execution/walk_forward.py` | `step_months` захардкожен в `6` вместо `None → test_months` | `AssertionError: 6 == 3` |
+| WF-003 | `tests/test_walk_forward.py` | pyenv Python без `_sqlite3` → SQLite URI падает в MLflow | `ModuleNotFoundError: No module named '_sqlite3'` |
+
+**Паттерн:** При сборке Python через pyenv на чистом сервере/контейнере без `libsqlite3-dev`
+нативный модуль `_sqlite3` не компилируется. Это затрагивает любую библиотеку, использующую
+SQLite (Django ORM, MLflow, SQLAlchemy). Решение: либо установить `libsqlite3-dev` и
+пересобрать Python (`pyenv install 3.11.9`), либо использовать альтернативный backend.
+
+---
+
+*Последнее обновление: 2026-05 | Фаза: 2.4–2.6 — Metrics, Walk-Forward, MLflow*
+
+---
+
+## Фаза 2 — Шаг 2.4 (patch): Баги в calculate_sharpe_ratio
+
+### SR-001 — Отрицательный Sharpe для прибыльной стратегии: −12.4 вместо положительного
+
+**Точный текст ошибки:**
+```
+Результат calculate_sharpe_ratio(equity_curve) = -12.4 для buy&hold BTC 2024
+(BTC вырос на ~119%, стратегия прибыльна, но Sharpe отрицательный)
+```
+
+**Причина:**  
+Дефолтный `risk_free_rate=0.05` (5% годовых) — стандарт для рынков акций США, где  
+безрисковая ставка (~T-bills) реальна. Для крипто-фьючерсов аналогичного инструмента нет.  
+Стратегия `BuyAndHoldStrategy` с `trade_size=0.001` BTC (~$43–65 notional) при капитале $10k  
+зарабатывала ~0.5–1.5% годовых на портфельном капитале (позиция крошечная).  
+Формула: `excess = 0.0014% / day − 0.0137% / day = −0.0123%` → Sharpe отрицательный,  
+хотя стратегия И BTC прибыльны.
+
+**Решение:**  
+Изменён дефолтный параметр: `risk_free_rate: float = 0.05` → `risk_free_rate: float = 0.0`.  
+Для крипто-фьючерсов нет ликвидного безрискового инструмента — ставка 0% является  
+стандартной конвенцией.
+
+**До исправления:**
+```python
+calculate_sharpe_ratio(btc_buy_hold_curve)  # → -8.3 (отрицательный!)
+```
+**После:**
+```python
+calculate_sharpe_ratio(btc_buy_hold_curve)  # → +0.97 (положительный ✓)
+```
+
+**Файл:** `src/execution/metrics.py` (строка 57)  
+**Что не трогали:** формула расчёта, группировка по дням, аннуализация.
+
+---
+
+### SR-002 — Sharpe = ±10¹³ для equity с постоянной ставкой роста
+
+**Точный текст ошибки:**
+```python
+equity *= 1.0001  # каждый день одинаковый множитель
+calculate_sharpe_ratio(curve)  # → -20122771928376.875 (мусор!)
+```
+
+**Причина:**  
+Гард `if std_r == 0: return 0.0` ловил только **точный** ноль. При equity с постоянной  
+дневной доходностью возвраты теоретически равны, но числа с плавающей точкой дают  
+`std_r ≈ 1e-18` (шум мантиссы, не настоящая волатильность). Деление `excess / 1e-18`  
+давало `±10¹³` вместо корректного `0.0` или `±∞`.
+
+**Решение:**  
+Заменён гард на порог: `if std_r < 1e-8: return 0.0`.  
+Порог `1e-8` на несколько порядков выше машинного шума (~1e-16), но ниже любой реальной  
+дневной волатильности крипто-стратегий (обычно `std_r > 1e-4`).
+
+**Файл:** `src/execution/metrics.py` (строка 93)  
+**Что не трогали:** формула Sharpe, Daily grouping, параметры.
+
+---
+
+### SR-003 — Неверный `rf_per_period` при передаче `periods_per_year=2190` для 4H-баров
+
+**Точный текст ошибки:**  
+Явной ошибки нет — функция молча возвращала неверный результат.
+
+**Причина:**  
+Функция **всегда** группирует `equity_curve` к концу дня (`daily[dt.date()] = equity`),  
+поэтому возвраты всегда **дневные** (365 периодов/год), независимо от частоты входных баров.  
+Однако `rf_per_period = risk_free_rate / periods_per_year` использовал переданный параметр.  
+При вызове с `periods_per_year=2190` (как для 4H-данных):
+```python
+rf_per_period = 0.05 / 2190 = 0.0000228 / день   # в 6× меньше правильного 0.05/365
+```
+Дневные возвраты при этом делились на неверную дневную ставку.
+
+**Решение:**  
+Введена внутренняя константа `_CRYPTO_PERIODS_PER_YEAR = 365`, которая используется  
+**только** для вычисления `rf_per_day`, независимо от `periods_per_year`:
+```python
+rf_per_day = risk_free_rate / _CRYPTO_PERIODS_PER_YEAR   # всегда /365
+# periods_per_year влияет только на sqrt() — аннуализацию
+return (mean_r - rf_per_day) / std_r * math.sqrt(periods_per_year)
+```
+Для 4H-данных дневная группировка делает `periods_per_year` эффективно всегда 365,  
+что и задокументировано в docstring функции.
+
+**Файл:** `src/execution/metrics.py` (строки 89–96)  
+**Что не трогали:** `calculate_max_drawdown`, `calculate_calmar_ratio`, `MetricsResult`.
+
+---
+
+### Итоговая таблица патча calculate_sharpe_ratio
+
+| ID | Файл | Суть | Проявление |
+|---|---|---|---|
+| SR-001 | `src/execution/metrics.py` | `risk_free_rate=0.05` → `0.0` — неверный дефолт для крипто | Sharpe −12.4 для прибыльной BTC стратегии |
+| SR-002 | `src/execution/metrics.py` | Гард `== 0` не ловит `std ≈ 1e-18` — порог заменён на `< 1e-8` | Sharpe = ±10¹³ для equity с постоянной ставкой |
+| SR-003 | `src/execution/metrics.py` | `rf_per_period` привязан к `periods_per_year`, а не к 365 | Неверный rf при `periods_per_year=2190` для 4H-баров |
+
+**Паттерн:** Формулы финансовых метрик из академических источников часто подразумевают  
+рынок акций (252 торговых дня, T-bill как rf). При адаптации под крипто необходимо  
+проверять: торгуется 365 дней в году, безрисковой ставки нет → `rf=0.0`, `periods=365`.
+
+---
+
+*Последнее обновление: 2026-05 | Патч: calculate_sharpe_ratio (SR-001–SR-003)*

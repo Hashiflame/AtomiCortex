@@ -11,10 +11,14 @@ AI-powered crypto futures trading system.
 | **2.1** | Data Catalog (Parquet → Nautilus) | ✅ Completed | 26/26 |
 | **2.2** | BacktestEngine + BuyAndHold strategy | ✅ Completed | 26/26 |
 | **2.3** | Cost Model (fees + slippage + funding) | ✅ Completed | 28/28 |
-| **2.4** | Feature Engineering | 🔲 Planned | — |
-| **2.5** | ML Models (LightGBM) | 🔲 Planned | — |
+| **2.4** | Metrics (Sharpe, Calmar, MaxDD, WinRate, PF) | ✅ Completed | 16/16 |
+| **2.5** | Walk-Forward + Purged K-Fold CV | ✅ Completed | 20/20 |
+| **2.6** | MLflow Experiment Tracker | ✅ Completed | 6/6 |
+| **2.7** | Feature Engineering | 🔲 Planned | — |
+| **2.8** | ML Models (LightGBM) | 🔲 Planned | — |
 | **3** | Live Trading (Nautilus LiveNode) | 🔲 Planned | — |
 
+**Total: 158/158 tests passing**
 
 ### Data
 
@@ -31,6 +35,7 @@ AI-powered crypto futures trading system.
 - **Data:** Cryptofeed + Binance Data Portal
 - **Storage:** Parquet (ZSTD) + DuckDB + QuestDB
 - **ML:** LightGBM (trend/range/highvol models)
+- **Experiment Tracking:** MLflow (filesystem backend)
 - **Bot:** Telegram signals
 
 ## Structure
@@ -43,12 +48,17 @@ src/
 │   ├── data_quality.py
 │   └── live_feed.py
 ├── execution/          # Phase 2 — backtest & live trading
-│   ├── data_catalog.py       # Parquet → Nautilus Bar/TradeTick
-│   ├── backtest_runner.py    # BacktestEngine wrapper
+│   ├── data_catalog.py           # Parquet → Nautilus Bar/TradeTick
+│   ├── backtest_runner.py        # BacktestEngine wrapper + cost analytics
+│   ├── cost_model.py             # FeeConfig, CostModel, RoundTripCost
+│   ├── metrics.py                # MetricsResult, Sharpe, Calmar, MaxDD
+│   ├── walk_forward.py           # WalkForwardValidator, PurgedKFoldCV
+│   ├── experiment_tracker.py     # MLflow integration
 │   └── strategies/
-│       └── baseline_strategy.py   # BuyAndHoldStrategy
-├── features/           # Phase 2.3 — feature engineering
-├── models/             # Phase 2.4 — LightGBM
+│       ├── baseline_strategy.py      # BuyAndHoldStrategy
+│       └── random_entry_strategy.py  # RandomEntryStrategy (cost validation)
+├── features/           # Phase 2.7 — feature engineering
+├── models/             # Phase 2.8 — LightGBM
 ├── risk/               # Phase 3 — risk engine
 └── telegram_bot/       # Phase 3 — signal bot
 
@@ -56,7 +66,9 @@ scripts/
 ├── download_historical.py
 ├── convert_to_parquet.py
 ├── check_data_quality.py
-└── run_backtest.py           # backtesting CLI
+├── run_backtest.py               # backtesting CLI
+├── validate_cost_model.py        # cost table display
+└── run_walk_forward.py           # walk-forward validation CLI
 ```
 
 ## Setup
@@ -81,9 +93,33 @@ python scripts/run_backtest.py \
     --strategy buy_and_hold
 ```
 
+## Walk-Forward Validation
+
+```bash
+python scripts/run_walk_forward.py \
+    --symbol BTCUSDT \
+    --interval 4h \
+    --start 2024-01-01 \
+    --end 2024-12-31 \
+    --strategy buy_and_hold \
+    --train-months 6 \
+    --test-months 2
+
+# Log results to MLflow
+python scripts/run_walk_forward.py --symbol BTCUSDT --mlflow
+```
+
+## Cost Model Validation
+
+```bash
+python scripts/validate_cost_model.py
+```
+
 ## Tests
 
 ```bash
-pytest tests/ -v          
-pytest tests/test_backtest_engine.py -v   
+pytest tests/ -v
+pytest tests/test_backtest_engine.py -v
+pytest tests/test_cost_model.py -v
+pytest tests/test_walk_forward.py -v
 ```
