@@ -5,7 +5,7 @@ AI-powered crypto futures trading system.
 
 ## Status
 
-| Phase | Описание | Статус | Тесты |
+| Phase | Description | Status | Tests |
 |---|---|---|---|
 | **1** | Data Pipeline | ✅ Completed | 62/62 |
 | **2.1** | Data Catalog (Parquet → Nautilus) | ✅ Completed | 26/26 |
