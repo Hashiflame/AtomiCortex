@@ -151,8 +151,8 @@ class DataStore:
             return pl.DataFrame()
 
         start_ms, end_ms = _to_ms(start), _to_ms(end)
-        where = f"calc_time >= {start_ms} AND calc_time <= {end_ms}"
-        sql = self._read_parquet_sql(files, where=where, order_by="calc_time")
+        where = f"fundingTime >= {start_ms} AND fundingTime <= {end_ms}"
+        sql = self._read_parquet_sql(files, where=where, order_by="fundingTime")
         return self._run(sql)
 
     def get_metrics(
