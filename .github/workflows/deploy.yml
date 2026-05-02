@@ -22,6 +22,14 @@ jobs:
           pip install lightgbm optuna scikit-learn scipy hurst ta
           pip install python-dotenv loguru pydantic pydantic-settings
           pip install nautilus_trader cryptofeed
+          pip install --upgrade pip
+          pip install polars numpy duckdb pyarrow zstandard pandas
+          pip install lightgbm optuna mlflow scikit-learn scipy hurst ta
+          pip install python-dotenv loguru pydantic pydantic-settings redis
+          pip install requests aiohttp httpx click tqdm
+          pip install nautilus_trader
+          pip install cryptofeed
+          pip install pytest pytest-asyncio
       
       - name: Run tests
         run: |
