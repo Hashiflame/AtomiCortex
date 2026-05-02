@@ -23,6 +23,7 @@ from src.features.microstructure import (
     add_price_features,
     add_volume_features,
 )
+from src.features.regime_detector import RegimeDetector
 from src.logger import get_logger
 
 if TYPE_CHECKING:
@@ -76,6 +77,14 @@ FEATURE_GROUPS: dict[str, list[str]] = {
         "basis_approx",
         "basis_extreme",
     ],
+    "regime": [
+        "hurst",
+        "adx",
+        "atr_pct",
+        "atr_percentile",
+        "trend_strength",
+        "regime_confidence",
+    ],
 }
 
 
@@ -119,9 +128,10 @@ class FeaturePipeline:
         1-3.  Load klines, funding_rate, metrics from DataStore.
         4-6.  Add CVD, volume, price features (microstructure).
         7-9.  Add funding, OI, basis features (derivatives).
-        10.   Drop the first ``_WARMUP_ROWS`` rows (NaN from rolling).
-        11.   Warn if any NaN remains in feature columns.
-        12.   Optionally save to Parquet (ZSTD compression).
+        10.   Detect market regime (Hurst, ADX, ATR).
+        11.   Drop the first ``_WARMUP_ROWS`` rows (NaN from rolling).
+        12.   Warn if any NaN remains in feature columns.
+        13.   Optionally save to Parquet (ZSTD compression).
 
         Returns the feature DataFrame.
         """
@@ -160,11 +170,15 @@ class FeaturePipeline:
         df = add_oi_features(df, metrics_df)
         df = add_basis_features(df)
 
-        # 10. Drop warmup rows
+        # 10. Regime detection (Hurst, ADX, ATR)
+        detector = RegimeDetector()
+        df = detector.detect_all(df)
+
+        # 11. Drop warmup rows
         df = df.slice(_WARMUP_ROWS)
         _log.info(f"After warmup trim: {len(df)} rows")
 
-        # 11. NaN audit
+        # 12. NaN audit
         feature_cols = self.get_feature_names()
         present = [c for c in feature_cols if c in df.columns]
         nan_counts = {
@@ -177,7 +191,7 @@ class FeaturePipeline:
         else:
             _log.info("NaN audit: clean")
 
-        # 12. Persist
+        # 13. Persist
         if save_to is not None:
             save_to = Path(save_to)
             save_to.parent.mkdir(parents=True, exist_ok=True)
