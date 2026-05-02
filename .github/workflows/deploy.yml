@@ -1,0 +1,48 @@
+name: Deploy to Cloud VM
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install polars numpy duckdb pyarrow zstandard
+          pip install lightgbm optuna scikit-learn scipy hurst ta
+          pip install python-dotenv loguru pydantic pydantic-settings
+          pip install nautilus_trader cryptofeed
+      
+      - name: Run tests
+        run: |
+          pip install pytest pytest-asyncio
+          pytest tests/ -x --ignore=tests/test_live_feed.py -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/AtomiCortex
+            git pull origin master
+            source .venv/bin/activate
+            pip install -r requirements.txt --quiet
+            echo "Deploy completed at $(date)"
