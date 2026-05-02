@@ -78,27 +78,19 @@ def main() -> None:
     with DataStore(args.data_dir) as store:
         pipeline = FeaturePipeline(store, args.symbol, args.interval)
         df = pipeline.build(start, end, save_to=output_path)
+        feature_names = pipeline.get_feature_names()
 
     if df.is_empty():
         print("ERROR: No data produced. Check data-dir and date range.")
         sys.exit(1)
 
-    feature_names = pipeline.get_feature_names()
     present = [f for f in feature_names if f in df.columns]
 
     # --- NaN check ---
-    nan_total = 0
-    for col in present:
-        n = df[col].null_count()
-        if df[col].dtype in (df.dtypes[df.columns.index(col)],):
-            pass
-        nan_total += n
-    # Re-check properly
-    import polars as pl
     nan_report: dict[str, int] = {}
     for col in present:
         null_n = df[col].null_count()
-        nan_n = df[col].is_nan().sum() if df[col].dtype in (pl.Float32, pl.Float64) else 0
+        nan_n = df[col].is_nan().sum() if df[col].dtype.is_float() else 0
         total = null_n + nan_n
         if total > 0:
             nan_report[col] = total

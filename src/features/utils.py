@@ -27,7 +27,7 @@ def rolling_zscore(series: pl.Expr, window: int) -> pl.Expr:
     """
     mean = series.rolling_mean(window_size=window)
     std = series.rolling_std(window_size=window)
-    return safe_divide(series - mean, std).fill_nan(0.0).fill_null(0.0)
+    return safe_divide(series - mean, std)  # safe_divide already fills NaN/null
 
 
 def rolling_correlation(x: pl.Expr, y: pl.Expr, window: int) -> pl.Expr:

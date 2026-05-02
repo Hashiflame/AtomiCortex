@@ -473,7 +473,7 @@ class ParquetConverter:
         result["columns"] = df.columns
 
         # Check for all-null key columns (timestamp)
-        key_cols = [c for c in ("open_time", "calc_time", "create_time", "transact_time") if c in df.columns]
+        key_cols = [c for c in ("open_time", "fundingTime", "create_time", "transact_time") if c in df.columns]
         for col in key_cols:
             null_count = df[col].null_count()
             if null_count == len(df):

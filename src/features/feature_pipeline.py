@@ -41,6 +41,7 @@ FEATURE_GROUPS: dict[str, list[str]] = {
         "cvd_slope_6",
         "cvd_slope_12",
         "taker_buy_ratio",
+        "volume_sma_20",
         "volume_ratio",
         "volume_zscore",
         "large_volume",
@@ -65,8 +66,8 @@ FEATURE_GROUPS: dict[str, list[str]] = {
         "funding_positive",
         "funding_cum_24h",
         "oi_value",
-        "oi_delta_1h",
         "oi_delta_4h",
+        "oi_delta_12h",
         "oi_zscore",
         "oi_quadrant",
         "ls_ratio",
@@ -167,7 +168,7 @@ class FeaturePipeline:
         feature_cols = self.get_feature_names()
         present = [c for c in feature_cols if c in df.columns]
         nan_counts = {
-            c: df[c].null_count() + (df[c].is_nan().sum() if df[c].dtype in (pl.Float32, pl.Float64) else 0)
+            c: df[c].null_count() + (df[c].is_nan().sum() if df[c].dtype.is_float() else 0)
             for c in present
         }
         bad = {c: n for c, n in nan_counts.items() if n > 0}

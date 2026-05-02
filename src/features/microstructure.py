@@ -56,9 +56,10 @@ def add_volume_features(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("volume_ratio") > 2.0).cast(pl.Int8).alias("large_volume")
     )
     # VWAP over last 6 bars (1 trading day on 4H)
+    typical = (pl.col("high") + pl.col("low") + pl.col("close")) / 3.0
     df = df.with_columns(
         safe_divide(
-            (pl.col("close") * pl.col("volume")).rolling_sum(window_size=6),
+            (typical * pl.col("volume")).rolling_sum(window_size=6),
             pl.col("volume").rolling_sum(window_size=6),
         ).alias("vwap_4h")
     )

@@ -238,7 +238,7 @@ class TestOIFeatures:
         assert actual.issubset(valid), f"Unexpected oi_quadrant values: {actual - valid}"
 
     def test_oi_delta_4h_formula(self):
-        """oi_delta_4h[i] = (oi[i] - oi[i-1]) / oi[i]."""
+        """oi_delta_4h[i] = (oi[i] - oi[i-1]) / oi[i] (shift(1) on 4H data)."""
         df = self._df_with_price_features()
         out = add_oi_features(df, _metrics(200))
         oi = out["oi_value"].to_list()
@@ -286,7 +286,7 @@ class TestFeaturePipeline:
         feature_cols = [c for c in pipeline.get_feature_names() if c in df.columns]
         for col in feature_cols:
             null_n = df[col].null_count()
-            nan_n = df[col].is_nan().sum() if df[col].dtype in (pl.Float32, pl.Float64) else 0
+            nan_n = df[col].is_nan().sum() if df[col].dtype.is_float() else 0
             assert null_n == 0, f"Column '{col}' has {null_n} nulls"
             assert nan_n == 0, f"Column '{col}' has {nan_n} NaNs"
 

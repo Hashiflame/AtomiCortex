@@ -14,6 +14,9 @@ from src.logger import get_logger
 
 _log = get_logger(__name__)
 
+# Funding rate is published every 8 hours → 3 events per day (24 / 8 = 3)
+_FUNDING_PERIODS_PER_DAY = 3
+
 # --- helpers -----------------------------------------------------------------
 
 def _zero_funding(df: pl.DataFrame) -> pl.DataFrame:
@@ -33,8 +36,8 @@ def _zero_oi(df: pl.DataFrame) -> pl.DataFrame:
     """Add zero-filled OI columns when no metrics data is available."""
     return df.with_columns([
         pl.lit(0.0).alias("oi_value"),
-        pl.lit(0.0).alias("oi_delta_1h"),
         pl.lit(0.0).alias("oi_delta_4h"),
+        pl.lit(0.0).alias("oi_delta_12h"),
         pl.lit(0.0).alias("oi_zscore"),
         pl.lit(0).cast(pl.Int8).alias("oi_quadrant"),
         pl.lit(0.0).alias("ls_ratio"),
@@ -49,10 +52,10 @@ def add_funding_features(
     df: pl.DataFrame,
     funding_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Funding rate features via asof join on open_time → fundingTime/calc_time.
+    """Funding rate features via asof join on open_time → fundingTime.
 
     Required df columns: open_time
-    funding_df columns: fundingTime (or calc_time), fundingRate (or funding_rate)
+    funding_df columns: fundingTime, fundingRate (or legacy: calc_time, funding_rate)
 
     Added columns: funding_rate, funding_abs, funding_zscore_7d,
                    funding_zscore_30d, funding_extreme, funding_positive,
@@ -94,14 +97,14 @@ def add_funding_features(
 
     df = df.with_columns([
         pl.col("funding_rate").abs().alias("funding_abs"),
-        rolling_zscore(pl.col("funding_rate"), 21).alias("funding_zscore_7d"),
-        rolling_zscore(pl.col("funding_rate"), 90).alias("funding_zscore_30d"),
+        rolling_zscore(pl.col("funding_rate"), 42).alias("funding_zscore_7d"),   # 42 bars × 4H = 7 days
+        rolling_zscore(pl.col("funding_rate"), 180).alias("funding_zscore_30d"), # 180 bars × 4H = 30 days
     ])
     df = df.with_columns([
         (pl.col("funding_zscore_7d").abs() > 2.0).cast(pl.Int8).alias("funding_extreme"),
         (pl.col("funding_rate") > 0).cast(pl.Int8).alias("funding_positive"),
         pl.col("funding_rate")
-            .rolling_sum(window_size=3)
+            .rolling_sum(window_size=6)   # 6 bars × 4H = 24 hours
             .fill_null(0.0)
             .fill_nan(0.0)
             .alias("funding_cum_24h"),
@@ -120,7 +123,7 @@ def add_oi_features(
     metrics_df columns: create_time, sum_open_interest_value,
                         count_long_short_ratio, sum_taker_long_short_vol_ratio
 
-    Added columns: oi_value, oi_delta_1h, oi_delta_4h, oi_zscore, oi_quadrant,
+    Added columns: oi_value, oi_delta_4h, oi_delta_12h, oi_zscore, oi_quadrant,
                    ls_ratio, ls_ratio_zscore, taker_vol_ratio
     """
     if metrics_df.is_empty():
@@ -150,18 +153,18 @@ def add_oi_features(
     # OI deltas: (current - past) / current
     df = df.with_columns([
         safe_divide(
-            pl.col("oi_value") - pl.col("oi_value").shift(3),
-            pl.col("oi_value"),
-        ).alias("oi_delta_1h"),
-        safe_divide(
             pl.col("oi_value") - pl.col("oi_value").shift(1),
             pl.col("oi_value"),
-        ).alias("oi_delta_4h"),
+        ).alias("oi_delta_4h"),   # shift(1) × 4H = 4 hours
+        safe_divide(
+            pl.col("oi_value") - pl.col("oi_value").shift(3),
+            pl.col("oi_value"),
+        ).alias("oi_delta_12h"),  # shift(3) × 4H = 12 hours
         rolling_zscore(pl.col("oi_value"), 180).alias("oi_zscore"),
         rolling_zscore(pl.col("ls_ratio"), 180).alias("ls_ratio_zscore"),
     ])
 
-    # oi_quadrant: sign(price) × sign(oi_delta_4h)
+    # oi_quadrant: sign(price_change) × sign(oi_delta_4h)
     price_up = pl.col("close") >= pl.col("close").shift(1)
     oi_up = pl.col("oi_delta_4h") >= 0
     df = df.with_columns(
@@ -184,7 +187,7 @@ def add_basis_features(df: pl.DataFrame) -> pl.DataFrame:
     Added columns: basis_approx, basis_extreme
     """
     df = df.with_columns(
-        (pl.col("funding_cum_24h") * 3.0).alias("basis_approx")
+        (pl.col("funding_cum_24h") * _FUNDING_PERIODS_PER_DAY).alias("basis_approx")
     )
     df = df.with_columns(
         (pl.col("basis_approx").abs() > 0.001).cast(pl.Int8).alias("basis_extreme")

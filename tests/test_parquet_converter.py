@@ -68,10 +68,10 @@ def _write_funding_csv(path: Path) -> Path:
     """Write a synthetic funding-rate CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     content = textwrap.dedent("""\
-        calc_time,funding_interval_hours,last_funding_rate,mark_price
-        1704067200000,8,0.0001,42000.0
-        1704096000000,8,0.00012,42100.0
-        1704124800000,8,0.000095,41900.0
+        fundingTime,fundingRate,markPrice,symbol
+        1704067200000,0.0001,42000.0,BTCUSDT
+        1704096000000,0.00012,42100.0,BTCUSDT
+        1704124800000,0.000095,41900.0,BTCUSDT
     """)
     path.write_text(content)
     return path
@@ -85,6 +85,52 @@ def test_extract_date_from_stem() -> None:
     assert extract_date_from_stem("BTCUSDT-4h-2024-01-01") == "2024-01-01"
     assert extract_date_from_stem("BTCUSDT-fundingRate-2024-12-31") == "2024-12-31"
     assert extract_date_from_stem("ETHUSDT-metrics-2025-06-15") == "2025-06-15"
+
+
+# ---------------------------------------------------------------------------
+# Test: funding CSV conversion
+# ---------------------------------------------------------------------------
+
+def test_convert_funding_csv(tmp_path: Path) -> None:
+    """Converting a funding CSV produces valid Parquet with correct schema."""
+    csv_path = _write_funding_csv(tmp_path / "BTCUSDT-fundingRate-2024-01-01.csv")
+    output_dir = tmp_path / "features"
+
+    converter = ParquetConverter()
+    result = converter.convert_csv_to_parquet(
+        csv_path=csv_path,
+        data_type="funding_rate",
+        symbol="BTCUSDT",
+        output_dir=output_dir,
+    )
+
+    assert result is not None, "Expected a Parquet path, got None"
+    assert result.exists()
+    assert result.suffix == ".parquet"
+
+    df = pl.read_parquet(result, hive_partitioning=False)
+
+    # Row count
+    assert len(df) == 3
+
+    # Required columns present
+    assert "fundingTime" in df.columns
+    assert "fundingRate" in df.columns
+    assert "markPrice" in df.columns
+    assert "datetime" in df.columns
+    assert "symbol" in df.columns
+
+    # Correct dtypes
+    assert df["fundingTime"].dtype == pl.Int64
+    assert df["fundingRate"].dtype == pl.Float64
+
+    # Sorted by fundingTime
+    assert df["fundingTime"].is_sorted()
+
+    # Values are correct
+    assert df["fundingTime"][0] == 1_704_067_200_000
+    assert df["fundingRate"][0] == pytest.approx(0.0001)
+    assert df["symbol"][0] == "BTCUSDT"
 
 
 # ---------------------------------------------------------------------------
