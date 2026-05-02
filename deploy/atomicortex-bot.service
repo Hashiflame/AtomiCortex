@@ -11,6 +11,9 @@ Group=hashiflame
 WorkingDirectory=/home/hashiflame/AtomiCortex
 Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+# matplotlib (pulled by mlflow) needs a writable cache dir under ProtectHome=read-only
+Environment=MPLCONFIGDIR=/home/hashiflame/AtomiCortex/data/.matplotlib
+Environment=MPLBACKEND=Agg
 ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
     scripts/run_live.py \
     --mode testnet \
@@ -28,7 +31,7 @@ StartLimitBurst=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data /home/hashiflame/AtomiCortex/mlruns
 
 # Resource limits
 LimitNOFILE=65536

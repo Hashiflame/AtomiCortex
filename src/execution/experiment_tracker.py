@@ -1,9 +1,12 @@
-"""MLflow experiment tracking for AtomiCortex backtests and walk-forward runs."""
+"""MLflow experiment tracking for AtomiCortex backtests and walk-forward runs.
+
+mlflow is imported lazily inside each method to avoid loading matplotlib
+at module-import time.  Under systemd with ``ProtectHome=read-only``,
+matplotlib's cache-directory initialisation would otherwise raise an
+``OSError`` even though the trading bot never uses matplotlib.
+"""
 
 from __future__ import annotations
-
-import mlflow
-import mlflow.tracking
 
 from src.execution.backtest_runner import BacktestConfig, BacktestResult
 from src.execution.metrics import MetricsResult
@@ -29,6 +32,9 @@ class ExperimentTracker:
     ) -> None:
         self._experiment_name = experiment_name
         self._tracking_uri = tracking_uri
+
+        import mlflow  # lazy: avoids matplotlib OSError under systemd
+
         mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_experiment(experiment_name)
         log.info("ExperimentTracker: experiment='%s' uri='%s'", experiment_name, tracking_uri)
@@ -43,6 +49,8 @@ class ExperimentTracker:
         metrics: MetricsResult,
     ) -> str:
         """Log one backtest run.  Returns the MLflow run_id."""
+        import mlflow  # lazy
+
         with mlflow.start_run(run_name=run_name) as run:
             mlflow.log_params(
                 {
@@ -69,6 +77,8 @@ class ExperimentTracker:
         config: BacktestConfig,
     ) -> str:
         """Log aggregate walk-forward statistics.  Returns the MLflow run_id."""
+        import mlflow  # lazy
+
         with mlflow.start_run(run_name=run_name) as run:
             mlflow.log_params(
                 {
@@ -112,6 +122,8 @@ class ExperimentTracker:
         top_n: int = 5,
     ) -> list[dict]:
         """Return the top *top_n* runs sorted by *metric* (descending)."""
+        import mlflow.tracking  # lazy
+
         client = mlflow.tracking.MlflowClient(tracking_uri=self._tracking_uri)
         experiment = client.get_experiment_by_name(self._experiment_name)
         if experiment is None:

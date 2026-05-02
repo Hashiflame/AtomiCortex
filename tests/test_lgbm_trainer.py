@@ -385,17 +385,28 @@ class TestMLflowLogging:
         trainer, _, _ = _make_trainer(tmp_path)
         train_df, _ = trainer.prepare_data()
 
-        with patch("src.models.lgbm_trainer.mlflow") as mock_mlflow:
-            mock_run = MagicMock()
-            mock_run.info.run_id = "test-run-123"
-            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=mock_run)
-            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+        mock_mlflow = MagicMock()
+        mock_run = MagicMock()
+        mock_run.info.run_id = "test-run-123"
+        mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=mock_run)
+        mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
 
+        # mlflow is now lazily imported inside _log_to_mlflow,
+        # so we inject it via sys.modules
+        import sys
+        original = sys.modules.get("mlflow")
+        sys.modules["mlflow"] = mock_mlflow
+        try:
             model = trainer.train(train_df)
+        finally:
+            if original is not None:
+                sys.modules["mlflow"] = original
+            else:
+                sys.modules.pop("mlflow", None)
 
-            assert mock_mlflow.set_tracking_uri.called
-            assert mock_mlflow.set_experiment.called
-            assert mock_mlflow.start_run.called
+        assert mock_mlflow.set_tracking_uri.called
+        assert mock_mlflow.set_experiment.called
+        assert mock_mlflow.start_run.called
 
 
 class TestModelSavesPkl:

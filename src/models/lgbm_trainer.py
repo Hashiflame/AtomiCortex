@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 
 import lightgbm as lgb
-import mlflow
 import numpy as np
 import polars as pl
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
@@ -505,8 +504,10 @@ class LGBMTrainer:
         booster: lgb.Booster,
         feature_names: list[str],
     ) -> None:
-        """Log training run to MLflow."""
+        """Log training run to MLflow (lazy import to avoid matplotlib at startup)."""
         try:
+            import mlflow  # lazy: avoids matplotlib OSError under systemd
+
             mlflow.set_tracking_uri("./mlruns")
             mlflow.set_experiment("AtomiCortex_LightGBM")
 
