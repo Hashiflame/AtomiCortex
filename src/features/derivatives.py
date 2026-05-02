@@ -154,12 +154,12 @@ def add_oi_features(
     df = df.with_columns([
         safe_divide(
             pl.col("oi_value") - pl.col("oi_value").shift(1),
-            pl.col("oi_value"),
-        ).alias("oi_delta_4h"),   # shift(1) × 4H = 4 hours
+            pl.col("oi_value").shift(1),
+        ).alias("oi_delta_4h"),   # pct change over 1 bar (4H)
         safe_divide(
             pl.col("oi_value") - pl.col("oi_value").shift(3),
-            pl.col("oi_value"),
-        ).alias("oi_delta_12h"),  # shift(3) × 4H = 12 hours
+            pl.col("oi_value").shift(3),
+        ).alias("oi_delta_12h"),  # pct change over 3 bars (12H)
         rolling_zscore(pl.col("oi_value"), 180).alias("oi_zscore"),
         rolling_zscore(pl.col("ls_ratio"), 180).alias("ls_ratio_zscore"),
     ])
@@ -186,8 +186,9 @@ def add_basis_features(df: pl.DataFrame) -> pl.DataFrame:
 
     Added columns: basis_approx, basis_extreme
     """
+    # Daily basis = sum of 3 daily funding payments (already accumulated)
     df = df.with_columns(
-        (pl.col("funding_cum_24h") * _FUNDING_PERIODS_PER_DAY).alias("basis_approx")
+        pl.col("funding_cum_24h").alias("basis_approx")
     )
     df = df.with_columns(
         (pl.col("basis_approx").abs() > 0.001).cast(pl.Int8).alias("basis_extreme")

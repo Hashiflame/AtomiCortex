@@ -96,13 +96,13 @@ class _MockStore:
     """Minimal DataStore stand-in that serves synthetic data."""
 
     def get_klines(self, symbol, interval, start, end, columns=None):
-        return _klines(200)
+        return _klines(500)
 
     def get_funding_rate(self, symbol, start, end):
-        return _funding(200)
+        return _funding(500)
 
     def get_metrics(self, symbol, start, end):
-        return _metrics(200)
+        return _metrics(500)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,13 +119,13 @@ class TestCVDFeatures:
         assert actual == pytest.approx(expected, rel=1e-9)
 
     def test_cvd_slope_3_correctness(self):
-        """cvd_slope_3[i] == cvd[i] − cvd[i-3] for i ≥ 3."""
+        """cvd_slope_3[i] == (cvd[i] − cvd[i-3]) / 3 for i ≥ 3."""
         df = _klines(20)
         out = add_cvd_features(df)
         cvd = out["cvd"].to_list()
         slope3 = out["cvd_slope_3"].to_list()
         for i in range(3, len(cvd)):
-            assert slope3[i] == pytest.approx(cvd[i] - cvd[i - 3], rel=1e-9)
+            assert slope3[i] == pytest.approx((cvd[i] - cvd[i - 3]) / 3.0, rel=1e-9)
 
     def test_taker_buy_ratio_bounds(self):
         """taker_buy_ratio must be in [0, 1] (buy ≤ total volume)."""
@@ -238,15 +238,15 @@ class TestOIFeatures:
         assert actual.issubset(valid), f"Unexpected oi_quadrant values: {actual - valid}"
 
     def test_oi_delta_4h_formula(self):
-        """oi_delta_4h[i] = (oi[i] - oi[i-1]) / oi[i] (shift(1) on 4H data)."""
+        """oi_delta_4h[i] = (oi[i] - oi[i-1]) / oi[i-1] (pct change)."""
         df = self._df_with_price_features()
         out = add_oi_features(df, _metrics(200))
         oi = out["oi_value"].to_list()
         delta = out["oi_delta_4h"].to_list()
         # Check row 5 (warmup past)
         i = 5
-        if oi[i] != 0:
-            expected = (oi[i] - oi[i - 1]) / oi[i]
+        if oi[i - 1] != 0:
+            expected = (oi[i] - oi[i - 1]) / oi[i - 1]
             assert delta[i] == pytest.approx(expected, rel=1e-6)
 
     def test_empty_metrics_returns_zero_columns(self):
@@ -300,10 +300,10 @@ class TestFeaturePipeline:
             assert feat in names, f"Feature '{feat}' missing from get_feature_names()"
 
     def test_warmup_rows_removed(self):
-        """build() removes first 100 warmup rows — output row count < input."""
+        """build() removes first 200 warmup rows — output row count < input."""
         df = self._build()
-        # MockStore returns 200 kline rows; after warmup: ≥ 100 rows remain
-        assert len(df) >= 100
+        # MockStore returns 500 kline rows; after warmup=200: ≥ 200 rows remain
+        assert len(df) >= 200
 
     def test_save_to_parquet_creates_file(self, tmp_path: Path):
         """save_to path must produce a readable Parquet file."""

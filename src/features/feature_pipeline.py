@@ -31,8 +31,9 @@ if TYPE_CHECKING:
 
 _log = get_logger(__name__)
 
-# Rows to drop at the head of the DataFrame to eliminate NaN from rolling ops
-_WARMUP_ROWS = 100
+# Rows to drop at the head of the DataFrame to eliminate NaN from rolling ops.
+# Must exceed the longest rolling window (180 for funding_zscore_30d).
+_WARMUP_ROWS = 200
 
 FEATURE_GROUPS: dict[str, list[str]] = {
     "microstructure": [

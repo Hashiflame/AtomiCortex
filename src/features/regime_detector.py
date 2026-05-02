@@ -81,7 +81,7 @@ def calculate_hurst_exponent(
                 mean = chunk.mean()
                 deviations = np.cumsum(chunk - mean)
                 r = deviations.max() - deviations.min()
-                s = chunk.std(ddof=0)
+                s = chunk.std(ddof=1)
                 if s > 0:
                     rs_list.append(r / s)
 

@@ -29,9 +29,9 @@ def add_cvd_features(df: pl.DataFrame) -> pl.DataFrame:
     )
     df = df.with_columns([
         pl.col("cvd").cum_sum().alias("cvd_cum"),
-        (pl.col("cvd") - pl.col("cvd").shift(3)).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_3"),
-        (pl.col("cvd") - pl.col("cvd").shift(6)).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_6"),
-        (pl.col("cvd") - pl.col("cvd").shift(12)).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_12"),
+        ((pl.col("cvd") - pl.col("cvd").shift(3)) / 3.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_3"),
+        ((pl.col("cvd") - pl.col("cvd").shift(6)) / 6.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_6"),
+        ((pl.col("cvd") - pl.col("cvd").shift(12)) / 12.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_12"),
         safe_divide(pl.col("taker_buy_volume"), pl.col("volume")).alias("taker_buy_ratio"),
     ])
     _log.debug("add_cvd_features: done")
@@ -96,7 +96,10 @@ def add_price_features(df: pl.DataFrame) -> pl.DataFrame:
         safe_divide(body, hl).alias("body_ratio"),
         safe_divide(pl.col("high") - hi_body, hl).alias("upper_wick"),
         safe_divide(lo_body - pl.col("low"), hl).alias("lower_wick"),
-        (pl.col("open") - pl.col("close").shift(1)).fill_null(0.0).fill_nan(0.0).alias("gap"),
+        safe_divide(
+            pl.col("open") - pl.col("close").shift(1),
+            pl.col("close").shift(1),
+        ).alias("gap"),
     ])
     _log.debug("add_price_features: done")
     return df
