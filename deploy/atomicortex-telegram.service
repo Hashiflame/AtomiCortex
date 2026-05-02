@@ -1,0 +1,39 @@
+[Unit]
+Description=AtomiCortex Telegram Bot
+Documentation=https://github.com/Hashiflame/AtomiCortex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hashiflame
+Group=hashiflame
+WorkingDirectory=/home/hashiflame/AtomiCortex
+Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
+    scripts/run_telegram_bot.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atomicortex-telegram
+
+[Install]
+WantedBy=multi-user.target

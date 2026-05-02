@@ -2517,4 +2517,301 @@ with open(path, "rb") as f:
 
 ---
 
-*Последнее обновление: 2026-05 | Фаза: 4 Code Review (PROD-001–PROD-015)*
+*Последнее обновление: 2026-05 | Фаза: 7 Code Review (TG-001–TG-018)*
+
+---
+
+## Фаза 7 — Telegram Bot Code Review
+
+**Файлы проверены:**
+- `src/telegram_bot/database.py` (443 строки)
+- `src/telegram_bot/roles.py` (210 строк)
+- `src/telegram_bot/handlers_free.py` (108 строк)
+- `src/telegram_bot/handlers_premium.py` (157 строк)
+- `src/telegram_bot/handlers_owner.py` (382 строки)
+- `src/telegram_bot/broadcaster.py` (220 строк)
+- `src/telegram_bot/bot.py` (171 строка)
+- `scripts/run_telegram_bot.py` (53 строки)
+
+### Сводная таблица
+
+| ID | Severity | Категория | Файл | Описание |
+|----|----------|-----------|------|----------|
+| TG-001 | 🔴 | Безопасность | `roles.py:42` | `OWNER_ID` frozen at import — env change requires restart; `OWNER_ID=0` при пустом env пропускает все owner-проверки |
+| TG-002 | 🔴 | Безопасность | `handlers_owner.py:292-298` | `subprocess.run(["sudo","systemctl","stop",...])` — shell injection невозможен (list args), но `sudo` без NOPASSWD → зависание 15с |
+| TG-003 | 🔴 | Безопасность | `handlers_owner.py:330-336` | `/logs` отправляет сырые JSON логи в Telegram — могут содержать API ключи, IP адреса |
+| TG-004 | 🟠 | Логика ролей | `roles.py:76` | `_ensure_user` сравнивает с module-level `OWNER_ID` — при `OWNER_ID=0` никто не получит owner роль автоматически |
+| TG-005 | 🟠 | Команды | `handlers_owner.py:264,284` | `/stop_bot` race: `_pending_stop` — module-level dict без TTL cleanup; stale entries persist forever |
+| TG-006 | 🟠 | Broadcaster | `broadcaster.py:184-199` | `_send_to_min_role` — sequential `await` per user; 1000 users × 0.5s timeout = 500s блокировка event loop |
+| TG-007 | 🟠 | Database | `database.py:47-51` | `PRAGMA journal_mode=WAL` выполняется на **каждом** `_connect()` — избыточно, WAL persistent |
+| TG-008 | 🟠 | Интеграция | `bot.py:164-170` | `update_bot_data()` — нет механизма для trading bot вызвать это; два процесса не разделяют память |
+| TG-009 | 🟡 | Команды | `handlers_owner.py:320` | `/logs N` — `args[0].isdigit()` отклоняет отрицательные N, но не проверяет N=0 |
+| TG-010 | 🟡 | Команды | `handlers_premium.py:129-134` | `/risk` — не валидирует отрицательный капитал; `/risk -1000` даёт отрицательные значения |
+| TG-011 | 🟡 | Команды | `handlers_owner.py:109` | `/grant owner` позволяет создать второго owner — нет защиты от множественных owners |
+| TG-012 | 🟡 | Database | `database.py` | Нет индексов на `signals_log.result`, `signals_log.created_at`, `users.role` — медленные запросы при >1000 записей |
+| TG-013 | 🟡 | Database | `database.py:96-98` | `_init_db` catch-all `except` глотает ошибки создания таблиц — silent failure |
+| TG-014 | 🟡 | Безопасность | `handlers_owner.py:55` | `/user` lookup by username — O(N) scan через `get_all_users()` вместо SQL WHERE |
+| TG-015 | 🟡 | Broadcaster | `broadcaster.py:170-178` | `send_to_owner` reads module-level `OWNER_ID` (may be 0) — silent no-op |
+| TG-016 | 🔵 | Интеграция | `bot.py` | Нет scheduled job для daily report at 00:00 UTC — `broadcast_daily_report` никогда не вызывается автоматически |
+| TG-017 | 🔵 | Код | `handlers_free.py:16` | `cmd_start` вызывает `_ensure_user` повторно — `@require_role` уже вызвал его |
+| TG-018 | 🔵 | Код | `run_telegram_bot.py:9` | `import signal` — unused import |
+
+---
+
+### 🔴 КРИТИЧЕСКИЕ
+
+---
+
+### [TG-001] OWNER_ID=0 при пустом env — owner-защита отключена
+
+```
+Файл: src/telegram_bot/roles.py:30-42
+```
+
+**Код проблемы:**
+
+```python
+def get_owner_id() -> int:
+    raw = os.getenv("TELEGRAM_ADMIN_ID", "0")
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return 0
+
+OWNER_ID: int = get_owner_id()
+```
+
+**Проблема:** Если `TELEGRAM_ADMIN_ID` не установлен или = `"your_telegram_user_id_here"`:
+- `int("your_telegram_user_id_here")` → `ValueError` → `OWNER_ID = 0`
+- `_ensure_user` (строка 76): `user_id == 0` — ни один реальный пользователь не получит owner-роль автоматически
+- `/ban` (handlers_owner.py:169): `user["user_id"] == 0` — защита от бана owner не работает для реального owner
+- `send_to_owner` (broadcaster.py:172): `not 0` = True → `send_message(chat_id=0)` → Telegram API error (silent fail)
+
+**Второй аспект:** `OWNER_ID` фиксируется при **импорте модуля**. Изменение `.env` без перезапуска бота не обновит OWNER_ID.
+
+**Решение:**
+
+```python
+def get_owner_id() -> int:
+    raw = os.getenv("TELEGRAM_ADMIN_ID", "")
+    if not raw or not raw.isdigit():
+        _log.error("TELEGRAM_ADMIN_ID not set or invalid — owner features DISABLED")
+        return 0
+    return int(raw)
+```
+
+И в `_ensure_user`:
+```python
+if OWNER_ID == 0:
+    _log.warning("OWNER_ID is 0 — auto-registration as owner disabled")
+```
+
+---
+
+### [TG-002] subprocess.run с sudo — зависание при отсутствии NOPASSWD
+
+```
+Файл: src/telegram_bot/handlers_owner.py:291-298, 306-308
+```
+
+**Проблема:** `subprocess.run(["sudo", "systemctl", "stop", ...], timeout=15)` — если sudoers не настроен с `NOPASSWD` для `systemctl`, `sudo` ждёт пароль на stdin → блокирует asyncio event loop на 15 секунд (timeout).
+
+**Дополнительно:** `subprocess.run` — **синхронный** вызов внутри `async` handler. Блокирует весь event loop бота.
+
+**Решение:**
+1. Использовать `asyncio.create_subprocess_exec` вместо `subprocess.run`
+2. Добавить в sudoers: `hashiflame ALL=(ALL) NOPASSWD: /bin/systemctl stop atomicortex-bot, /bin/systemctl restart atomicortex-bot`
+
+---
+
+### [TG-003] /logs отправляет сырые логи — утечка секретов
+
+```
+Файл: src/telegram_bot/handlers_owner.py:330-336
+```
+
+**Проблема:** Лог-файлы (`trading_*.log`) содержат `serialize=True` (JSON с полным record). Поля `extra` могут содержать:
+- API ключи (если логгируются при подключении)
+- IP адреса серверов
+- Внутренние пути файловой системы
+
+Отправка через Telegram (даже owner-only) — утечка через Telegram servers.
+
+**Решение:** Фильтровать sensitive patterns перед отправкой:
+```python
+import re
+output = re.sub(r'(api[_-]?key|secret|password|token)["\s:=]+\S+', r'\1=***', output, flags=re.IGNORECASE)
+```
+
+---
+
+### 🟠 СЕРЬЁЗНЫЕ
+
+---
+
+### [TG-004] OWNER_ID=0 → auto-registration сломана
+
+```
+Файл: src/telegram_bot/roles.py:76
+```
+
+`is_owner = user_id == OWNER_ID` — при `OWNER_ID=0` всегда `False` (Telegram user_id > 0). Owner не получит автоматическую роль при `/start`. Придётся вручную менять DB.
+
+---
+
+### [TG-005] _pending_stop не cleanup'ится
+
+```
+Файл: src/telegram_bot/handlers_owner.py:264
+```
+
+`_pending_stop: dict[int, float] = {}` — entries добавляются при каждом `/stop_bot`, но удаляются только при `/confirm_stop`. Если owner вызовет `/stop_bot` 1000 раз без confirm — 1000 записей в памяти. Мелочь, но не чисто.
+
+**Решение:** Очищать expired entries или использовать `context.user_data` (PTB built-in per-user storage).
+
+---
+
+### [TG-006] Broadcaster sequential await — блокирует event loop
+
+```
+Файл: src/telegram_bot/broadcaster.py:188-199
+```
+
+```python
+for u in users:
+    try:
+        await self._bot.send_message(...)  # sequential!
+```
+
+При 100 users и Telegram rate limit (30 msg/s) — минимум 3.3 секунды. При 1000 users — 33 секунды. Весь бот не отвечает на команды в это время.
+
+**Решение:** `asyncio.gather` с semaphore:
+```python
+sem = asyncio.Semaphore(25)
+async def _send(uid, msg):
+    async with sem:
+        await self._bot.send_message(chat_id=uid, text=msg)
+await asyncio.gather(*[_send(u["user_id"], msg) for u in users], return_exceptions=True)
+```
+
+---
+
+### [TG-007] PRAGMA WAL на каждом connect
+
+```
+Файл: src/telegram_bot/database.py:49
+```
+
+`conn.execute("PRAGMA journal_mode=WAL")` вызывается при **каждом** вызове метода (connection-per-call). WAL — persistent setting, достаточно установить один раз в `_init_db`. Каждый лишний PRAGMA — ~0.1ms × тысячи вызовов.
+
+---
+
+### [TG-008] update_bot_data бесполезен в multi-process архитектуре
+
+```
+Файл: src/telegram_bot/bot.py:164-170
+```
+
+Telegram бот и trading bot — **отдельные systemd services** (отдельные процессы). `update_bot_data()` обновляет `bot_data` dict в памяти telegram-процесса, но trading bot не может вызвать его напрямую.
+
+**Решение:** Inter-process communication через:
+1. Redis pub/sub (Redis уже в стеке)
+2. SQLite polling (DB уже есть)
+3. Unix socket
+
+---
+
+### 🟡 УМЕРЕННЫЕ
+
+---
+
+### [TG-009] /logs N=0 → пустой tail
+
+`args[0].isdigit()` пропускает `"0"`. `tail -n0` — пустой вывод. Безобидно, но unexpected.
+
+### [TG-010] /risk с отрицательным капиталом
+
+`/risk -1000` → `float("-1000")` = -1000 → `dollar_risk = -10` → отрицательная позиция. Нужен `if capital <= 0: return error`.
+
+### [TG-011] /grant owner создаёт множественных owners
+
+Нет проверки уникальности. `db.set_role(user_id, "owner")` — можно выдать owner 10 пользователям. Семантически неправильно.
+
+### [TG-012] Нет индексов на часто используемых полях
+
+`signals_log.result` и `signals_log.created_at` используются в `get_stats()` (6 запросов). При >1000 сигналов — full table scan на каждый.
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_signals_result ON signals_log(result);
+CREATE INDEX IF NOT EXISTS idx_signals_created ON signals_log(created_at);
+```
+
+### [TG-013] Silent failure при init_db
+
+`except Exception as exc: _log.error(...)` — ошибка логгируется, но бот **продолжает работу** с отсутствующими таблицами. Первый же SQL запрос упадёт с `OperationalError: no such table`.
+
+### [TG-014] Username lookup — O(N) scan
+
+`_resolve_user` и `/user` вызывают `get_all_users()` и итерируют Python-side. Нужен `get_user_by_username(username)` с SQL WHERE.
+
+### [TG-015] send_to_owner с OWNER_ID=0 — silent no-op
+
+Broadcaster не уведомляет о critical alerts если OWNER_ID не настроен. Нет fallback (email, stderr).
+
+---
+
+### 🔵 НИЗКИЕ
+
+---
+
+### [TG-016] Daily report не scheduled
+
+`broadcast_daily_report` существует, но **нигде не вызывается** автоматически. Нет `JobQueue.run_daily(time=datetime.time(0,0))`.
+
+### [TG-017] Двойной _ensure_user в /start
+
+`@require_role("free")` уже вызывает `_ensure_user`. Внутри `cmd_start` — повторный вызов. 2 DB запроса вместо 1.
+
+### [TG-018] Unused import signal
+
+`run_telegram_bot.py:9`: `import signal` не используется.
+
+---
+
+### ТОП-5 КРИТИЧЕСКИХ ПРОБЛЕМ (приоритет исправления)
+
+| # | ID | Описание | Риск |
+|---|----|----------|------|
+| 1 | **TG-008** | `update_bot_data` не работает между процессами — handlers показывают нули | Бесполезные /health, /regime, /risk |
+| 2 | **TG-001** | `OWNER_ID=0` при пустом env → owner-защита отключена | Нет auto-owner, нет owner alerts |
+| 3 | **TG-003** | `/logs` отправляет raw JSON с потенциальными секретами | Утечка API keys через Telegram |
+| 4 | **TG-006** | Sequential broadcast → блокировка event loop | Бот не отвечает на команды |
+| 5 | **TG-002** | Синхронный `subprocess.run` + sudo без NOPASSWD | 15s зависание бота |
+
+### Чеклист ответов на вопросы ревью
+
+| Вопрос | Ответ | Оценка |
+|--------|-------|--------|
+| Может ли обычный user получить owner? | Нет — `set_role` только через owner-команды. Но при `OWNER_ID=0` никто не owner → deadlock | 🟠 TG-001 |
+| Подмена user_id в owner командах? | Невозможна — Telegram API гарантирует `effective_user.id` | ✅ |
+| SQL injection? | Нет — все запросы параметризованы (`?` placeholders) | ✅ |
+| Утечка в логах? | `/logs` отправляет raw логи — потенциальная утечка | 🔴 TG-003 |
+| OWNER_ID не установлен? | `OWNER_ID=0`, owner features молча отключены | 🔴 TG-001 |
+| Автодаунгрейд expired? | Корректен — проверяется в `get_user()` с timezone-aware сравнением | ✅ |
+| Banned user обход? | Невозможен — `@require_role` проверяет бан ДО роли | ✅ |
+| Наследование ролей? | Корректно — `_ROLE_LEVELS` + числовое сравнение | ✅ |
+| /grant без срока = бессрочно? | Да, `expires_at=None` → permanent | ✅ |
+| /stop_bot race condition? | Мелкий: stale entries в dict, но не security issue | 🟡 TG-005 |
+| /logs N отрицательный? | `isdigit()` отклоняет `-1`. `N=0` пропускается | 🟡 TG-009 |
+| /risk не число? | ValueError caught, error message sent | ✅ |
+| /broadcast пустой список? | Корректно — `sent=0, failed=0` | ✅ |
+| Telegram API down при broadcast? | Exception caught per-user, continues | ✅ |
+| Thread-safety DB? | Connection-per-call + WAL = safe | ✅ |
+| DB file locked? | `PRAGMA journal_mode=WAL` позволяет concurrent reads | ✅ |
+| Connections закрываются? | Да — `finally: conn.close()` во всех методах | ✅ |
+| Circular imports? | Нет — database ← roles ← handlers, broadcaster; bot imports all | ✅ |
+| Daily report at 00:00? | Не реализовано — нет JobQueue scheduling | 🔵 TG-016 |
+
+---
+
+*Последнее обновление: 2026-05 | Фаза: 7 Code Review (TG-001–TG-018)*
