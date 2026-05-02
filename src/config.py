@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     telegram_admin_id: str = Field(default="", alias="TELEGRAM_ADMIN_ID")
 
     # ------------------------------------------------------------------
+    # Payments — Telegram Stars
+    # ------------------------------------------------------------------
+    premium_price_stars_30d: int = Field(default=500, alias="PREMIUM_PRICE_STARS_30D")
+    premium_price_stars_90d: int = Field(default=1200, alias="PREMIUM_PRICE_STARS_90D")
+
+    # ------------------------------------------------------------------
+    # Payments — CryptoBot (USDT)
+    # ------------------------------------------------------------------
+    cryptobot_token: str = Field(default="", alias="CRYPTOBOT_TOKEN")
+    premium_price_usdt_30d: float = Field(default=7.00, alias="PREMIUM_PRICE_USDT_30D")
+    premium_price_usdt_90d: float = Field(default=18.00, alias="PREMIUM_PRICE_USDT_90D")
+
+    # ------------------------------------------------------------------
     # QuestDB
     # ------------------------------------------------------------------
     questdb_host: str = Field(default="localhost", alias="QUESTDB_HOST")
@@ -159,6 +172,7 @@ class Settings(BaseSettings):
         "bybit_mainnet_api_secret",
         "telegram_bot_token",
         "redis_password",
+        "cryptobot_token",
     }
 
     def safe_dict(self) -> dict[str, Any]:

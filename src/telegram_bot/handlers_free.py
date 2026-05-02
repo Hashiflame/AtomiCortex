@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from telegram import Update
+from datetime import datetime, timezone
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.telegram_bot.database import Database
@@ -11,14 +13,15 @@ from src.telegram_bot.roles import require_role, _ensure_user
 
 @require_role("free")
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome + auto-register (TG-017: _ensure_user already called by decorator)."""
+    """Welcome + auto-register."""
     name = update.effective_user.first_name if update.effective_user else "trader"
     await update.effective_chat.send_message(
         f"👋 Привет, {name}!\n\n"
         f"Добро пожаловать в AtomiCortex — AI Crypto Futures Trading Bot.\n\n"
         f"📊 /stats — публичная статистика\n"
         f"📋 /help — список команд\n"
-        f"⭐ /subscribe — информация о подписке\n\n"
+        f"⭐ /subscribe — оформить подписку\n"
+        f"👤 /mystatus — ваш статус\n\n"
         f"{'═' * 30}"
     )
 
@@ -36,7 +39,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start — приветствие",
         "/help — список команд",
         "/stats — публичная статистика",
-        "/subscribe — информация о подписке",
+        "/subscribe — оформить подписку",
+        "/mystatus — ваш статус",
     ]
 
     if role in ("premium", "owner"):
@@ -63,6 +67,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/restart_bot — перезапуск бота",
             "/logs <N> — последние N строк логов",
             "/stats_admin — полная статистика",
+            "/payments — история платежей",
+            "/revenue — статистика дохода",
         ]
 
     await update.effective_chat.send_message("\n".join(lines))
@@ -73,7 +79,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Public statistics."""
     db: Database = context.bot_data["db"]
     stats = db.get_stats()
-    # TG-008: read regime from last signal in DB, not bot_data
     signals = db.get_signals_history(limit=1)
     regime = signals[0].get("regime", "N/A").upper() if signals else "N/A"
 
@@ -92,16 +97,104 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @require_role("free")
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Subscription info."""
+    """Show subscription options with inline keyboard buttons."""
+    prices = context.bot_data.get("prices", {})
+    stars_30 = prices.get("stars_30d", 500)
+    stars_90 = prices.get("stars_90d", 1200)
+    usdt_30 = prices.get("usdt_30d", 7.00)
+    usdt_90 = prices.get("usdt_90d", 18.00)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"⭐ 30 дней — {stars_30} Stars",
+                callback_data="pay_stars_30",
+            ),
+            InlineKeyboardButton(
+                f"⭐ 90 дней — {stars_90} Stars",
+                callback_data="pay_stars_90",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"💰 30 дней — ${usdt_30:.0f} USDT",
+                callback_data="pay_usdt_30",
+            ),
+            InlineKeyboardButton(
+                f"💰 90 дней — ${usdt_90:.0f} USDT",
+                callback_data="pay_usdt_90",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "✉️ Написать владельцу",
+                callback_data="pay_manual",
+            ),
+        ],
+    ])
+
     await update.effective_chat.send_message(
-        "⭐ AtomiCortex Premium\n"
-        f"{'═' * 30}\n\n"
-        "Что включено:\n"
-        "  🔔 Все торговые сигналы в реальном времени\n"
-        "  📈 Детальная статистика и история\n"
-        "  🎯 Калькулятор размера позиции\n"
-        "  📊 Режим рынка, funding, Hurst, ADX\n"
-        "  📋 Ежедневные отчёты\n\n"
-        "Для получения Premium свяжитесь с @admin\n"
-        f"{'═' * 30}"
+        f"{'━' * 30}\n"
+        f"💎 AtomiCortex Premium\n\n"
+        f"🤖 AI сигналы BTC/ETH/SOL\n"
+        f"📊 Все режимы рынка (TREND/HIGH_VOL)\n"
+        f"⚡ Уверенность ≥ 65%\n"
+        f"📱 Мгновенные алерты\n\n"
+        f"Выбери способ и срок:\n"
+        f"{'━' * 30}",
+        reply_markup=keyboard,
     )
+
+
+@require_role("free")
+async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current subscription status."""
+    if update.effective_user is None:
+        return
+    db: Database = context.bot_data["db"]
+    user = db.get_user(update.effective_user.id)
+
+    if user is None:
+        await update.effective_chat.send_message("❌ Профиль не найден. Используйте /start.")
+        return
+
+    role = user.get("role", "free")
+    expires = user.get("expires_at")
+
+    if role == "premium" and expires:
+        try:
+            exp_dt = datetime.fromisoformat(expires)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            remaining = (exp_dt - datetime.now(timezone.utc)).days
+            exp_str = exp_dt.strftime("%Y-%m-%d")
+            await update.effective_chat.send_message(
+                f"👤 Ваш статус\n"
+                f"{'═' * 30}\n"
+                f"Роль: Premium ✅\n"
+                f"Истекает: {exp_str} ({remaining} дней)\n"
+                f"{'═' * 30}"
+            )
+        except (ValueError, TypeError):
+            await update.effective_chat.send_message(
+                f"👤 Ваш статус\n"
+                f"{'═' * 30}\n"
+                f"Роль: Premium ✅\n"
+                f"Срок: бессрочно\n"
+                f"{'═' * 30}"
+            )
+    elif role == "owner":
+        await update.effective_chat.send_message(
+            f"👤 Ваш статус\n"
+            f"{'═' * 30}\n"
+            f"Роль: Owner 👑\n"
+            f"{'═' * 30}"
+        )
+    else:
+        await update.effective_chat.send_message(
+            f"👤 Ваш статус\n"
+            f"{'═' * 30}\n"
+            f"Роль: Free\n\n"
+            f"Upgrade: /subscribe\n"
+            f"{'═' * 30}"
+        )

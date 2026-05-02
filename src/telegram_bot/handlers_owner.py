@@ -455,3 +455,60 @@ async def cmd_stats_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     msg += f"\n{'═' * 30}"
 
     await update.effective_chat.send_message(msg)
+
+
+@require_role("owner")
+async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show payment history: /payments [N]."""
+    db: Database = context.bot_data["db"]
+    args = context.args or []
+    limit = 20
+    if args and args[0].isdigit():
+        limit = min(int(args[0]), 50)
+
+    payments = db.get_payments(limit)
+    if not payments:
+        await update.effective_chat.send_message("📭 Нет платежей.")
+        return
+
+    lines = [f"💳 Платежи (последние {len(payments)}):\n"]
+    lines.append("ID | User | Amount | Method | Status | Date")
+    lines.append("─" * 45)
+    for p in payments:
+        method_emoji = {"stars": "⭐", "usdt": "💰", "manual": "✋"}.get(
+            p.get("method", ""), "❓"
+        )
+        amount_str = (
+            f"{p.get('stars_amount', 0)} XTR"
+            if p.get("method") == "stars"
+            else f"${p.get('amount_usd', 0):.2f}"
+        )
+        status_emoji = {"paid": "✅", "pending": "⏳", "failed": "❌"}.get(
+            p.get("status", ""), "❓"
+        )
+        date = (p.get("created_at") or "")[:10]
+        lines.append(
+            f"{p['id']} | {p['user_id']} | {amount_str} "
+            f"| {method_emoji} | {status_emoji} | {date}"
+        )
+
+    await update.effective_chat.send_message("\n".join(lines))
+
+
+@require_role("owner")
+async def cmd_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show revenue statistics."""
+    db: Database = context.bot_data["db"]
+    rev = db.get_revenue_stats()
+
+    await update.effective_chat.send_message(
+        f"💰 Revenue Statistics\n"
+        f"{'═' * 30}\n\n"
+        f"Всего:           ${rev['total_usd']:,.2f}\n"
+        f"Этот месяц:      ${rev['this_month_usd']:,.2f}\n"
+        f"Stars:           {rev['stars_total']} ⭐\n"
+        f"USDT:            ${rev['usdt_total']:,.2f}\n\n"
+        f"Активных подписок: {rev['active_premiums']}\n"
+        f"Всего платежей:    {rev['total_payments']}\n"
+        f"{'═' * 30}"
+    )

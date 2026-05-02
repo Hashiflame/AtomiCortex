@@ -103,6 +103,27 @@ class Database:
                     ON signals_log(created_at);
                 CREATE INDEX IF NOT EXISTS idx_events_created
                     ON bot_events(created_at);
+
+                CREATE TABLE IF NOT EXISTS payments (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id         INTEGER NOT NULL,
+                    method          TEXT NOT NULL,
+                    amount_usd      REAL,
+                    stars_amount    INTEGER,
+                    days            INTEGER,
+                    payload         TEXT,
+                    invoice_id      TEXT,
+                    status          TEXT DEFAULT 'pending',
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    paid_at         TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_payments_user
+                    ON payments(user_id);
+                CREATE INDEX IF NOT EXISTS idx_payments_status
+                    ON payments(status);
+                CREATE INDEX IF NOT EXISTS idx_payments_payload
+                    ON payments(payload);
             """)
             conn.commit()
         except Exception as exc:
@@ -465,5 +486,144 @@ class Database:
                 (today,),
             ).fetchone()
             return row[0] if row else 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Payments
+    # ------------------------------------------------------------------
+
+    def create_payment(
+        self,
+        user_id: int,
+        method: str,
+        amount_usd: float,
+        days: int,
+        payload: str = "",
+        invoice_id: str = "",
+        stars_amount: int = 0,
+        status: str = "pending",
+    ) -> int:
+        """Create a payment record.  Returns the payment ID."""
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """INSERT INTO payments
+                   (user_id, method, amount_usd, stars_amount, days,
+                    payload, invoice_id, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, method, amount_usd, stars_amount, days,
+                 payload, invoice_id, status),
+            )
+            conn.commit()
+            return cursor.lastrowid or 0
+        finally:
+            conn.close()
+
+    def update_payment_status(
+        self,
+        payment_id: int,
+        status: str,
+        paid_at: str | None = None,
+    ) -> None:
+        """Update payment status (pending → paid / failed)."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE payments SET status = ?, paid_at = ? WHERE id = ?",
+                (status, paid_at, payment_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_payment_by_payload(self, payload: str) -> dict[str, Any] | None:
+        """Find a payment by its unique payload string."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM payments WHERE payload = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (payload,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_pending_payments(self, method: str | None = None) -> list[dict[str, Any]]:
+        """Return all pending payments, optionally filtered by method."""
+        conn = self._connect()
+        try:
+            if method:
+                rows = conn.execute(
+                    "SELECT * FROM payments WHERE status = 'pending' "
+                    "AND method = ? ORDER BY created_at DESC",
+                    (method,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM payments WHERE status = 'pending' "
+                    "ORDER BY created_at DESC",
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_payments(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent payments, newest first."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM payments ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_revenue_stats(self) -> dict[str, Any]:
+        """Aggregate revenue statistics."""
+        conn = self._connect()
+        try:
+            total = conn.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0) FROM payments "
+                "WHERE status = 'paid'",
+            ).fetchone()[0]
+
+            this_month = datetime.now(timezone.utc).strftime("%Y-%m")
+            month_total = conn.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0) FROM payments "
+                "WHERE status = 'paid' "
+                "AND strftime('%Y-%m', paid_at) = ?",
+                (this_month,),
+            ).fetchone()[0]
+
+            stars_total = conn.execute(
+                "SELECT COALESCE(SUM(stars_amount), 0) FROM payments "
+                "WHERE status = 'paid' AND method = 'stars'",
+            ).fetchone()[0]
+
+            usdt_total = conn.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0) FROM payments "
+                "WHERE status = 'paid' AND method = 'usdt'",
+            ).fetchone()[0]
+
+            active_premiums = conn.execute(
+                "SELECT COUNT(*) FROM users "
+                "WHERE role = 'premium'",
+            ).fetchone()[0]
+
+            paid_count = conn.execute(
+                "SELECT COUNT(*) FROM payments WHERE status = 'paid'",
+            ).fetchone()[0]
+
+            return {
+                "total_usd": total,
+                "this_month_usd": month_total,
+                "stars_total": stars_total,
+                "usdt_total": usdt_total,
+                "active_premiums": active_premiums,
+                "total_payments": paid_count,
+            }
         finally:
             conn.close()
