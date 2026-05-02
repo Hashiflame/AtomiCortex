@@ -1,0 +1,609 @@
+"""
+AtomiCortex — ML Trading Strategy.
+
+Main live/backtest trading strategy that combines:
+- ML regime-specific signal generation (trend + high_vol LightGBM models)
+- Pre-trade risk filtering via RiskEngine
+- ATR-based position sizing
+- Exchange-side STOP_MARKET for risk management
+
+Phase 4 — Step 4.4.
+"""
+
+from __future__ import annotations
+
+import pickle
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model.currencies import USDT
+from nautilus_trader.model.data import Bar, BarSpecification, BarType
+from nautilus_trader.model.enums import (
+    AggregationSource,
+    BarAggregation,
+    OrderSide,
+    PriceType,
+    TimeInForce,
+    TriggerType,
+)
+from nautilus_trader.model.events import OrderFilled, PositionClosed, PositionOpened
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Venue
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.trading.strategy import Strategy
+
+from src.logger import get_logger
+from src.risk.risk_engine import (
+    PortfolioState,
+    RiskConfig,
+    RiskDecision,
+    RiskEngine,
+    TradeSignal,
+)
+from src.risk.portfolio_tracker import PortfolioTracker
+
+_log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Strategy config
+# ---------------------------------------------------------------------------
+
+class MLStrategyConfig(StrategyConfig, frozen=True):
+    """Configuration for the ML-driven trading strategy."""
+
+    instrument_id: str = "BTCUSDT-PERP.BINANCE"
+    bar_type: str = "BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL"
+    interval: str = "4h"
+    confidence_threshold: float = 0.65
+    models_dir: str = "./data/features/models"
+    features_dir: str = "./data/features/ml_features"
+    risk_per_trade: float = 0.01
+    max_leverage: int = 10
+    max_open_positions: int = 3
+    initial_equity: float = 10_000.0
+    warmup_bars: int = 300
+    dry_run: bool = False
+    rr_ratio: float = 1.5
+
+
+# ---------------------------------------------------------------------------
+# Helper: bar → OHLCV dict
+# ---------------------------------------------------------------------------
+
+def _bar_to_dict(bar: Bar) -> dict[str, float]:
+    """Extract OHLCV from a Nautilus Bar object."""
+    return {
+        "open": bar.open.as_double(),
+        "high": bar.high.as_double(),
+        "low": bar.low.as_double(),
+        "close": bar.close.as_double(),
+        "volume": bar.volume.as_double(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML Trading Strategy
+# ---------------------------------------------------------------------------
+
+class MLTradingStrategy(Strategy):
+    """
+    Live trading strategy that:
+    1. Collects 4H bars
+    2. Detects market regime (ADX-first)
+    3. Selects regime-appropriate LightGBM model
+    4. Generates ML signal → confidence
+    5. Passes through RiskEngine pre-trade filters
+    6. Opens positions with exchange-side stop orders
+    """
+
+    def __init__(self, config: MLStrategyConfig) -> None:
+        super().__init__(config)
+        self._config = config
+        self._instrument_id = InstrumentId.from_str(config.instrument_id)
+        self._bar_type = BarType.from_str(config.bar_type)
+        self._venue = Venue(self._instrument_id.venue.value)
+
+        # Will be initialised in on_start
+        self._risk_engine: RiskEngine | None = None
+        self._tracker: PortfolioTracker | None = None
+        self._trend_model: Any = None
+        self._highvol_model: Any = None
+        self._trend_features: list[str] = []
+        self._highvol_features: list[str] = []
+        self._regime_detector: Any = None
+
+        # Bar buffer
+        self._bars: list[Bar] = []
+        self._bar_count: int = 0
+
+        # Equity curve tracking
+        self._equity_curve: list[tuple[int, float]] = []
+
+        # Track pending SL/TP per instrument to avoid duplicate orders
+        self._pending_stops: dict[str, str] = {}  # instrument_id → client_order_id
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def on_start(self) -> None:
+        """Initialise components and subscribe to bars."""
+        self.log.info("MLTradingStrategy starting...")
+
+        # 1. Risk Engine
+        risk_cfg = RiskConfig(
+            risk_per_trade=self._config.risk_per_trade,
+            max_leverage=self._config.max_leverage,
+            max_open_positions=self._config.max_open_positions,
+            confidence_threshold=self._config.confidence_threshold,
+        )
+        self._risk_engine = RiskEngine(risk_cfg, equity=self._config.initial_equity)
+
+        # 2. Portfolio Tracker
+        self._tracker = PortfolioTracker(self._config.initial_equity)
+
+        # 3. Regime Detector
+        from src.features.regime_detector import RegimeDetector
+        self._regime_detector = RegimeDetector()
+
+        # 4. Load ML models
+        self._load_models()
+
+        # 5. Subscribe to bars
+        self.subscribe_bars(self._bar_type)
+        self.log.info(
+            f"Subscribed to {self._bar_type} | "
+            f"dry_run={self._config.dry_run} | "
+            f"warmup={self._config.warmup_bars} bars"
+        )
+
+    def on_stop(self) -> None:
+        """Graceful shutdown: close all positions, cancel pending orders."""
+        self.log.info("MLTradingStrategy stopping — closing positions...")
+        if not self._config.dry_run:
+            self.cancel_all_orders(self._instrument_id)
+            self.close_all_positions(self._instrument_id)
+        self.log.info(
+            f"Strategy stopped | bars_processed={self._bar_count} | "
+            f"equity_points={len(self._equity_curve)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Bar handler
+    # ------------------------------------------------------------------
+
+    def on_bar(self, bar: Bar) -> None:
+        """Core logic: regime → model → signal → risk → execute."""
+        self._bars.append(bar)
+        self._bar_count += 1
+
+        # Record equity
+        self._record_equity(bar.ts_event)
+
+        # 1. Warmup check
+        if len(self._bars) < self._config.warmup_bars:
+            if self._bar_count % 50 == 0:
+                self.log.debug(
+                    f"Warmup: {len(self._bars)}/{self._config.warmup_bars} bars"
+                )
+            return
+
+        # 2. Detect regime
+        regime_state = self._detect_regime()
+        if regime_state is None:
+            return
+
+        regime_label = regime_state.regime.value  # e.g. "trend_up", "high_vol"
+
+        # 3. Select model by regime
+        model, features_list = self._select_model(regime_label)
+        if model is None:
+            self.log.debug(f"No model for regime '{regime_label}' — skipping")
+            return
+
+        # 4. Compute features
+        feature_vector = self._compute_features(features_list)
+        if feature_vector is None:
+            return
+
+        # 5. Get ML signal
+        from src.models.lgbm_trainer import LGBMTrainer
+        direction, confidence = LGBMTrainer.get_signal(
+            None,  # static-ish: only uses model.predict
+            model,
+            feature_vector,
+            confidence_threshold=self._config.confidence_threshold,
+        )
+
+        if direction == 0:
+            self.log.debug(
+                f"No signal | regime={regime_label} | confidence={confidence:.3f}"
+            )
+            return
+
+        # 6. Build TradeSignal
+        current_price = bar.close.as_double()
+        atr_dollar = regime_state.atr_pct * current_price
+        now_utc = datetime.fromtimestamp(bar.ts_event / 1e9, tz=timezone.utc)
+
+        signal = TradeSignal(
+            symbol=str(self._instrument_id),
+            direction=direction,
+            confidence=confidence,
+            regime=regime_label,
+            entry_price=current_price,
+            atr=atr_dollar,
+            atr_pct=regime_state.atr_pct,
+            funding_rate=0.0001,  # default; will be updated from live feed
+            timestamp=now_utc,
+        )
+
+        # 7. Risk evaluation
+        portfolio_state = self._tracker.get_state()
+        decision = self._risk_engine.evaluate(signal, portfolio_state)
+
+        if not decision.approved:
+            self.log.info(
+                f"Signal BLOCKED | {regime_label} | "
+                f"dir={direction} conf={confidence:.3f} | "
+                f"reason={decision.reason}"
+            )
+            return
+
+        # 8. Execute
+        self.log.info(
+            f"Signal APPROVED | {regime_label} dir={direction} "
+            f"conf={confidence:.3f} | size={decision.position_size:.6f} "
+            f"notional=${decision.notional:.2f}"
+        )
+        if not self._config.dry_run:
+            self._open_position(decision, signal)
+        else:
+            self.log.info(
+                f"[DRY RUN] Would open {signal.direction} "
+                f"{decision.position_size:.6f} @ ${signal.entry_price:.2f} | "
+                f"SL=${decision.stop_loss:.2f} TP=${decision.take_profit:.2f}"
+            )
+
+    # ------------------------------------------------------------------
+    # Order events
+    # ------------------------------------------------------------------
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        """Update portfolio tracker and place stop orders on entry fill."""
+        fill_price = event.last_px.as_double()
+        fill_qty = event.last_qty.as_double()
+        commission = event.commission.as_double() if event.commission else 0.0
+        is_buy = event.is_buy
+        now_utc = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc)
+
+        self.log.info(
+            f"ORDER FILLED | {event.order_side} {fill_qty} "
+            f"@ {fill_price} | commission={commission}"
+        )
+
+        # Update tracker
+        if self._tracker:
+            direction = 1 if is_buy else -1
+            self._tracker.update_fill(
+                symbol=str(event.instrument_id),
+                direction=direction,
+                quantity=fill_qty,
+                price=fill_price,
+                fee=commission,
+                timestamp=now_utc,
+            )
+
+    def on_position_opened(self, event: PositionOpened) -> None:
+        """Place stop-loss after position is confirmed open."""
+        self.log.info(
+            f"POSITION OPENED | {event.instrument_id} | "
+            f"side={event.entry} qty={event.quantity}"
+        )
+
+    def on_position_closed(self, event: PositionClosed) -> None:
+        """Handle position close: update PnL, track consecutive losses."""
+        realized_pnl = event.realized_pnl.as_double() if event.realized_pnl else 0.0
+        now_utc = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc)
+
+        self.log.info(
+            f"POSITION CLOSED | {event.instrument_id} | "
+            f"realized_pnl={realized_pnl:.4f} | "
+            f"return={event.realized_return:.4f}"
+        )
+
+        # Close in tracker
+        if self._tracker:
+            self._tracker.close_position(
+                symbol=str(event.instrument_id),
+                close_price=event.avg_px_close.as_double(),
+                fee=0.0,  # fees already accounted in OrderFilled
+                timestamp=now_utc,
+            )
+
+            if realized_pnl < 0:
+                self._tracker.record_loss(now_utc)
+
+        # TODO: Telegram alert (Phase 5)
+
+    # ------------------------------------------------------------------
+    # Position management
+    # ------------------------------------------------------------------
+
+    def _open_position(
+        self,
+        decision: RiskDecision,
+        signal: TradeSignal,
+    ) -> None:
+        """Submit market order + exchange-side STOP_MARKET."""
+        instrument = self.cache.instrument(self._instrument_id)
+        if instrument is None:
+            self.log.error(f"Instrument {self._instrument_id} not found in cache")
+            return
+
+        # Direction → OrderSide
+        entry_side = OrderSide.BUY if signal.direction == 1 else OrderSide.SELL
+        exit_side = OrderSide.SELL if signal.direction == 1 else OrderSide.BUY
+
+        # Quantity (round to instrument precision)
+        qty = instrument.make_qty(decision.position_size)
+
+        # Client order ID (idempotent)
+        ts_ms = int(time.time() * 1000)
+        dir_str = "L" if signal.direction == 1 else "S"
+        entry_tag = f"AC-{dir_str}-{ts_ms}"
+
+        # 1. Market entry
+        entry_order = self.order_factory.market(
+            instrument_id=self._instrument_id,
+            order_side=entry_side,
+            quantity=qty,
+            time_in_force=TimeInForce.IOC,
+            tags=[entry_tag],
+        )
+        self.submit_order(entry_order)
+        self.log.info(
+            f"ENTRY submitted | {entry_side} {qty} | "
+            f"tag={entry_tag}"
+        )
+
+        # 2. Stop-loss (exchange-side STOP_MARKET, reduce_only)
+        sl_price = instrument.make_price(decision.stop_loss)
+        stop_order = self.order_factory.stop_market(
+            instrument_id=self._instrument_id,
+            order_side=exit_side,
+            quantity=qty,
+            trigger_price=sl_price,
+            trigger_type=TriggerType.LAST_PRICE,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+            tags=[f"SL-{entry_tag}"],
+        )
+        self.submit_order(stop_order)
+        self.log.info(
+            f"STOP LOSS submitted | {exit_side} {qty} @ trigger={sl_price}"
+        )
+
+    # ------------------------------------------------------------------
+    # Feature computation
+    # ------------------------------------------------------------------
+
+    def _compute_features(self, feature_names: list[str]) -> np.ndarray | None:
+        """Build a feature vector from the current bar buffer.
+
+        Uses the last 50 bars to compute microstructure features,
+        then extracts only the features the model was trained on.
+        """
+        try:
+            import polars as pl
+
+            # Convert bars to DataFrame
+            lookback = min(len(self._bars), 540)
+            recent_bars = self._bars[-lookback:]
+            records = [_bar_to_dict(b) for b in recent_bars]
+            df = pl.DataFrame(records)
+
+            # Add basic derived features inline (lightweight version)
+            close = df["close"].to_numpy()
+            high = df["high"].to_numpy()
+            low = df["low"].to_numpy()
+            volume = df["volume"].to_numpy()
+
+            # Returns
+            returns = np.diff(np.log(close), prepend=np.log(close[0]))
+
+            feature_dict: dict[str, float] = {}
+
+            # Price features
+            for period in [1, 3, 6, 12, 24]:
+                key = f"returns_{period}"
+                if key in feature_names:
+                    if len(close) > period:
+                        feature_dict[key] = float(
+                            (close[-1] - close[-1 - period]) / close[-1 - period]
+                        )
+                    else:
+                        feature_dict[key] = 0.0
+
+            # Body / wick ratios
+            last_bar = recent_bars[-1]
+            o, h, l, c = (
+                last_bar.open.as_double(),
+                last_bar.high.as_double(),
+                last_bar.low.as_double(),
+                last_bar.close.as_double(),
+            )
+            rng = h - l if h > l else 1e-10
+            feature_dict["body_ratio"] = abs(c - o) / rng
+            feature_dict["upper_wick"] = (h - max(o, c)) / rng
+            feature_dict["lower_wick"] = (min(o, c) - l) / rng
+            feature_dict["gap"] = 0.0
+
+            # Volume features
+            vol_sma_20 = float(np.mean(volume[-20:])) if len(volume) >= 20 else float(np.mean(volume))
+            feature_dict["volume_sma_20"] = vol_sma_20
+            feature_dict["volume_ratio"] = float(volume[-1]) / vol_sma_20 if vol_sma_20 > 0 else 1.0
+            vol_std = float(np.std(volume[-20:])) if len(volume) >= 20 else 1.0
+            feature_dict["volume_zscore"] = (float(volume[-1]) - vol_sma_20) / vol_std if vol_std > 0 else 0.0
+            feature_dict["large_volume"] = 1.0 if feature_dict["volume_ratio"] > 2.0 else 0.0
+
+            # CVD approximations
+            buy_volume = volume * np.where(close > np.roll(close, 1), 1, 0.5)
+            sell_volume = volume - buy_volume
+            cvd = np.cumsum(buy_volume - sell_volume)
+            feature_dict["cvd"] = float(buy_volume[-1] - sell_volume[-1])
+            feature_dict["cvd_cum"] = float(cvd[-1])
+            for slope_n in [3, 6, 12]:
+                key = f"cvd_slope_{slope_n}"
+                if key in feature_names and len(cvd) >= slope_n:
+                    feature_dict[key] = float(cvd[-1] - cvd[-slope_n]) / slope_n
+                else:
+                    feature_dict[key] = 0.0
+            feature_dict["taker_buy_ratio"] = float(
+                buy_volume[-1] / volume[-1]
+            ) if volume[-1] > 0 else 0.5
+
+            # VWAP
+            cum_vp = np.cumsum(close * volume)
+            cum_v = np.cumsum(volume)
+            vwap = cum_vp[-1] / cum_v[-1] if cum_v[-1] > 0 else close[-1]
+            feature_dict["vwap_4h"] = float(vwap)
+            feature_dict["price_to_vwap"] = float(close[-1] / vwap) if vwap > 0 else 1.0
+
+            # Derivative placeholders (will be updated with live data)
+            for key in [
+                "funding_rate", "funding_abs", "funding_zscore_7d",
+                "funding_zscore_30d", "funding_extreme", "funding_positive",
+                "funding_cum_24h", "oi_value", "oi_delta_4h", "oi_delta_12h",
+                "oi_zscore", "oi_quadrant", "ls_ratio", "ls_ratio_zscore",
+                "taker_vol_ratio", "basis_approx", "basis_extreme",
+            ]:
+                if key in feature_names and key not in feature_dict:
+                    feature_dict[key] = 0.0
+
+            # Regime features
+            from src.features.regime_detector import (
+                calculate_adx,
+                calculate_atr_percentile,
+                calculate_hurst_exponent,
+            )
+            hurst = calculate_hurst_exponent(close[-300:])
+            adx_arr = calculate_adx(high, low, close)
+            adx_val = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
+            _, atr_pctl = calculate_atr_percentile(high, low, close)
+
+            feature_dict["hurst"] = hurst
+            feature_dict["adx"] = adx_val
+            feature_dict["atr_pct"] = float(
+                (high[-1] - low[-1]) / close[-1]
+            ) if close[-1] > 0 else 0.0
+            feature_dict["atr_percentile"] = atr_pctl
+            feature_dict["trend_strength"] = min(adx_val / 50.0, 1.0)
+            feature_dict["regime_confidence"] = min(adx_val / 50.0, 1.0)
+
+            # symbol_encoded (always last feature)
+            sym_str = str(self._instrument_id)
+            sym_map = {"BTCUSDT": 0, "ETHUSDT": 1, "SOLUSDT": 2}
+            # Extract base symbol from instrument_id
+            base = sym_str.split("-")[0] if "-" in sym_str else sym_str.split(".")[0]
+            feature_dict["symbol_encoded"] = float(sym_map.get(base, -1))
+
+            # Build vector in correct order
+            vector = np.array(
+                [feature_dict.get(f, 0.0) for f in feature_names],
+                dtype=np.float64,
+            )
+            return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+
+        except Exception as exc:
+            self.log.error(f"Feature computation failed: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Regime detection
+    # ------------------------------------------------------------------
+
+    def _detect_regime(self) -> Any:
+        """Detect current market regime from bar buffer."""
+        try:
+            import polars as pl
+            from src.features.regime_detector import RegimeState, MarketRegime
+
+            lookback = min(len(self._bars), 540)
+            recent = self._bars[-lookback:]
+            records = [_bar_to_dict(b) for b in recent]
+            df = pl.DataFrame(records)
+
+            state = self._regime_detector.detect(df, idx=-1)
+            self.log.debug(
+                f"Regime: {state.regime.value} | ADX={state.adx:.1f} "
+                f"| ATR%={state.atr_pct:.4f}"
+            )
+            return state
+
+        except Exception as exc:
+            self.log.error(f"Regime detection failed: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Model management
+    # ------------------------------------------------------------------
+
+    def _load_models(self) -> None:
+        """Load pickled LightGBM model bundles."""
+        models_dir = Path(self._config.models_dir)
+        for regime in ["trend", "high_vol"]:
+            path = models_dir / f"{regime}_model.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    bundle = pickle.load(f)
+                booster = bundle["booster"]
+                features = bundle.get("feature_columns", [])
+                if regime == "trend":
+                    self._trend_model = booster
+                    self._trend_features = features
+                else:
+                    self._highvol_model = booster
+                    self._highvol_features = features
+                self.log.info(
+                    f"Loaded {regime} model from {path} "
+                    f"({len(features)} features)"
+                )
+            else:
+                self.log.warning(f"Model not found: {path}")
+
+    def _select_model(
+        self, regime_label: str,
+    ) -> tuple[Any, list[str]]:
+        """Select model + feature list by regime."""
+        if regime_label in ("trend_up", "trend_down"):
+            return self._trend_model, self._trend_features
+        elif regime_label == "high_vol":
+            return self._highvol_model, self._highvol_features
+        # range / unknown → no model
+        return None, []
+
+    # ------------------------------------------------------------------
+    # Equity tracking
+    # ------------------------------------------------------------------
+
+    def _record_equity(self, ts_ns: int) -> None:
+        """Record equity snapshot for curve plotting."""
+        account = self.portfolio.account(self._venue)
+        if account is None:
+            return
+        try:
+            balance = account.balance_total(USDT)
+            upnl = self.portfolio.unrealized_pnl(self._instrument_id)
+            equity = balance.as_double() + (
+                upnl.as_double() if upnl is not None else 0.0
+            )
+            self._equity_curve.append((ts_ns, equity))
+        except Exception:
+            pass
