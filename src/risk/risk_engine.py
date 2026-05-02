@@ -419,16 +419,17 @@ class RiskEngine:
         return True, ""
 
     def _check_max_drawdown(self, state: PortfolioState) -> tuple[bool, str]:
-        """Kill switch: block if drawdown > absolute max."""
-        if state.current_drawdown_pct <= abs(self._config.max_drawdown_kill):
-            return True, ""
-        # drawdown_pct is stored as positive number (e.g. 0.16 = 16%)
-        # but config threshold is negative (-0.15)
-        # We compare: -drawdown_pct <= max_drawdown_kill
-        neg_dd = -state.current_drawdown_pct
-        if neg_dd <= self._config.max_drawdown_kill:
+        """Kill switch: block if drawdown > absolute max.
+
+        ``current_drawdown_pct`` is stored as a **positive** fraction
+        (e.g. 0.16 = 16% drawdown).  ``max_drawdown_kill`` is a negative
+        config value (e.g. -0.15).  We compare against ``abs(threshold)``.
+        """
+        threshold = abs(self._config.max_drawdown_kill)  # 0.15
+        if state.current_drawdown_pct > threshold:
             return False, (
                 f"KILL SWITCH: drawdown {state.current_drawdown_pct:.2%} "
-                f"> max {abs(self._config.max_drawdown_kill):.2%}"
+                f"> max {threshold:.2%}"
             )
         return True, ""
+

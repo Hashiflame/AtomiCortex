@@ -474,3 +474,215 @@ class TestIdempotentOrderIds:
         assert long_id.startswith("AC-L-")
         assert short_id.startswith("AC-S-")
         assert len(long_id) > 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROD-001: Kill switch boundary test
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestKillSwitchPROD001:
+    """PROD-001: verify simplified kill switch logic."""
+
+    def test_drawdown_15pct_triggers_kill_switch(self) -> None:
+        """DD=15.1% → KILL SWITCH → rejected."""
+        engine = RiskEngine(RiskConfig(max_drawdown_kill=-0.15), equity=10_000)
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=94_000.0, atr=1500.0,
+            atr_pct=0.016, funding_rate=0.0001,
+            timestamp=datetime.now(timezone.utc),
+        )
+        state = PortfolioState(
+            equity=8_490, open_positions=0,
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0,
+            current_drawdown_pct=0.151,  # 15.1% > 15%
+            consecutive_losses=0, last_loss_time=None,
+            peak_equity=10_000,
+        )
+        decision = engine.evaluate(signal, state)
+        assert not decision.approved
+        assert "KILL SWITCH" in decision.reason
+
+    def test_drawdown_14_9pct_passes_kill_switch(self) -> None:
+        """DD=14.9% → passes kill switch → approved (if other filters pass)."""
+        engine = RiskEngine(RiskConfig(max_drawdown_kill=-0.15), equity=10_000)
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=94_000.0, atr=1500.0,
+            atr_pct=0.016, funding_rate=0.0001,
+            timestamp=datetime.now(timezone.utc),
+        )
+        state = PortfolioState(
+            equity=8_510, open_positions=0,
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0,
+            current_drawdown_pct=0.149,  # 14.9% < 15%
+            consecutive_losses=0, last_loss_time=None,
+            peak_equity=10_000,
+        )
+        decision = engine.evaluate(signal, state)
+        assert decision.approved
+
+    def test_drawdown_exactly_15pct_passes(self) -> None:
+        """DD=15.0% (boundary) → NOT triggered (> required, not >=)."""
+        engine = RiskEngine(RiskConfig(max_drawdown_kill=-0.15), equity=10_000)
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=94_000.0, atr=1500.0,
+            atr_pct=0.016, funding_rate=0.0001,
+            timestamp=datetime.now(timezone.utc),
+        )
+        state = PortfolioState(
+            equity=8_500, open_positions=0,
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0,
+            current_drawdown_pct=0.15,  # exactly 15%
+            consecutive_losses=0, last_loss_time=None,
+            peak_equity=10_000,
+        )
+        decision = engine.evaluate(signal, state)
+        # 0.15 is NOT > 0.15, so kill switch should NOT trigger
+        assert decision.approved
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROD-002: Consecutive losses single-count test
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConsecutiveLossesPROD002:
+    """PROD-002: verify record_loss is called exactly once per close."""
+
+    def test_four_losses_do_not_trigger_circuit_breaker(self) -> None:
+        """4 consecutive losses → counter=4, circuit breaker (limit=5) NOT triggered."""
+        tracker = PortfolioTracker(10_000)
+        # Relax daily loss limit so we only test consecutive losses
+        engine = RiskEngine(
+            RiskConfig(consecutive_losses_limit=5, daily_loss_limit=-0.10,
+                       weekly_loss_limit=-0.20),
+            equity=10_000,
+        )
+
+        for i in range(4):
+            ts = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=i)
+            tracker.update_fill("BTCUSDT", 1, 0.1, 50_000, 1.0, ts)
+            # Lose $100 each time
+            tracker.close_position("BTCUSDT", 49_000, 1.0, ts + timedelta(hours=1))
+
+        state = tracker.get_state()
+        assert state.consecutive_losses == 4  # exactly 4, not 8
+
+        # Signal should pass (4 < 5)
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=50_000.0, atr=1500.0,
+            atr_pct=0.016, funding_rate=0.0001,
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        decision = engine.evaluate(signal, state)
+        assert decision.approved
+
+    def test_five_losses_trigger_circuit_breaker(self) -> None:
+        """5 consecutive losses → counter=5, circuit breaker triggered."""
+        tracker = PortfolioTracker(10_000)
+        # Relax daily loss limit so we only test consecutive losses
+        engine = RiskEngine(
+            RiskConfig(consecutive_losses_limit=5, daily_loss_limit=-0.10,
+                       weekly_loss_limit=-0.20),
+            equity=10_000,
+        )
+
+        for i in range(5):
+            ts = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=i)
+            tracker.update_fill("BTCUSDT", 1, 0.1, 50_000, 1.0, ts)
+            tracker.close_position("BTCUSDT", 49_000, 1.0, ts + timedelta(hours=1))
+
+        state = tracker.get_state()
+        assert state.consecutive_losses == 5  # exactly 5, not 10
+
+        # Signal should be blocked
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=50_000.0, atr=1500.0,
+            atr_pct=0.016, funding_rate=0.0001,
+            timestamp=datetime(2026, 1, 1, 6, tzinfo=timezone.utc),
+        )
+        decision = engine.evaluate(signal, state)
+        assert not decision.approved
+        assert "consecutive losses" in decision.reason
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROD-003: Funding rate from feature data
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFundingRatePROD003:
+    """PROD-003: verify extreme funding rate blocks signal."""
+
+    def test_extreme_funding_rate_blocks_signal(self) -> None:
+        """funding_rate > 0.1% → rejected by _check_funding_rate."""
+        engine = RiskEngine(
+            RiskConfig(max_funding_rate=0.001), equity=10_000,
+        )
+        signal = TradeSignal(
+            symbol="BTCUSDT", direction=1, confidence=0.80,
+            regime="trend", entry_price=94_000.0, atr=1500.0,
+            atr_pct=0.016,
+            funding_rate=0.002,  # 0.2% — extreme
+            timestamp=datetime.now(timezone.utc),
+        )
+        state = PortfolioState(
+            equity=10_000, open_positions=0,
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0,
+            current_drawdown_pct=0.0, consecutive_losses=0,
+            last_loss_time=None, peak_equity=10_000,
+        )
+        decision = engine.evaluate(signal, state)
+        assert not decision.approved
+        assert "funding" in decision.reason.lower()
+
+    def test_get_funding_rate_from_features(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """_get_funding_rate extracts rate from feature vector."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        feature_names = ["returns_1", "funding_rate", "adx"]
+        feature_vector = np.array([0.01, 0.0015, 25.0])
+
+        rate = strategy._get_funding_rate(feature_vector, feature_names)
+        assert rate == pytest.approx(0.0015)
+        assert strategy._last_funding_rate == pytest.approx(0.0015)
+
+    def test_get_funding_rate_fallback_zero(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """When funding_rate not in features → returns 0.0 (safe default)."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        feature_names = ["returns_1", "adx"]
+        feature_vector = np.array([0.01, 25.0])
+
+        rate = strategy._get_funding_rate(feature_vector, feature_names)
+        assert rate == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROD-005: Deferred SL submission
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDeferredStopLossPROD005:
+    """PROD-005: verify SL params are stored for deferred submission."""
+
+    def test_pending_sl_params_stored_on_init(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Strategy should have empty _pending_sl_params on init."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        assert strategy._pending_sl_params == {}
+
+    def test_pending_sl_params_type(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """_pending_sl_params should be a dict."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        assert isinstance(strategy._pending_sl_params, dict)

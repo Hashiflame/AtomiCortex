@@ -10,6 +10,7 @@ Phase 4 — Step 4.5.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -129,29 +130,6 @@ class LiveTrader:
             use_reduce_only=True,
         )
 
-        # Strategy config — one per symbol
-        strategies = []
-        for symbol in cfg.symbols:
-            # Nautilus instrument ID format: BTCUSDT-PERP.BINANCE
-            instrument_id = f"{symbol}.BINANCE"
-            bar_type = f"{instrument_id}-4-HOUR-LAST-EXTERNAL"
-
-            strat_config = MLStrategyConfig(
-                instrument_id=instrument_id,
-                bar_type=bar_type,
-                confidence_threshold=cfg.confidence_threshold,
-                models_dir=cfg.models_dir,
-                features_dir=cfg.features_dir,
-                risk_per_trade=cfg.risk_per_trade,
-                max_leverage=cfg.max_leverage,
-                max_open_positions=cfg.max_open_positions,
-                initial_equity=cfg.initial_equity,
-                dry_run=cfg.dry_run,
-            )
-            strategies.append(
-                {"strategy_path": f"{MLTradingStrategy.__module__}.{MLTradingStrategy.__name__}"}
-            )
-
         # Build TradingNode config
         node_config = TradingNodeConfig(
             trader_id=TraderId("ATOMICORTEX-001"),
@@ -205,7 +183,14 @@ class LiveTrader:
         return node
 
     def run(self) -> None:
-        """Start the TradingNode (blocks until stopped)."""
+        """Start the TradingNode (blocks until stopped).
+
+        ``TradingNode.run()`` calls ``loop.run_until_complete(run_async())``
+        internally and blocks.  When ``stop()`` is invoked (from a signal
+        handler or duration timer), ``node.stop()`` schedules
+        ``stop_async()`` on the same loop, which cancels the engine tasks
+        and lets ``run_async()`` return naturally.
+        """
         if self._node is None:
             self.build_node()
 
@@ -214,13 +199,44 @@ class LiveTrader:
             self._node.run()
         except KeyboardInterrupt:
             _log.info("KeyboardInterrupt — stopping...")
+        except Exception as exc:
+            _log.error(f"TradingNode run error: {exc}")
         finally:
-            self.stop()
+            self._dispose()
 
     def stop(self) -> None:
-        """Graceful stop."""
+        """Request a graceful stop.
+
+        This is safe to call from **any thread** (including signal
+        handlers and duration-timer threads).  It calls
+        ``TradingNode.stop()`` which internally checks
+        ``loop.is_running()`` and schedules ``stop_async()`` as a task
+        on the correct event loop — no cross-thread loop access.
+
+        ``dispose()`` is NOT called here; it is called in ``run()``'s
+        ``finally`` block after the loop has stopped.
+        """
         if self._node is not None:
-            _log.info("Stopping TradingNode...")
-            self._node.dispose()
-            self._node = None
+            _log.info("Requesting TradingNode stop...")
+            try:
+                self._node.stop()
+            except Exception as exc:
+                _log.warning(f"Error requesting stop: {exc}")
+
+    def _dispose(self) -> None:
+        """Dispose of the node after the event loop has stopped.
+
+        Called only from ``run()``'s ``finally`` block, where the loop
+        is guaranteed to have stopped.
+        """
+        if self._node is not None:
+            _log.info("Disposing TradingNode...")
+            try:
+                # Give engines a moment to finish flushing
+                time.sleep(1)
+                self._node.dispose()
+            except Exception as exc:
+                _log.warning(f"Error during dispose: {exc}")
+            finally:
+                self._node = None
             _log.info("TradingNode disposed")

@@ -2027,3 +2027,494 @@ print(bt)  # -> BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL
 ---
 
 *Последнее обновление: 2026-05 | Фаза: 4.4–4.5 — Live Trader (NT2-001–NT2-007)*
+
+---
+
+## Фаза 4 — Production Code Review
+
+Детальный аудит всех файлов Фазы 4 перед production-развёртыванием.
+
+**Файлы проверены:**
+- `src/risk/risk_engine.py` (435 строк)
+- `src/risk/circuit_breaker.py` (241 строка)
+- `src/risk/portfolio_tracker.py` (254 строки)
+- `src/execution/strategies/ml_strategy.py` (610 строк)
+- `src/execution/live_trader.py` (266 строк)
+- `src/execution/heartbeat.py` (186 строк)
+- `src/execution/watchdog.py` (488 строк)
+- `src/execution/reconciler.py` (271 строка)
+
+### Сводная таблица
+
+| ID | Severity | Категория | Файл | Описание |
+|----|----------|-----------|------|----------|
+| PROD-001 | 🔴 | Безопасность | `risk_engine.py:421-434` | Kill switch `_check_max_drawdown` содержит дублирующую/мёртвую логику |
+| PROD-002 | 🔴 | Безопасность | `ml_strategy.py:330-331` | Двойной подсчёт consecutive losses |
+| PROD-003 | 🔴 | Безопасность | `ml_strategy.py:243` | Хардкод `funding_rate=0.0001` вместо реальных данных |
+| PROD-004 | 🟠 | Математика | `portfolio_tracker.py:96-104` | `update_fill` ломает avg_entry_price при partial fill на существующую позицию другого направления |
+| PROD-005 | 🟠 | Безопасность | `ml_strategy.py:362-388` | Entry + SL ордера не атомарны — SL может остаться без позиции |
+| PROD-006 | 🟠 | Edge case | `ml_strategy.py:122-123` | `_bars` — unbounded list → memory leak |
+| PROD-007 | 🟠 | Edge case | `live_trader.py:133-154` | Dead code: первый цикл создаёт `strategies` list, но он нигде не используется |
+| PROD-008 | 🟡 | Математика | `risk_engine.py:382` | Volatility filter использует hardcoded baseline 1% вместо скользящего среднего |
+| PROD-009 | 🟡 | Edge case | `ml_strategy.py:278-301` | `on_order_filled` не различает entry vs exit fill → tracker считает exit fill как новый trade |
+| PROD-010 | 🟡 | Edge case | `watchdog.py:90` | `_incidents` — unbounded list |
+| PROD-011 | 🟡 | Production | `ml_strategy.py:564-565` | Pickle deserialization без верификации — потенциальный arbitrary code execution |
+| PROD-012 | 🟡 | Edge case | `portfolio_tracker.py:95-103` | Partial close не поддерживается — только full open или add to existing |
+| PROD-013 | 🔵 | Production | `ml_strategy.py:126` | `_equity_curve` — unbounded list (менее критично чем bars) |
+| PROD-014 | 🔵 | Production | `circuit_breaker.py:67-69` | `_daily_triggered` никогда не проверяется повторно |
+| PROD-015 | 🔵 | Edge case | `reconciler.py:214-228` | `auto_fix=True` ничего реально не исправляет (только "Would close") |
+
+---
+
+### 🔴 КРИТИЧЕСКИЕ
+
+---
+
+### [PROD-001] Kill Switch содержит мёртвую логику — может ПРОПУСТИТЬ drawdown >15%
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/risk/risk_engine.py:421-434
+```
+
+**Код проблемы:**
+
+```python
+def _check_max_drawdown(self, state: PortfolioState) -> tuple[bool, str]:
+    """Kill switch: block if drawdown > absolute max."""
+    if state.current_drawdown_pct <= abs(self._config.max_drawdown_kill):
+        return True, ""                           # ← строка 423
+    neg_dd = -state.current_drawdown_pct
+    if neg_dd <= self._config.max_drawdown_kill:
+        return False, (...)
+    return True, ""                               # ← строка 434: мёртвый код
+```
+
+**Проблема:** Двухэтапная проверка с неправильной первой веткой.
+
+- `state.current_drawdown_pct` хранится как **положительное** число (0.16 = 16% drawdown).
+- `abs(self._config.max_drawdown_kill)` = `abs(-0.15)` = `0.15`.
+- Строка 423: `0.16 <= 0.15` → `False` → проверка проходит ко второму блоку.
+- Строка 429: `neg_dd = -0.16`, `max_drawdown_kill = -0.15`, `-0.16 <= -0.15` → `True` → BLOCKED.
+
+Для drawdown=16% **оба блока работают верно**, но логика запутана и содержит мёртвый `return True` на строке 434 (достижим только если drawdown > kill_threshold по первой проверке, но второй блок уже поймает). Настоящая опасность: **если кто-то изменит drawdown_pct на отрицательное число** (что семантически может произойти при рефакторинге), первая ветка поломается.
+
+**Решение — упростить:**
+
+```python
+def _check_max_drawdown(self, state: PortfolioState) -> tuple[bool, str]:
+    threshold = abs(self._config.max_drawdown_kill)  # 0.15
+    if state.current_drawdown_pct > threshold:
+        return False, (
+            f"KILL SWITCH: drawdown {state.current_drawdown_pct:.2%} "
+            f"> max {threshold:.2%}"
+        )
+    return True, ""
+```
+
+**Severity:** 🔴 — Kill switch должен быть кристально ясным, ноль двусмысленности.
+
+---
+
+### [PROD-002] Двойной подсчёт consecutive losses
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:310-331
+```
+
+**Код проблемы:**
+
+```python
+# on_position_closed (строки 321-331):
+if self._tracker:
+    self._tracker.close_position(...)  # ← внутри close_position() уже вызывает record_loss()!
+
+    if realized_pnl < 0:
+        self._tracker.record_loss(now_utc)  # ← ДУБЛЬ!
+```
+
+**Причина:** `PortfolioTracker.close_position()` (строка 162-163 portfolio_tracker.py) **уже** вызывает `self.record_loss(timestamp)` при `realized_pnl < 0`. Затем `on_position_closed` вызывает `record_loss` **повторно**.
+
+**Последствия:** `consecutive_losses` инкрементируется **дважды** за один убыточный трейд. При 3 реальных проигрышах подряд counter покажет 6, и circuit breaker сработает на 3-м проигрыше вместо 5-го.
+
+**Решение:** Убрать дублирующий `record_loss` из `on_position_closed`:
+
+```python
+# on_position_closed — ИСПРАВЛЕНО:
+if self._tracker:
+    self._tracker.close_position(
+        symbol=str(event.instrument_id),
+        close_price=event.avg_px_close.as_double(),
+        fee=0.0,
+        timestamp=now_utc,
+    )
+    # НЕ вызываем record_loss() — close_position() уже это делает
+```
+
+**Severity:** 🔴 — Преждевременная остановка торговли = потерянные сигналы.
+
+---
+
+### [PROD-003] Hardcoded funding_rate=0.0001 вместо реальных данных
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:243
+```
+
+**Код проблемы:**
+
+```python
+signal = TradeSignal(
+    ...
+    funding_rate=0.0001,  # default; will be updated from live feed
+    ...
+)
+```
+
+**Проблема:** Эта строка **никогда не обновляется из live feed**. TODO-комментарий оставлен, но не реализован. В реальности funding rate BTC колеблется от -0.05% до +0.3%. Hardcoded 0.01% (1 bps):
+
+1. Пропускает `_check_funding_rate` (порог 0.1%) когда реальный rate = 0.15%
+2. Неправильно считает expected cost → возможен вход в убыточные сделки при extreme funding
+
+**Решение:** Подписаться на Binance funding rate stream или запрашивать REST endpoint `/fapi/v1/premiumIndex` при каждом сигнале.
+
+**Severity:** 🔴 — Неверный расчёт стоимости позиции → реальные убытки.
+
+---
+
+### 🟠 СЕРЬЁЗНЫЕ
+
+---
+
+### [PROD-004] update_fill ломает avg_entry_price при разнонаправленных fills
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/risk/portfolio_tracker.py:95-104
+```
+
+**Код проблемы:**
+
+```python
+if symbol in self._positions:
+    pos = self._positions[symbol]
+    total_qty = pos.quantity + quantity   # всегда складывает
+    if total_qty > 0:
+        pos.avg_entry_price = (
+            pos.avg_entry_price * pos.quantity + price * quantity
+        ) / total_qty
+    pos.quantity = total_qty
+```
+
+**Проблема:** `update_fill` **не учитывает direction** при добавлении к позиции. Если у нас LONG 0.5 BTC и приходит fill на exit (тоже SELL 0.5), то:
+- `total_qty = 0.5 + 0.5 = 1.0` (увеличивает вместо уменьшения!)
+- `avg_entry_price` пересчитывается неверно
+
+Метод предполагает, что `quantity` **всегда положительная**, и direction определяет только знак PnL. Но partial close (reduce) выглядит как fill в противоположном направлении.
+
+**Влияние:** При текущей архитектуре (market entry + full close через stop или on_position_closed → close_position) это **не вызывает ошибок**, потому что close идёт через `close_position()`, а не `update_fill()`. Но если в будущем добавить partial closes, формула сломается.
+
+**Решение:** Добавить проверку direction при update_fill и обрабатывать противоположные fills как partial close.
+
+**Severity:** 🟠 — Сейчас safe благодаря текущей архитектуре, но fragile.
+
+---
+
+### [PROD-005] Entry + Stop Loss ордера не атомарны
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:362-388
+```
+
+**Код проблемы:**
+
+```python
+# 1. Market entry
+entry_order = self.order_factory.market(...)
+self.submit_order(entry_order)
+
+# 2. Stop-loss
+stop_order = self.order_factory.stop_market(...)
+self.submit_order(stop_order)
+```
+
+**Проблема:** Между submit entry и submit stop-loss проходит время. Если:
+- Entry fillится
+- Strategy крашится до submit stop_order
+- → Позиция открыта БЕЗ стоп-лосса!
+
+Также: если entry **отклоняется** (insufficient margin), stop-loss всё равно будет отправлен → "голый" stop на бирже.
+
+**Решение:** 
+1. Отправлять stop-loss из `on_position_opened` (что гарантирует позиция реально открыта)
+2. Сохранять mapping entry_order_id → stop_params в _pending_stops
+
+Частичный workaround уже есть (`reduce_only=True` на стопе), который гарантирует что "голый" стоп не откроет новую позицию. Но сценарий "позиция без стопа" остаётся.
+
+**Severity:** 🟠 — reduce_only защищает от reverse-entry, но crash-without-stop реален.
+
+---
+
+### [PROD-006] _bars list не ограничен — memory leak
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:122, 183
+```
+
+**Код проблемы:**
+
+```python
+self._bars: list[Bar] = []       # строка 122
+
+def on_bar(self, bar: Bar) -> None:
+    self._bars.append(bar)       # строка 183
+    # ... lookback = min(len(self._bars), 540)  # строка 407
+```
+
+**Проблема:** Бары **никогда не удаляются**. За неделю непрерывной работы при 4H барах = 42 бара. Не критично. Но при подписке на 1m bars = 10,080 Bar объектов в неделю. За месяц — 40,000+ объектов (каждый ~200 bytes Cython) ≈ 8 MB.
+
+Lookback использует только 540, значит всё что старше — мёртвый вес.
+
+**Решение:**
+
+```python
+MAX_BARS_BUFFER = 600  # > warmup_bars + lookback margin
+
+def on_bar(self, bar: Bar) -> None:
+    self._bars.append(bar)
+    if len(self._bars) > MAX_BARS_BUFFER:
+        self._bars = self._bars[-MAX_BARS_BUFFER:]
+```
+
+**Severity:** 🟠 — При 4H bars не критично; при переходе на 1m/5m bars — серьёзная утечка.
+
+---
+
+### [PROD-007] Dead code в live_trader.py — первый цикл strategies бесполезен
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/live_trader.py:133-154
+```
+
+**Код проблемы:**
+
+```python
+# Strategy config — one per symbol
+strategies = []                           # строка 134
+for symbol in cfg.symbols:                # строка 135
+    ...
+    strat_config = MLStrategyConfig(...)   # создаёт config
+    strategies.append(                     # строка 152
+        {"strategy_path": ...}            # кладёт в список
+    )
+
+# ... далее ...
+
+# Add strategy instances manually (after build)
+for symbol in cfg.symbols:                # строка 183: ВТОРОЙ ЦИКЛ
+    strat_config = MLStrategyConfig(...)   # ДУБЛИКАТ!
+    strategy = MLTradingStrategy(...)
+    node.trader.add_strategy(strategy)
+```
+
+**Проблема:** Первый цикл (строки 134-154) создаёт `strategies` list и `strat_config`, но список **нигде не используется** и config **пересоздаётся** во втором цикле. Двойная работа + путаница.
+
+**Решение:** Удалить первый цикл полностью.
+
+**Severity:** 🟠 — Wasted compute + confusion, не баг.
+
+---
+
+### 🟡 УМЕРЕННЫЕ
+
+---
+
+### [PROD-008] Volatility filter hardcodes 1% baseline
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/risk/risk_engine.py:382
+```
+
+**Код:**
+
+```python
+if signal.atr_pct > self._config.vol_spike_multiplier * 0.01:
+```
+
+**Проблема:** 1% (0.01) hardcoded как "средний ATR%". Для BTC среднее ATR% ≈ 2.5%, для SOL ≈ 5%. При `vol_spike_multiplier=2.0`:
+- Порог = 2%, что является **нормальным** ATR для BTC
+- Множество валидных сигналов будут заблокированы
+
+**Решение:** Использовать скользящее среднее ATR% (доступно через `RegimeState.atr_pct` из regime detector) или передавать `avg_atr_pct` в `TradeSignal`.
+
+**Severity:** 🟡 — Ложные срабатывания фильтра, не пропускает опасные сигналы.
+
+---
+
+### [PROD-009] on_order_filled не различает entry vs exit fills
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:278-301
+```
+
+**Код:**
+
+```python
+def on_order_filled(self, event: OrderFilled) -> None:
+    direction = 1 if is_buy else -1
+    self._tracker.update_fill(
+        symbol=str(event.instrument_id),
+        direction=direction,
+        quantity=fill_qty,
+        ...
+    )
+```
+
+**Проблема:** Каждый fill (entry, stop-loss hit, manual close) вызывает `update_fill()`. При исполнении stop-loss:
+1. `on_order_filled` → `update_fill` добавляет SELL fill как "новую" запись
+2. `on_position_closed` → `close_position` закрывает позицию
+
+Получается двойной учёт: fill обрабатывается и как add-to-position, и как close. Частично спасает то что `close_position()` удаляет позицию из dict. Но `_cash` уже модифицирован в `update_fill` (строка 93: `self._cash -= fee`), и в `close_position` модифицируется снова.
+
+**Решение:** В `on_order_filled` проверять, является ли fill reduce-only (exit), и не вызывать `update_fill` для exit fills. Или использовать `event.client_order_id` / tags для различия.
+
+**Severity:** 🟡 — fees считаются дважды, equity drift.
+
+---
+
+### [PROD-010] watchdog._incidents — unbounded list
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/watchdog.py:90, 304
+```
+
+**Проблема:** `self._incidents.append(incident)` без лимита. При повторных watchdog triggers (например, Redis flapping) список будет расти бесконечно.
+
+**Решение:** Использовать `collections.deque(maxlen=100)`.
+
+**Severity:** 🟡 — Watchdog lightweight, но принцип.
+
+---
+
+### [PROD-011] Pickle deserialization без верификации
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/execution/strategies/ml_strategy.py:564-565
+```
+
+**Код:**
+
+```python
+with open(path, "rb") as f:
+    bundle = pickle.load(f)
+```
+
+**Проблема:** `pickle.load()` исполняет произвольный Python код. Если кто-то подменит model file — arbitrary code execution.
+
+**Решение:** В production:
+1. Проверять hash/checksum модели перед загрузкой
+2. Использовать `lightgbm.Booster(model_file=...)` напрямую вместо pickle
+3. Или хотя бы проверять `isinstance(bundle, dict)` и наличие ожидаемых ключей
+
+**Severity:** 🟡 — Файлы под нашим контролем, но security best practice.
+
+---
+
+### [PROD-012] Partial close не поддерживается в PortfolioTracker
+
+```
+Дата:    2026-05
+Фаза:    4 — Production Code Review
+Файл:    src/risk/portfolio_tracker.py:135-182
+```
+
+**Проблема:** `close_position()` **всегда удаляет** позицию из dict (`del self._positions[symbol]`). Partial close (закрыть 50% из 1.0 BTC) невозможен — tracker удалит всю позицию.
+
+**Влияние:** Текущая стратегия всегда закрывает 100%, поэтому не вызывает ошибок. Но если добавить scale-out или partial TP — сломается.
+
+**Решение:** Добавить `partial_close_position(symbol, close_qty, close_price, fee, timestamp)`.
+
+**Severity:** 🟡 — Не блокер сейчас, блокер при scale-out.
+
+---
+
+### 🔵 НИЗКИЕ
+
+---
+
+### [PROD-013] _equity_curve unbounded
+
+```
+Файл: src/execution/strategies/ml_strategy.py:126
+```
+
+`self._equity_curve: list[tuple[int, float]] = []` растёт бесконечно. ~16 bytes × 6 bars/day = ~35 KB/year. Не критично, но `deque(maxlen=5000)` будет чище.
+
+---
+
+### [PROD-014] CircuitBreaker._daily_triggered никогда не перепроверяется
+
+```
+Файл: src/risk/circuit_breaker.py:67-69
+```
+
+`_daily_triggered` устанавливается в `True` при daily hard breaker, и `reset_daily()` сбрасывает его. Но `_daily_triggered` **нигде не проверяется** в `check()` — метод каждый раз проверяет `portfolio_state.daily_pnl_pct` напрямую. Поле бесполезно.
+
+---
+
+### [PROD-015] reconciler auto_fix ничего реально не делает
+
+```
+Файл: src/execution/reconciler.py:214-228
+```
+
+Когда `auto_fix=True`, код добавляет строки "Would close orphan X" — но реальных REST-вызовов для закрытия orphan позиций нет. Это placeholder.
+
+---
+
+### ТОП-5 КРИТИЧЕСКИХ ПРОБЛЕМ (приоритет исправления)
+
+| # | ID | Описание | Риск |
+|---|----|----------|------|
+| 1 | **PROD-002** | Двойной `record_loss` → circuit breaker срабатывает на 3-м проигрыше вместо 5-го | Преждевременный halt торговли |
+| 2 | **PROD-003** | Hardcoded `funding_rate=0.0001` → не блокирует extreme funding | Реальные убытки на funding |
+| 3 | **PROD-001** | Kill switch логика запутана → fragile при рефакторинге | Может пропустить 15%+ DD |
+| 4 | **PROD-005** | Entry + SL не атомарны → crash = позиция без стопа | Неограниченный убыток |
+| 5 | **PROD-009** | Entry/exit fills не различаются → двойной учёт fees | Drift equity tracker |
+
+---
+
+### Чеклист edge cases
+
+| Сценарий | Результат | Оценка |
+|----------|-----------|--------|
+| Partial fill на entry? | Nautilus обрабатывает через OrderPartiallyFilled → нет partial support в tracker | 🟡 Допустимо при market IOC |
+| Stop-loss не исполнился (gap/slippage)? | Watchdog закроет через emergency_close_all() если bot alive. Если позиция в убытке > drawdown → kill switch | ✅ Два уровня защиты |
+| Два сигнала одновременно? | `max_open_positions` filter блокирует. Но если оба проходят filter до fill первого → оба откроются | 🟡 Теоретический race condition |
+| Redis недоступен при старте? | HeartbeatManager: WARNING, продолжает работу. Watchdog: fail-open, не триггерит | ✅ Корректно |
+| Binance API timeout при emergency close? | aiohttp timeout=10s, error logged, positions may remain open | 🟠 Нужен retry |
+| Бот перезапустился с open positions? | Nautilus reconciliation, но внутренний tracker пуст → ghost positions | 🟡 Reconciler нужно вызвать в on_start |
+
+---
+
+*Последнее обновление: 2026-05 | Фаза: 4 Code Review (PROD-001–PROD-015)*

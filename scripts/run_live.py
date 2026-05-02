@@ -17,6 +17,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -118,33 +119,48 @@ def main() -> None:
     # Create trader
     trader = LiveTrader(config)
 
-    # Duration-based auto-stop
+    # Duration-based auto-stop:
+    # Send SIGINT to the main process — this is the safest way to
+    # stop the Nautilus event loop from a background thread.
+    # SIGINT is caught by the signal handler below, which calls
+    # trader.stop() → node.stop() → schedules stop_async() on the loop.
     if args.duration > 0:
         def _auto_stop() -> None:
             time.sleep(args.duration)
-            log.info(f"Duration limit ({args.duration}s) reached — stopping")
-            trader.stop()
+            log.info(f"Duration limit ({args.duration}s) reached — sending SIGINT")
+            os.kill(os.getpid(), signal.SIGINT)
 
         t = threading.Thread(target=_auto_stop, daemon=True)
         t.start()
 
     # Graceful SIGINT / SIGTERM
+    # Call trader.stop() which schedules stop_async on the Nautilus loop.
+    # Do NOT call sys.exit() — that would bypass run()'s finally block
+    # where dispose() is called.
+    _stop_requested = False
+
     def _signal_handler(sig: int, frame: Any) -> None:
-        log.info("Signal received — stopping...")
+        nonlocal _stop_requested
+        if _stop_requested:
+            log.warning("Force exit (second signal)")
+            sys.exit(1)
+        _stop_requested = True
+        log.info("Signal received — requesting graceful stop...")
         trader.stop()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Run
+    # Run — blocks until node.stop() causes run_async() to return.
+    # The finally block in trader.run() calls _dispose().
     try:
         trader.run()
+    except SystemExit:
+        pass
     except Exception as exc:
         log.error(f"Fatal error: {exc}", exc_info=True)
-        trader.stop()
-        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

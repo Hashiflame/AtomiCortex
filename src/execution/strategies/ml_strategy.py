@@ -128,6 +128,13 @@ class MLTradingStrategy(Strategy):
         # Track pending SL/TP per instrument to avoid duplicate orders
         self._pending_stops: dict[str, str] = {}  # instrument_id → client_order_id
 
+        # Last known funding rate (updated from feature data)
+        self._last_funding_rate: float = 0.0
+
+        # Pending SL params: entry client_order_id → {decision, signal} for
+        # deferred stop-loss submission (placed in on_order_filled, not _open_position)
+        self._pending_sl_params: dict[str, dict[str, Any]] = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -232,6 +239,9 @@ class MLTradingStrategy(Strategy):
         atr_dollar = regime_state.atr_pct * current_price
         now_utc = datetime.fromtimestamp(bar.ts_event / 1e9, tz=timezone.utc)
 
+        # Read funding rate from feature data (PROD-003 fix)
+        funding_rate = self._get_funding_rate(feature_vector, feature_names)
+
         signal = TradeSignal(
             symbol=str(self._instrument_id),
             direction=direction,
@@ -240,7 +250,7 @@ class MLTradingStrategy(Strategy):
             entry_price=current_price,
             atr=atr_dollar,
             atr_pct=regime_state.atr_pct,
-            funding_rate=0.0001,  # default; will be updated from live feed
+            funding_rate=funding_rate,
             timestamp=now_utc,
         )
 
@@ -276,20 +286,32 @@ class MLTradingStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def on_order_filled(self, event: OrderFilled) -> None:
-        """Update portfolio tracker and place stop orders on entry fill."""
+        """Handle order fills: entry fills update tracker + submit SL,
+        exit fills are ignored (handled by on_position_closed).
+
+        PROD-009 fix: distinguish entry vs exit fills via order tags.
+        PROD-005 fix: SL is submitted here (after confirmed fill), not
+        in _open_position, to guarantee no position without a stop.
+        """
         fill_price = event.last_px.as_double()
         fill_qty = event.last_qty.as_double()
         commission = event.commission.as_double() if event.commission else 0.0
         is_buy = event.is_buy
         now_utc = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc)
+        client_oid = str(event.client_order_id)
 
         self.log.info(
             f"ORDER FILLED | {event.order_side} {fill_qty} "
-            f"@ {fill_price} | commission={commission}"
+            f"@ {fill_price} | commission={commission} | oid={client_oid}"
         )
 
-        # Update tracker
-        if self._tracker:
+        # Distinguish entry vs exit fill:
+        # - Entry fills have pending SL params stored by _open_position
+        # - Exit fills (SL hit, manual close) do NOT have pending params
+        is_entry_fill = client_oid in self._pending_sl_params
+
+        if is_entry_fill and self._tracker:
+            # Entry fill → update tracker + place SL
             direction = 1 if is_buy else -1
             self._tracker.update_fill(
                 symbol=str(event.instrument_id),
@@ -300,15 +322,32 @@ class MLTradingStrategy(Strategy):
                 timestamp=now_utc,
             )
 
+            # Submit deferred stop-loss (PROD-005 fix: SL after confirmed entry)
+            sl_params = self._pending_sl_params.pop(client_oid)
+            self._submit_stop_loss_with_retry(
+                decision=sl_params["decision"],
+                signal=sl_params["signal"],
+                fill_qty=fill_qty,
+            )
+        else:
+            # Exit fill (SL or manual close) → fees tracked via close_position
+            self.log.debug(
+                f"Exit fill (SL/close) | {event.order_side} {fill_qty} @ {fill_price}"
+            )
+
     def on_position_opened(self, event: PositionOpened) -> None:
-        """Place stop-loss after position is confirmed open."""
+        """Log position open."""
         self.log.info(
             f"POSITION OPENED | {event.instrument_id} | "
             f"side={event.entry} qty={event.quantity}"
         )
 
     def on_position_closed(self, event: PositionClosed) -> None:
-        """Handle position close: update PnL, track consecutive losses."""
+        """Handle position close: update PnL via tracker.
+
+        PROD-002 fix: do NOT call record_loss() here — close_position()
+        already calls it internally when realized_pnl < 0.
+        """
         realized_pnl = event.realized_pnl.as_double() if event.realized_pnl else 0.0
         now_utc = datetime.fromtimestamp(event.ts_event / 1e9, tz=timezone.utc)
 
@@ -318,17 +357,14 @@ class MLTradingStrategy(Strategy):
             f"return={event.realized_return:.4f}"
         )
 
-        # Close in tracker
+        # Close in tracker (record_loss is handled inside close_position)
         if self._tracker:
             self._tracker.close_position(
                 symbol=str(event.instrument_id),
                 close_price=event.avg_px_close.as_double(),
-                fee=0.0,  # fees already accounted in OrderFilled
+                fee=0.0,  # fees already accounted in on_order_filled
                 timestamp=now_utc,
             )
-
-            if realized_pnl < 0:
-                self._tracker.record_loss(now_utc)
 
         # TODO: Telegram alert (Phase 5)
 
@@ -341,7 +377,12 @@ class MLTradingStrategy(Strategy):
         decision: RiskDecision,
         signal: TradeSignal,
     ) -> None:
-        """Submit market order + exchange-side STOP_MARKET."""
+        """Submit market entry order.
+
+        PROD-005 fix: stop-loss is now submitted in on_order_filled()
+        after the entry fill is confirmed, not here.  This eliminates
+        the crash-between-entry-and-SL window.
+        """
         instrument = self.cache.instrument(self._instrument_id)
         if instrument is None:
             self.log.error(f"Instrument {self._instrument_id} not found in cache")
@@ -349,7 +390,6 @@ class MLTradingStrategy(Strategy):
 
         # Direction → OrderSide
         entry_side = OrderSide.BUY if signal.direction == 1 else OrderSide.SELL
-        exit_side = OrderSide.SELL if signal.direction == 1 else OrderSide.BUY
 
         # Quantity (round to instrument precision)
         qty = instrument.make_qty(decision.position_size)
@@ -359,7 +399,7 @@ class MLTradingStrategy(Strategy):
         dir_str = "L" if signal.direction == 1 else "S"
         entry_tag = f"AC-{dir_str}-{ts_ms}"
 
-        # 1. Market entry
+        # Market entry
         entry_order = self.order_factory.market(
             instrument_id=self._instrument_id,
             order_side=entry_side,
@@ -367,28 +407,92 @@ class MLTradingStrategy(Strategy):
             time_in_force=TimeInForce.IOC,
             tags=[entry_tag],
         )
+
+        # Store SL params for deferred submission (on_order_filled will use these)
+        self._pending_sl_params[str(entry_order.client_order_id)] = {
+            "decision": decision,
+            "signal": signal,
+        }
+
         self.submit_order(entry_order)
         self.log.info(
             f"ENTRY submitted | {entry_side} {qty} | "
-            f"tag={entry_tag}"
+            f"tag={entry_tag} | SL deferred to fill confirmation"
         )
 
-        # 2. Stop-loss (exchange-side STOP_MARKET, reduce_only)
+    def _submit_stop_loss_with_retry(
+        self,
+        decision: RiskDecision,
+        signal: TradeSignal,
+        fill_qty: float,
+        max_retries: int = 3,
+    ) -> None:
+        """Submit exchange-side STOP_MARKET with retry logic.
+
+        PROD-005 fix: called from on_order_filled after entry is confirmed.
+        Retries up to ``max_retries`` times.  Logs CRITICAL if all fail.
+        """
+        instrument = self.cache.instrument(self._instrument_id)
+        if instrument is None:
+            self.log.critical(
+                f"CRITICAL: Cannot place SL — instrument {self._instrument_id} "
+                f"not in cache! Position is UNPROTECTED!"
+            )
+            return
+
+        exit_side = OrderSide.SELL if signal.direction == 1 else OrderSide.BUY
         sl_price = instrument.make_price(decision.stop_loss)
-        stop_order = self.order_factory.stop_market(
-            instrument_id=self._instrument_id,
-            order_side=exit_side,
-            quantity=qty,
-            trigger_price=sl_price,
-            trigger_type=TriggerType.LAST_PRICE,
-            time_in_force=TimeInForce.GTC,
-            reduce_only=True,
-            tags=[f"SL-{entry_tag}"],
+        qty = instrument.make_qty(fill_qty)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                stop_order = self.order_factory.stop_market(
+                    instrument_id=self._instrument_id,
+                    order_side=exit_side,
+                    quantity=qty,
+                    trigger_price=sl_price,
+                    trigger_type=TriggerType.LAST_PRICE,
+                    time_in_force=TimeInForce.GTC,
+                    reduce_only=True,
+                    tags=[f"SL-attempt-{attempt}"],
+                )
+                self.submit_order(stop_order)
+                self.log.info(
+                    f"STOP LOSS submitted | {exit_side} {qty} "
+                    f"@ trigger={sl_price} | attempt={attempt}"
+                )
+                return  # success
+            except Exception as exc:
+                self.log.error(
+                    f"SL submission failed (attempt {attempt}/{max_retries}): {exc}"
+                )
+
+        # All retries exhausted
+        self.log.critical(
+            f"CRITICAL: Failed to place SL after {max_retries} attempts! "
+            f"Position is UNPROTECTED! Manual intervention required."
         )
-        self.submit_order(stop_order)
-        self.log.info(
-            f"STOP LOSS submitted | {exit_side} {qty} @ trigger={sl_price}"
-        )
+
+    def _get_funding_rate(
+        self,
+        feature_vector: np.ndarray | None,
+        feature_names: list[str],
+    ) -> float:
+        """Extract funding rate from feature vector.
+
+        PROD-003 fix: read actual funding_rate from feature data instead
+        of hardcoded 0.0001.  Falls back to 0.0 (safe default that will
+        not bypass the extreme-funding filter).
+        """
+        if feature_vector is not None and "funding_rate" in feature_names:
+            idx = feature_names.index("funding_rate")
+            rate = float(feature_vector[idx])
+            if not np.isnan(rate) and not np.isinf(rate):
+                self._last_funding_rate = rate
+                return rate
+
+        # Fallback: use last known rate or 0.0 (safe default)
+        return self._last_funding_rate
 
     # ------------------------------------------------------------------
     # Feature computation
