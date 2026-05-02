@@ -193,24 +193,37 @@ class TestATRPercentile:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestRegimeDetect:
-    def test_detect_trend(self):
-        """Trending data → TREND_UP or TREND_DOWN."""
-        # Use persistent AR(1) prices wrapped in a DataFrame
-        prices = _ar1_prices(500, phi=0.6, seed=42)
-        df = pl.DataFrame({
-            "open_time": [_BASE_MS + i * _BAR_MS for i in range(500)],
-            "open": prices - 10.0,
-            "high": prices + 30.0,
-            "low": prices - 30.0,
-            "close": prices,
-            "volume": [500.0] * 500,
-            "taker_buy_volume": [250.0] * 500,
-        })
+    def test_detect_trend_strong_adx(self):
+        """Strong linear trend (ADX > 25) → TREND_UP or TREND_DOWN."""
+        # Linear ramp guarantees ADX >> 25
+        df = _trending_klines(500, direction=1.0)
         det = RegimeDetector(hurst_window=200)
         state = det.detect(df)
         assert state.regime in (
             MarketRegime.TREND_UP, MarketRegime.TREND_DOWN, MarketRegime.HIGH_VOL,
-        ), f"Expected TREND or HIGH_VOL, got {state.regime}"
+        ), f"Expected TREND or HIGH_VOL for strong ADX, got {state.regime}"
+        # ADX should be very high on a linear ramp
+        assert state.adx > 25, f"Expected ADX > 25, got {state.adx}"
+
+    def test_detect_range_low_adx(self):
+        """Flat/sideways data (ADX < 20) → RANGE."""
+        n = 500
+        rng = np.random.default_rng(42)
+        close = 40_000.0 + rng.normal(0, 1.0, n)  # nearly flat
+        df = pl.DataFrame({
+            "open_time": [_BASE_MS + i * _BAR_MS for i in range(n)],
+            "open": close - 0.5,
+            "high": close + 2.0,
+            "low": close - 2.0,
+            "close": close,
+            "volume": [500.0] * n,
+            "taker_buy_volume": [250.0] * n,
+        })
+        det = RegimeDetector(hurst_window=200)
+        state = det.detect(df)
+        assert state.regime == MarketRegime.RANGE, (
+            f"Expected RANGE for flat data, got {state.regime} (ADX={state.adx})"
+        )
 
     def test_detect_high_vol(self):
         """High-volatility spike → HIGH_VOL."""

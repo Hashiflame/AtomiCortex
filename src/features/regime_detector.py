@@ -220,16 +220,18 @@ class RegimeDetector:
     ----------
     hurst_window:
         Number of bars fed into Hurst calculation (300 ≈ 50 days on 4H).
+        Hurst is computed as a numeric feature for ML; it is **not** used
+        in the classification rules (ADX-first design).
     adx_period:
         ADX indicator period.
     atr_period:
         ATR indicator period.
     atr_lookback:
         Bars of ATR history used for percentile ranking (540 ≈ 90 days).
-    trend_threshold:
-        Hurst values above this → trend.
-    range_threshold:
-        Hurst values below this → mean-reversion / range.
+    adx_trend_threshold:
+        ADX above this → TREND regime.
+    adx_range_threshold:
+        ADX below this → RANGE regime.
     high_vol_percentile:
         ATR percentile above this → HIGH_VOL regime.
     """
@@ -240,16 +242,16 @@ class RegimeDetector:
         adx_period: int = 14,
         atr_period: int = 14,
         atr_lookback: int = 540,       # 90 days × 6 bars
-        trend_threshold: float = 0.55,
-        range_threshold: float = 0.45,
+        adx_trend_threshold: float = 25.0,
+        adx_range_threshold: float = 20.0,
         high_vol_percentile: float = 0.8,
     ) -> None:
         self.hurst_window = hurst_window
         self.adx_period = adx_period
         self.atr_period = atr_period
         self.atr_lookback = atr_lookback
-        self.trend_threshold = trend_threshold
-        self.range_threshold = range_threshold
+        self.adx_trend_threshold = adx_trend_threshold
+        self.adx_range_threshold = adx_range_threshold
         self.high_vol_percentile = high_vol_percentile
 
     # ------------------------------------------------------------------
@@ -263,14 +265,17 @@ class RegimeDetector:
     ) -> RegimeState:
         """Detect the market regime for one bar (default: last bar).
 
-        Rules (from master document)
-        ----------------------------
-        1. ATR percentile > high_vol_percentile  → HIGH_VOL
-        2. Hurst > trend_threshold  AND  ADX > 20  → TREND_UP / TREND_DOWN
-        3. Hurst < range_threshold  → RANGE
-        4. Otherwise  → UNKNOWN (transitional)
+        ADX-first classification rules
+        ------------------------------
+        1. ATR percentile > high_vol_percentile       → HIGH_VOL
+        2. ADX > adx_trend_threshold (25)             → TREND_UP / TREND_DOWN
+        3. ADX < adx_range_threshold (20)             → RANGE
+        4. adx_range_threshold ≤ ADX ≤ adx_trend_threshold → UNKNOWN
 
-        Confidence = 0.6 × |hurst − 0.5| × 2  +  0.4 × min(adx / 50, 1.0)
+        Hurst is computed but used only as a numeric ML feature,
+        not as a classification rule (R/S estimator bias on crypto).
+
+        Confidence = 0.4 × |hurst − 0.5| × 2  +  0.6 × min(adx / 50, 1.0)
         """
         n = len(df)
         if n == 0:
@@ -313,7 +318,8 @@ class RegimeDetector:
         # --- Composite scores ---
         hurst_distance = abs(hurst - 0.5) * 2.0  # 0–1
         adx_normalized = min(adx_val / 50.0, 1.0)
-        trend_strength = 0.6 * hurst_distance + 0.4 * adx_normalized
+        # ADX-first: ADX carries more weight than Hurst in confidence
+        trend_strength = 0.4 * hurst_distance + 0.6 * adx_normalized
         confidence = float(np.clip(trend_strength, 0.0, 1.0))
 
         return RegimeState(
@@ -422,7 +428,7 @@ class RegimeDetector:
             # --- Composite scores ---
             hurst_distance = abs(last_hurst - 0.5) * 2.0
             adx_normalized = min(adx_val / 50.0, 1.0)
-            ts = 0.6 * hurst_distance + 0.4 * adx_normalized
+            ts = 0.4 * hurst_distance + 0.6 * adx_normalized
             trend_strengths[i] = np.clip(ts, 0.0, 1.0)
             confidences[i] = np.clip(ts, 0.0, 1.0)
 
@@ -488,17 +494,26 @@ class RegimeDetector:
         close: np.ndarray,
         idx: int,
     ) -> MarketRegime:
-        """Apply classification rules (deterministic, no ML)."""
+        """ADX-first classification rules (deterministic, no ML).
+
+        1. atr_percentile > 0.8   → HIGH_VOL
+        2. adx > 25               → TREND_UP / TREND_DOWN
+        3. adx < 20               → RANGE
+        4. 20 ≤ adx ≤ 25          → UNKNOWN (transitional)
+
+        Hurst is deliberately excluded from the rules — it serves
+        as a numeric feature for downstream ML models.
+        """
         if atr_percentile > self.high_vol_percentile:
             return MarketRegime.HIGH_VOL
 
-        if hurst > self.trend_threshold and adx > 20:
+        if adx > self.adx_trend_threshold:
             # Direction from recent return
             if idx >= 1 and close[idx] >= close[idx - 1]:
                 return MarketRegime.TREND_UP
             return MarketRegime.TREND_DOWN
 
-        if hurst < self.range_threshold:
+        if adx < self.adx_range_threshold:
             return MarketRegime.RANGE
 
         return MarketRegime.UNKNOWN
