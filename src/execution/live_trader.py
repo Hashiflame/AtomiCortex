@@ -171,6 +171,7 @@ class LiveTrader:
                 max_open_positions=cfg.max_open_positions,
                 initial_equity=cfg.initial_equity,
                 dry_run=cfg.dry_run,
+                trading_mode=cfg.trading_mode,
             )
             strategy = MLTradingStrategy(config=strat_config)
             node.trader.add_strategy(strategy)

@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import pickle
 import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -67,9 +68,11 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     max_leverage: int = 10
     max_open_positions: int = 3
     initial_equity: float = 10_000.0
-    warmup_bars: int = 50
+    warmup_bars: int = 300
     dry_run: bool = False
     rr_ratio: float = 1.5
+    preload_enabled: bool = True
+    trading_mode: str = "testnet"  # testnet / paper / live
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +124,7 @@ class MLTradingStrategy(Strategy):
         # Bar buffer
         self._bars: list[Bar] = []
         self._bar_count: int = 0
+        self._warmup_complete: bool = False
 
         # Equity curve tracking
         self._equity_curve: list[tuple[int, float]] = []
@@ -170,6 +174,22 @@ class MLTradingStrategy(Strategy):
             f"warmup={self._config.warmup_bars} bars"
         )
 
+        # 6. Preload historical bars
+        if self._config.preload_enabled:
+            self._preload_historical_bars()
+
+        if self._warmup_complete:
+            self.log.info(
+                f"Strategy ready | "
+                f"bars={len(self._bars)} | "
+                f"warmup=COMPLETE"
+            )
+        else:
+            self.log.info(
+                f"Strategy started | warmup=IN_PROGRESS | "
+                f"need {self._config.warmup_bars} bars"
+            )
+
     def on_stop(self) -> None:
         """Graceful shutdown: close all positions, cancel pending orders."""
         self.log.info("MLTradingStrategy stopping — closing positions...")
@@ -194,12 +214,24 @@ class MLTradingStrategy(Strategy):
         self._record_equity(bar.ts_event)
 
         # 1. Warmup check
-        if len(self._bars) < self._config.warmup_bars:
-            if self._bar_count % 50 == 0:
-                self.log.debug(
-                    f"Warmup: {len(self._bars)}/{self._config.warmup_bars} bars"
+        if not self._warmup_complete:
+            if len(self._bars) >= self._config.warmup_bars:
+                self._warmup_complete = True
+                self.log.info(
+                    f"Warmup complete via live bars | "
+                    f"bars={len(self._bars)}"
                 )
-            return
+            else:
+                remaining = (
+                    self._config.warmup_bars - len(self._bars)
+                )
+                if self._bar_count % 50 == 0:
+                    self.log.debug(
+                        f"Warmup: {len(self._bars)}/"
+                        f"{self._config.warmup_bars} bars "
+                        f"({remaining} remaining)"
+                    )
+                return
 
         # 2. Detect regime
         regime_state = self._detect_regime()
@@ -692,6 +724,182 @@ class MLTradingStrategy(Strategy):
             return self._highvol_model, self._highvol_features
         # range / unknown → no model
         return None, []
+
+    # ------------------------------------------------------------------
+    # Historical bar preloading
+    # ------------------------------------------------------------------
+
+    def _preload_historical_bars(self) -> None:
+        """Preload historical bars from Parquet or Binance API.
+
+        Tries sources in order:
+        1. Local Parquet via DataStore
+        2. Binance REST API (testnet or mainnet)
+
+        Fills self._bars and sets self._warmup_complete = True on success.
+        All exceptions are caught — preload never crashes the strategy.
+        """
+        symbol_clean = "BTCUSDT"  # without -PERP
+        n_bars = self._config.warmup_bars  # 300
+
+        bars: list[Bar] = []
+        source = "none"
+
+        # Attempt 1: local Parquet
+        try:
+            bars = self._preload_from_parquet(symbol_clean, n_bars)
+            if len(bars) >= 50:  # minimum viable warmup
+                source = "parquet"
+                self.log.info(
+                    f"Preloaded {len(bars)} bars from Parquet"
+                )
+        except Exception as e:
+            self.log.warning(f"Parquet preload failed: {e}")
+
+        # Attempt 2: Binance REST API
+        if len(bars) < 50:
+            try:
+                bars = self._preload_from_binance_api(
+                    symbol_clean, n_bars,
+                )
+                if bars:
+                    source = "binance_api"
+                    self.log.info(
+                        f"Preloaded {len(bars)} bars from Binance API"
+                    )
+            except Exception as e:
+                self.log.warning(f"Binance API preload failed: {e}")
+
+        # Fill bar buffer
+        if bars:
+            for bar in bars[-n_bars:]:
+                self._bars.append(bar)
+            self._warmup_complete = True
+            self.log.info(
+                f"Warmup complete via {source} | "
+                f"bars={len(self._bars)}"
+            )
+        else:
+            self.log.warning(
+                "Preload failed — waiting for live bars warmup"
+            )
+            self._warmup_complete = False
+
+    def _preload_from_parquet(
+        self, symbol: str, n_bars: int,
+    ) -> list[Bar]:
+        """Load last *n_bars* from the local Parquet store.
+
+        Uses ``DataStore.get_klines()`` with a generous lookback
+        window (100 days) and returns the tail.
+        """
+        # Lazy import — avoid crash if DuckDB / data is missing
+        from src.ingestion.data_store import DataStore
+
+        # Derive data root from features_dir: features_dir → ../../
+        features_path = Path(self._config.features_dir).resolve()
+        data_root = features_path.parent  # data/features
+
+        if not data_root.exists():
+            self.log.warning(f"Parquet data root not found: {data_root}")
+            return []
+
+        store = DataStore(data_root)
+        try:
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(days=100)
+            df = store.get_klines(
+                symbol=symbol,
+                interval="4h",
+                start=start,
+                end=now,
+            )
+
+            if df.is_empty():
+                self.log.warning("Parquet returned empty DataFrame")
+                return []
+
+            bars: list[Bar] = []
+            for row in df.iter_rows(named=True):
+                ts_ns = int(row["open_time"]) * 1_000_000  # ms → ns
+                bar = Bar(
+                    bar_type=self._bar_type,
+                    open=Price(float(row["open"]), precision=1),
+                    high=Price(float(row["high"]), precision=1),
+                    low=Price(float(row["low"]), precision=1),
+                    close=Price(float(row["close"]), precision=1),
+                    volume=Quantity(float(row["volume"]), precision=3),
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+                bars.append(bar)
+
+            # Sort by timestamp and take last n_bars
+            bars.sort(key=lambda b: b.ts_event)
+            return bars[-n_bars:]
+        finally:
+            store.close()
+
+    def _preload_from_binance_api(
+        self, symbol: str, n_bars: int,
+    ) -> list[Bar]:
+        """Load last *n_bars* via Binance Futures REST API.
+
+        Uses synchronous ``requests`` because ``on_start()`` is called
+        before the Nautilus event loop starts.
+
+        Retries up to 3 times with 2-second delays.
+        """
+        import requests  # lazy — only needed for preload
+
+        mode = self._config.trading_mode.lower()
+        if mode == "testnet":
+            base_url = "https://testnet.binancefuture.com"
+        else:
+            base_url = "https://fapi.binance.com"
+
+        url = f"{base_url}/fapi/v1/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "4h",
+            "limit": min(n_bars, 500),
+        }
+
+        for attempt in range(1, 4):  # 3 retries
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                raw_klines = resp.json()
+
+                bars: list[Bar] = []
+                for k in raw_klines:
+                    ts_ns = int(k[0]) * 1_000_000  # open_time ms → ns
+                    bar = Bar(
+                        bar_type=self._bar_type,
+                        open=Price(float(k[1]), precision=1),
+                        high=Price(float(k[2]), precision=1),
+                        low=Price(float(k[3]), precision=1),
+                        close=Price(float(k[4]), precision=1),
+                        volume=Quantity(float(k[5]), precision=3),
+                        ts_event=ts_ns,
+                        ts_init=ts_ns,
+                    )
+                    bars.append(bar)
+
+                self.log.info(
+                    f"Binance API: fetched {len(bars)} klines "
+                    f"from {base_url} (attempt {attempt})"
+                )
+                return bars
+
+            except Exception as exc:
+                self.log.warning(
+                    f"Binance API attempt {attempt}/3 failed: {exc}"
+                )
+                if attempt < 3:
+                    time.sleep(2)
+
+        return []
 
     # ------------------------------------------------------------------
     # Equity tracking

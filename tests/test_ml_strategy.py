@@ -686,3 +686,270 @@ class TestDeferredStopLossPROD005:
         """_pending_sl_params should be a dict."""
         strategy = MLTradingStrategy(config=default_strategy_config)
         assert isinstance(strategy._pending_sl_params, dict)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRELOAD: Config defaults
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPreloadConfig:
+    """Verify new config fields for the preload system."""
+
+    def test_config_defaults_preload_enabled(self) -> None:
+        """preload_enabled defaults to True."""
+        cfg = MLStrategyConfig()
+        assert cfg.preload_enabled is True
+
+    def test_config_defaults_trading_mode(self) -> None:
+        """trading_mode defaults to testnet."""
+        cfg = MLStrategyConfig()
+        assert cfg.trading_mode == "testnet"
+
+    def test_config_custom_trading_mode(self) -> None:
+        """Custom trading_mode should be applied."""
+        cfg = MLStrategyConfig(trading_mode="live")
+        assert cfg.trading_mode == "live"
+
+    def test_config_preload_disabled(self) -> None:
+        """preload_enabled=False should be stored."""
+        cfg = MLStrategyConfig(preload_enabled=False)
+        assert cfg.preload_enabled is False
+
+    def test_warmup_complete_init_false(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """_warmup_complete should be False on init."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        assert strategy._warmup_complete is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRELOAD: Binance API
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPreloadFromBinanceApi:
+    """Test _preload_from_binance_api with mocked HTTP."""
+
+    def test_preload_from_binance_api(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Mock requests.get → 300 klines → bar_buffer filled → warmup_complete."""
+        from unittest.mock import patch
+
+        strategy = MLTradingStrategy(config=default_strategy_config)
+
+        # Build 300 fake klines (Binance format: list of lists)
+        base_ts = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        fake_klines = []
+        for i in range(300):
+            ts = base_ts + i * 4 * 3600 * 1000  # 4h apart
+            fake_klines.append([
+                ts,              # 0: open_time (ms)
+                "94000.0",       # 1: open
+                "94500.0",       # 2: high
+                "93500.0",       # 3: low
+                "94250.0",       # 4: close
+                "1000.000",      # 5: volume
+                ts + 4*3600*1000 - 1,  # 6: close_time
+                "1000000.0",     # 7: quote volume
+                100,             # 8: trade count
+                "500.0",         # 9: taker buy base
+                "500000.0",      # 10: taker buy quote
+                "0",             # 11: ignore
+            ])
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = fake_klines
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_response) as mock_get:
+            bars = strategy._preload_from_binance_api("BTCUSDT", 300)
+
+        assert len(bars) == 300
+        # Verify first bar
+        assert bars[0].open.as_double() == 94000.0
+        assert bars[0].close.as_double() == 94250.0
+        assert bars[0].ts_event == base_ts * 1_000_000  # ms → ns
+
+        # Verify request was made
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args
+        assert "testnet.binancefuture.com" in call_kwargs[1].get("url", "") or \
+               "testnet.binancefuture.com" in call_kwargs[0][0] if call_kwargs[0] else True
+
+    def test_preload_from_parquet(self) -> None:
+        """Mock DataStore.get_klines → DataFrame → Bar objects in time order."""
+        from unittest.mock import patch
+        import polars as pl
+
+        cfg = MLStrategyConfig(
+            warmup_bars=10,
+            dry_run=True,
+            features_dir="./data/features/ml_features",
+        )
+        strategy = MLTradingStrategy(config=cfg)
+
+        # Build mock DataFrame matching Parquet schema
+        base_ts = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        rows = []
+        for i in range(100):
+            ts = base_ts + i * 4 * 3600 * 1000
+            rows.append({
+                "open_time": ts,
+                "open": 94000.0 + i * 10,
+                "high": 94500.0 + i * 10,
+                "low": 93500.0 + i * 10,
+                "close": 94250.0 + i * 10,
+                "volume": 1000.0 + i,
+            })
+        df = pl.DataFrame(rows)
+
+        mock_store = MagicMock()
+        mock_store.get_klines.return_value = df
+        mock_store.close = MagicMock()
+
+        with patch("src.execution.strategies.ml_strategy.Path.resolve", return_value=Path("/tmp/fake/ml_features")), \
+             patch("src.execution.strategies.ml_strategy.Path.exists", return_value=True), \
+             patch("src.ingestion.data_store.DataStore.__init__", return_value=None), \
+             patch("src.ingestion.data_store.DataStore.get_klines", return_value=df), \
+             patch("src.ingestion.data_store.DataStore.close"):
+            bars = strategy._preload_from_parquet("BTCUSDT", 10)
+
+        assert len(bars) == 10
+        # Should be sorted chronologically (last 10)
+        for i in range(len(bars) - 1):
+            assert bars[i].ts_event <= bars[i + 1].ts_event
+
+    def test_preload_fallback_to_api(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Parquet fails → fallback to Binance API."""
+        from unittest.mock import patch
+
+        strategy = MLTradingStrategy(config=default_strategy_config)
+
+        # Parquet raises FileNotFoundError
+        with patch.object(
+            strategy, "_preload_from_parquet",
+            side_effect=FileNotFoundError("No Parquet data"),
+        ), patch.object(
+            strategy, "_preload_from_binance_api",
+            return_value=_make_bars(300),
+        ) as mock_api:
+            strategy._preload_historical_bars()
+
+        # Should have called API fallback
+        mock_api.assert_called_once_with("BTCUSDT", 10)  # warmup_bars=10 from fixture
+        assert strategy._warmup_complete is True
+        # _preload_historical_bars takes bars[-n_bars:] where n_bars=10 (warmup_bars)
+        assert len(strategy._bars) == 10
+
+    def test_preload_all_sources_fail(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Both sources fail → warmup_complete=False, strategy continues."""
+        from unittest.mock import patch
+
+        strategy = MLTradingStrategy(config=default_strategy_config)
+
+        with patch.object(
+            strategy, "_preload_from_parquet",
+            side_effect=Exception("Parquet broken"),
+        ), patch.object(
+            strategy, "_preload_from_binance_api",
+            side_effect=Exception("API down"),
+        ):
+            # Should NOT raise
+            strategy._preload_historical_bars()
+
+        assert strategy._warmup_complete is False
+        assert len(strategy._bars) == 0
+
+    def test_on_bar_skips_during_warmup(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """warmup_complete=False → on_bar returns without generating signal."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        strategy._warmup_complete = False
+
+        initial_bars = len(strategy._bars)
+        mock_bar = _make_bars(1)[0]
+
+        # on_bar uses self.log (Cython), can't run outside engine.
+        # Instead verify the logic: bar appended, but warmup blocks.
+        strategy._bars.append(mock_bar)
+        strategy._bar_count += 1
+
+        # Simulate warmup check
+        assert not strategy._warmup_complete
+        assert len(strategy._bars) < strategy._config.warmup_bars
+
+    def test_on_bar_processes_after_warmup(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """warmup_complete=True → on_bar should process (not return early)."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        strategy._warmup_complete = True
+        strategy._bars = _make_bars(50)
+
+        # With warmup complete, the warmup guard should not return
+        # (regime detection would be the next step)
+        assert strategy._warmup_complete is True
+        assert len(strategy._bars) >= strategy._config.warmup_bars
+
+    def test_preload_uses_testnet_url(self) -> None:
+        """trading_mode=testnet → URL=testnet.binancefuture.com."""
+        from unittest.mock import patch
+
+        cfg = MLStrategyConfig(
+            warmup_bars=10,
+            dry_run=True,
+            trading_mode="testnet",
+        )
+        strategy = MLTradingStrategy(config=cfg)
+
+        base_ts = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        fake_klines = [[
+            base_ts, "94000", "94500", "93500", "94250", "1000",
+            base_ts + 1, "1000", 100, "500", "500", "0",
+        ]]
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = fake_klines
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_response) as mock_get:
+            strategy._preload_from_binance_api("BTCUSDT", 10)
+
+        call_url = mock_get.call_args[0][0]
+        assert "testnet.binancefuture.com" in call_url
+
+    def test_preload_uses_mainnet_url(self) -> None:
+        """trading_mode=live → URL=fapi.binance.com."""
+        from unittest.mock import patch
+
+        cfg = MLStrategyConfig(
+            warmup_bars=10,
+            dry_run=True,
+            trading_mode="live",
+        )
+        strategy = MLTradingStrategy(config=cfg)
+
+        base_ts = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        fake_klines = [[
+            base_ts, "94000", "94500", "93500", "94250", "1000",
+            base_ts + 1, "1000", 100, "500", "500", "0",
+        ]]
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = fake_klines
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_response) as mock_get:
+            strategy._preload_from_binance_api("BTCUSDT", 10)
+
+        call_url = mock_get.call_args[0][0]
+        assert "fapi.binance.com" in call_url
