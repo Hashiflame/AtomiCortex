@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Any
 
 import psutil
 from telegram import Update
@@ -116,6 +117,7 @@ class TelegramBot:
         self._app: Application | None = None
         self._broadcaster: Broadcaster | None = None
         self._crypto_payment: CryptoBotPayment | None = None
+        self._signal_poller: Any = None  # SignalPoller (lazy init)
 
     # ------------------------------------------------------------------
     # Setup
@@ -530,15 +532,34 @@ class TelegramBot:
         if self._app is None:
             self.build()
 
-        # Start CryptoBot polling as background task via post_init
-        if self._crypto_payment is not None:
-            crypto = self._crypto_payment
+        # Capture references for the async post_init closure
+        crypto = self._crypto_payment
+        broadcaster = self._broadcaster
+        shared_db_path = self._get_shared_db_path()
+        bot_ref = self  # keep reference for _signal_poller assignment
 
-            async def _start_crypto_polling(app: Application) -> None:
+        async def _post_init(app: Application) -> None:
+            # CryptoBot polling
+            if crypto is not None:
                 crypto.start_polling(interval=60)
-                _log.info("CryptoBot polling started via post_init")
+                _log.info("CryptoBot polling started")
 
-            self._app.post_init = _start_crypto_polling
+            # Signal poller
+            if broadcaster is not None:
+                from src.telegram_bot.signal_poller import SignalPoller
+                poller = SignalPoller(
+                    db_path=shared_db_path,
+                    broadcaster=broadcaster,
+                    poll_interval=30,
+                )
+                bot_ref._signal_poller = poller
+                await poller.start()
+                _log.info(
+                    "SignalPoller started | db={p}",
+                    p=shared_db_path,
+                )
+
+        self._app.post_init = _post_init
 
         _log.info("Starting Telegram bot polling...")
         self._app.run_polling()
@@ -562,6 +583,33 @@ class TelegramBot:
     @property
     def crypto_payment(self) -> CryptoBotPayment | None:
         return self._crypto_payment
+
+    @property
+    def signal_poller(self) -> Any:
+        return self._signal_poller
+
+    # ------------------------------------------------------------------
+    # Shared DB path discovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_shared_db_path() -> str:
+        """Find the shared atomicortex.db used by the trading bot."""
+        candidates = [
+            Path("data/atomicortex.db"),
+            Path("/home/hashiflame/AtomiCortex/data/atomicortex.db"),
+        ]
+        try:
+            settings = get_settings()
+            candidates.insert(0, settings.data_dir / "atomicortex.db")
+        except Exception:
+            pass
+
+        for p in candidates:
+            if p.exists():
+                return str(p)
+        # Default (will be created by SignalBridge on the trading side)
+        return str(candidates[0])
 
 
 # ── Utility ──

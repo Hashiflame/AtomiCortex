@@ -1,0 +1,274 @@
+"""
+AtomiCortex — Signal Bridge.
+
+Bridge between the trading bot process and the Telegram bot process.
+The trading bot writes signals and events to a shared SQLite database;
+the Telegram bot polls for new records and broadcasts them.
+
+Design constraints:
+- Synchronous API (called from Nautilus on_bar / on_position_closed)
+- Thread-safe via threading.Lock
+- All operations wrapped in try/except to never crash the trading bot
+- No imports of nautilus or telegram
+- Connection-per-call pattern (no persistent connections across processes)
+"""
+
+from __future__ import annotations
+
+import json
+try:
+    import sqlite3
+except ImportError:
+    import pysqlite3 as sqlite3  # type: ignore[no-redef]
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+from src.logger import get_logger
+
+_log = get_logger(__name__)
+
+
+class SignalBridge:
+    """Writes trading signals and events to shared SQLite for the Telegram bot.
+
+    Parameters
+    ----------
+    db_path:
+        Path to the shared SQLite database (same file both processes use).
+    """
+
+    def __init__(self, db_path: str = "data/atomicortex.db") -> None:
+        self._db_path = str(db_path)
+        self._lock = threading.Lock()
+        self._init_tables()
+        _log.info("SignalBridge initialised | db={p}", p=self._db_path)
+
+    # ------------------------------------------------------------------
+    # Connection helper
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        """Create a new connection with WAL mode and foreign keys."""
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    # ------------------------------------------------------------------
+    # Schema (idempotent)
+    # ------------------------------------------------------------------
+
+    def _init_tables(self) -> None:
+        """Create tables if they don't exist (safe to call repeatedly)."""
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            _log.error("SignalBridge cannot connect to DB: {err}", err=str(exc))
+            return
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS signals_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol      TEXT,
+                    direction   TEXT,
+                    entry_price REAL,
+                    stop_loss   REAL,
+                    take_profit REAL,
+                    confidence  REAL,
+                    regime      TEXT,
+                    atr         REAL,
+                    funding_rate REAL,
+                    position_size REAL,
+                    notional    REAL,
+                    leverage    REAL,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at   TIMESTAMP,
+                    close_price REAL,
+                    pnl_pct     REAL,
+                    result      TEXT DEFAULT 'open'
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type  TEXT,
+                    message     TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_metrics (
+                    id              INTEGER PRIMARY KEY DEFAULT 1,
+                    equity          REAL,
+                    daily_pnl       REAL,
+                    regime          TEXT,
+                    open_positions  INTEGER,
+                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_signals_result
+                    ON signals_log(result);
+                CREATE INDEX IF NOT EXISTS idx_signals_created
+                    ON signals_log(created_at);
+                CREATE INDEX IF NOT EXISTS idx_events_created
+                    ON bot_events(created_at);
+            """)
+            conn.commit()
+        except Exception as exc:
+            _log.error("SignalBridge table init failed: {err}", err=str(exc))
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Signal operations
+    # ------------------------------------------------------------------
+
+    def log_signal(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        confidence: float,
+        regime: str,
+        atr: float = 0.0,
+        funding_rate: float = 0.0,
+        position_size: float = 0.0,
+        notional: float = 0.0,
+        leverage: float = 0.0,
+    ) -> int:
+        """Write a new open signal to signals_log. Returns signal_id."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    now = datetime.now(timezone.utc).isoformat()
+                    cursor = conn.execute(
+                        """INSERT INTO signals_log (
+                            symbol, direction, entry_price,
+                            stop_loss, take_profit, confidence,
+                            regime, atr, funding_rate,
+                            position_size, notional, leverage,
+                            created_at, result
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+                        (
+                            symbol, direction, entry_price,
+                            stop_loss, take_profit, confidence,
+                            regime, atr, funding_rate,
+                            position_size, notional, leverage,
+                            now,
+                        ),
+                    )
+                    conn.commit()
+                    signal_id = cursor.lastrowid or 0
+                    _log.info(
+                        "Signal logged | id={sid} {dir} {sym} @ ${p:,.2f}",
+                        sid=signal_id, dir=direction, sym=symbol, p=entry_price,
+                    )
+                    return signal_id
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error("SignalBridge.log_signal failed: {err}", err=str(exc))
+                return 0
+
+    def close_signal(
+        self,
+        signal_id: int,
+        close_price: float,
+        pnl_pct: float,
+        result: str,
+    ) -> None:
+        """Update a signal when the position is closed."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        """UPDATE signals_log SET
+                           closed_at = ?, close_price = ?,
+                           pnl_pct = ?, result = ?
+                           WHERE id = ?""",
+                        (now, close_price, pnl_pct, result, signal_id),
+                    )
+                    conn.commit()
+                    _log.info(
+                        "Signal closed | id={sid} result={r} pnl={pnl:+.2f}%",
+                        sid=signal_id, r=result, pnl=pnl_pct,
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error(
+                    "SignalBridge.close_signal failed: {err}", err=str(exc),
+                )
+
+    # ------------------------------------------------------------------
+    # Event operations
+    # ------------------------------------------------------------------
+
+    def log_regime_change(self, old_regime: str, new_regime: str) -> None:
+        """Write a regime change event to bot_events."""
+        payload = json.dumps({"old": old_regime, "new": new_regime})
+        self._log_event("regime_change", payload)
+
+    def log_circuit_breaker(self, reason: str) -> None:
+        """Write a circuit breaker event to bot_events."""
+        self._log_event("circuit_breaker", reason)
+
+    def _log_event(self, event_type: str, message: str) -> None:
+        """Insert a row into bot_events (internal)."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    conn.execute(
+                        "INSERT INTO bot_events (event_type, message) "
+                        "VALUES (?, ?)",
+                        (event_type, message),
+                    )
+                    conn.commit()
+                    _log.info(
+                        "Event logged | type={t} msg={m}",
+                        t=event_type, m=message[:80],
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error(
+                    "SignalBridge._log_event failed: {err}", err=str(exc),
+                )
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def update_metrics(
+        self,
+        equity: float,
+        daily_pnl: float,
+        regime: str,
+        open_positions: int,
+    ) -> None:
+        """Upsert current trading metrics into bot_metrics."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        """INSERT OR REPLACE INTO bot_metrics
+                           (id, equity, daily_pnl, regime,
+                            open_positions, updated_at)
+                           VALUES (1, ?, ?, ?, ?, ?)""",
+                        (equity, daily_pnl, regime, open_positions, now),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error(
+                    "SignalBridge.update_metrics failed: {err}", err=str(exc),
+                )

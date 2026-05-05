@@ -135,9 +135,14 @@ class MLTradingStrategy(Strategy):
         # Last known funding rate (updated from feature data)
         self._last_funding_rate: float = 0.0
 
-        # Pending SL params: entry client_order_id → {decision, signal} for
+        # Pending SL params: entry client_order_id -> {decision, signal} for
         # deferred stop-loss submission (placed in on_order_filled, not _open_position)
         self._pending_sl_params: dict[str, dict[str, Any]] = {}
+
+        # Signal bridge for Telegram integration
+        self._signal_bridge: Any = None  # SignalBridge (lazy init in on_start)
+        self._pending_signal_ids: dict[str, int] = {}  # symbol -> signal_id
+        self._last_regime: str = ""  # for detecting regime changes
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -177,6 +182,19 @@ class MLTradingStrategy(Strategy):
         # 6. Preload historical bars
         if self._config.preload_enabled:
             self._preload_historical_bars()
+
+        # 7. Signal Bridge for Telegram integration
+        try:
+            from src.execution.signal_bridge import SignalBridge
+            db_path = str(
+                Path(self._config.features_dir).parent.parent
+                / "data" / "atomicortex.db"
+            )
+            self._signal_bridge = SignalBridge(db_path=db_path)
+            self.log.info(f"SignalBridge initialised | db={db_path}")
+        except Exception as exc:
+            self.log.warning(f"SignalBridge init failed (non-fatal): {exc}")
+            self._signal_bridge = None
 
         if self._warmup_complete:
             self.log.info(
@@ -313,6 +331,30 @@ class MLTradingStrategy(Strategy):
                 f"SL=${decision.stop_loss:.2f} TP=${decision.take_profit:.2f}"
             )
 
+        # Regime change detection
+        if self._last_regime and regime_label != self._last_regime:
+            if self._signal_bridge:
+                try:
+                    self._signal_bridge.log_regime_change(
+                        self._last_regime, regime_label,
+                    )
+                except Exception:
+                    pass
+        self._last_regime = regime_label
+
+        # Periodic metrics update (every 6 bars = ~24H)
+        if self._bar_count % 6 == 0 and self._signal_bridge and self._tracker:
+            try:
+                state = self._tracker.get_state()
+                self._signal_bridge.update_metrics(
+                    equity=state.equity,
+                    daily_pnl=state.daily_pnl_pct,
+                    regime=regime_label,
+                    open_positions=state.open_positions,
+                )
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Order events
     # ------------------------------------------------------------------
@@ -398,7 +440,19 @@ class MLTradingStrategy(Strategy):
                 timestamp=now_utc,
             )
 
-        # TODO: Telegram alert (Phase 5)
+        # Close signal in bridge for Telegram notification
+        symbol = str(event.instrument_id)
+        signal_id = self._pending_signal_ids.pop(symbol, None)
+        if signal_id and self._signal_bridge:
+            try:
+                self._signal_bridge.close_signal(
+                    signal_id=signal_id,
+                    close_price=event.avg_px_close.as_double(),
+                    pnl_pct=event.realized_return * 100 if event.realized_return else 0.0,
+                    result="win" if realized_pnl > 0 else "loss",
+                )
+            except Exception as exc:
+                self.log.warning(f"SignalBridge close_signal failed: {exc}")
 
     # ------------------------------------------------------------------
     # Position management
@@ -451,6 +505,27 @@ class MLTradingStrategy(Strategy):
             f"ENTRY submitted | {entry_side} {qty} | "
             f"tag={entry_tag} | SL deferred to fill confirmation"
         )
+
+        # Log signal in bridge for Telegram notification
+        if self._signal_bridge:
+            try:
+                signal_id = self._signal_bridge.log_signal(
+                    symbol=signal.symbol,
+                    direction="long" if signal.direction == 1 else "short",
+                    entry_price=decision.entry_price if hasattr(decision, 'entry_price') else signal.entry_price,
+                    stop_loss=decision.stop_loss,
+                    take_profit=decision.take_profit,
+                    confidence=signal.confidence,
+                    regime=signal.regime,
+                    atr=signal.atr,
+                    funding_rate=signal.funding_rate,
+                    position_size=decision.position_size,
+                    notional=decision.notional,
+                    leverage=decision.leverage,
+                )
+                self._pending_signal_ids[signal.symbol] = signal_id
+            except Exception as exc:
+                self.log.warning(f"SignalBridge log_signal failed: {exc}")
 
     def _submit_stop_loss_with_retry(
         self,

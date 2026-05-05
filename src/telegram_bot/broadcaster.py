@@ -36,6 +36,8 @@ class Broadcaster:
     def __init__(self, bot: Bot, db: Database) -> None:
         self._bot = bot
         self._db = db
+        self._cached_metrics: dict = {}
+        self._cached_regime: str = "N/A"
 
     # ------------------------------------------------------------------
     # Public API
@@ -58,6 +60,10 @@ class Broadcaster:
         tp = signal_data.get("take_profit", 0)
         conf = signal_data.get("confidence", 0)
         regime = signal_data.get("regime", "N/A")
+        funding = signal_data.get("funding_rate", 0)
+        pos_size = signal_data.get("position_size", 0)
+        notional = signal_data.get("notional", 0)
+        leverage = signal_data.get("leverage", 0)
 
         sl_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0
         tp_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0
@@ -65,26 +71,35 @@ class Broadcaster:
         reward = abs(tp - entry)
         rr = reward / risk if risk > 0 else 0
 
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
         full_msg = (
             f"{'═' * 30}\n"
             f"{emoji} {d_upper} {symbol} PERP\n"
             f"{'═' * 30}\n"
-            f"Цена входа: ${entry:,.2f}\n"
-            f"Стоп: ${sl:,.2f} (-{sl_pct:.1f}%)\n"
-            f"Тейк: ${tp:,.2f} (+{tp_pct:.1f}%)\n"
-            f"R:R: 1:{rr:.1f}\n"
-            f"Режим: {regime.upper()}\n"
-            f"Уверенность: {conf:.0%}\n"
-            f"{'═' * 30}"
+            f"⏰ {timestamp}\n"
+            f"💵 Вход:    ${entry:,.0f}\n"
+            f"🛑 Стоп:    ${sl:,.0f} (-{sl_pct:.1f}%)\n"
+            f"🎯 Тейк:    ${tp:,.0f} (+{tp_pct:.1f}%)\n"
+            f"⚖️ R:R:     1:{rr:.1f}\n"
+            f"🤖 Режим:   {regime.upper()}\n"
+            f"📊 Conf:    {conf:.0%}\n"
         )
+        if funding:
+            full_msg += f"💸 Funding: {funding:+.3%}\n"
+        if pos_size:
+            full_msg += f"📏 Размер:  {pos_size:.4f} ({symbol.split('-')[0] if '-' in symbol else 'BTC'}) (${notional:,.0f})\n"
+        if leverage:
+            full_msg += f"⚡ Leverage: {leverage:.1f}x\n"
+        full_msg += f"{'═' * 30}"
 
         teaser_msg = (
-            f"🔔 Новый сигнал: {emoji} {d_upper} {symbol}\n\n"
-            f"Подпишитесь на Premium для полных деталей.\n"
-            f"/subscribe"
+            f"🔔 Новый сигнал!\n"
+            f"{d_upper} {symbol} | Уверенность: {conf:.0%}\n\n"
+            f"👉 /subscribe для полного доступа"
         )
 
-        signal_id = self._db.log_signal(signal_data)
         self._db.log_event("signal", f"{d_upper} {symbol} @ ${entry:,.2f}")
 
         await self._send_role_filtered(
@@ -94,21 +109,48 @@ class Broadcaster:
         )
 
         _log.info(
-            "Signal broadcast | {sym} {dir} | id={sid}",
-            sym=symbol, dir=d_upper, sid=signal_id,
+            "Signal broadcast | {sym} {dir}",
+            sym=symbol, dir=d_upper,
+        )
+
+    async def broadcast_signal_closed(
+        self, signal_data: dict[str, Any],
+    ) -> None:
+        """Broadcast a position close event (win/loss/breakeven)."""
+        result = signal_data.get("result", "")
+        direction = signal_data.get("direction", "")
+        d_upper = direction.upper() if isinstance(direction, str) else "?"
+        symbol = signal_data.get("symbol", "N/A")
+        pnl = signal_data.get("pnl_pct", 0) or 0
+        close_price = signal_data.get("close_price", 0)
+
+        result_emoji = "✅" if result == "win" else "❌"
+        msg = (
+            f"{result_emoji} ЗАКРЫТ {d_upper} {symbol}\n"
+            f"{'═' * 30}\n"
+            f"P&L: {pnl:+.2f}%\n"
+        )
+        if close_price:
+            msg += f"Цена закрытия: ${close_price:,.0f}\n"
+        msg += f"{'═' * 30}"
+
+        await self._send_to_min_role(msg, "premium")
+        _log.info(
+            "Signal close broadcast | {sym} {r} {pnl:+.2f}%",
+            sym=symbol, r=result, pnl=pnl,
         )
 
     async def broadcast_regime_change(
         self, old_regime: str, new_regime: str,
     ) -> None:
         """Notify about market regime change (premium+ only)."""
+        self._cached_regime = new_regime
         msg = (
             f"📊 Смена режима рынка\n"
             f"{'═' * 30}\n"
             f"{old_regime.upper()} → {new_regime.upper()}\n"
             f"{'═' * 30}"
         )
-        self._db.log_event("regime_change", f"{old_regime} -> {new_regime}")
         await self._send_to_min_role(msg, "premium")
 
     async def broadcast_circuit_breaker(self, reason: str) -> None:
