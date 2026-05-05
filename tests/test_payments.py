@@ -531,8 +531,8 @@ class TestSubscribeButtons:
         await cmd_subscribe(update, ctx)
         keyboard = update.effective_chat.send_message.call_args[1]["reply_markup"]
         # Verify callback_data for Stars buttons
-        assert keyboard.inline_keyboard[0][0].callback_data == "pay_stars_30"
-        assert keyboard.inline_keyboard[0][1].callback_data == "pay_stars_90"
+        assert keyboard.inline_keyboard[0][0].callback_data == "buy_stars_30"
+        assert keyboard.inline_keyboard[0][1].callback_data == "buy_stars_90"
 
 
 # ═══════════════════════════════════════

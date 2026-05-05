@@ -8,22 +8,72 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.telegram_bot.database import Database
+from src.telegram_bot.keyboards import (
+    get_keyboard_for_role,
+    get_renew_button,
+    get_subscribe_keyboard,
+)
 from src.telegram_bot.roles import require_role, _ensure_user
 
 
 @require_role("free")
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome + auto-register."""
-    name = update.effective_user.first_name if update.effective_user else "trader"
-    await update.effective_chat.send_message(
-        f"👋 Привет, {name}!\n\n"
-        f"Добро пожаловать в AtomiCortex — AI Crypto Futures Trading Bot.\n\n"
-        f"📊 /stats — публичная статистика\n"
-        f"📋 /help — список команд\n"
-        f"⭐ /subscribe — оформить подписку\n"
-        f"👤 /mystatus — ваш статус\n\n"
-        f"{'═' * 30}"
-    )
+    """Welcome + auto-register + show role-based ReplyKeyboard."""
+    if update.effective_user is None or update.effective_chat is None:
+        return
+
+    db: Database = context.bot_data["db"]
+    user = _ensure_user(db, update)
+    role = user.get("role", "free") if user else "free"
+    name = update.effective_user.first_name or "trader"
+
+    keyboard = get_keyboard_for_role(role)
+
+    if role in ("premium", "owner"):
+        # Premium / owner greeting
+        expires = user.get("expires_at") if user else None
+        exp_str = "бессрочно"
+        if expires:
+            try:
+                exp_dt = datetime.fromisoformat(expires)
+                exp_str = exp_dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                exp_str = "бессрочно"
+
+        # Last signal info
+        signals = db.get_signals_history(limit=1)
+        last_signal = "нет данных"
+        regime = "N/A"
+        if signals:
+            s = signals[0]
+            d = s.get("direction", "?").upper()
+            sym = s.get("symbol", "?")
+            last_signal = f"{d} {sym}"
+            regime = s.get("regime", "N/A").upper()
+
+        role_badge = "👑" if role == "owner" else "⭐"
+        msg = (
+            f"👋 Привет, {name}! {role_badge}\n\n"
+            f"Premium активен до {exp_str}\n\n"
+            f"📊 Последний сигнал: {last_signal}\n"
+            f"🌡 Режим рынка: {regime}\n\n"
+            f"👇 Используй кнопки меню ниже"
+        )
+    else:
+        # Free greeting
+        stats = db.get_stats()
+        wr = stats.get("win_rate_30d", 0)
+        total = stats.get("total_trades", 0)
+        msg = (
+            f"👋 Привет, {name}!\n\n"
+            f"Добро пожаловать в AtomiCortex — AI торговые "
+            f"сигналы крипто фьючерсов.\n\n"
+            f"🤖 BTC/ETH/SOL | 4H таймфрейм\n"
+            f"📊 Win Rate: {wr:.0%} | {total} сигналов\n\n"
+            f"👇 Используй кнопки меню ниже"
+        )
+
+    await update.effective_chat.send_message(msg, reply_markup=keyboard)
 
 
 @require_role("free")
@@ -104,43 +154,17 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     usdt_30 = prices.get("usdt_30d", 7.00)
     usdt_90 = prices.get("usdt_90d", 18.00)
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                f"⭐ 30 дней — {stars_30} Stars",
-                callback_data="pay_stars_30",
-            ),
-            InlineKeyboardButton(
-                f"⭐ 90 дней — {stars_90} Stars",
-                callback_data="pay_stars_90",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"💰 30 дней — ${usdt_30:.0f} USDT",
-                callback_data="pay_usdt_30",
-            ),
-            InlineKeyboardButton(
-                f"💰 90 дней — ${usdt_90:.0f} USDT",
-                callback_data="pay_usdt_90",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "✉️ Написать владельцу",
-                callback_data="pay_manual",
-            ),
-        ],
-    ])
+    keyboard = get_subscribe_keyboard(stars_30, stars_90, usdt_30, usdt_90)
 
     await update.effective_chat.send_message(
         f"{'━' * 30}\n"
-        f"💎 AtomiCortex Premium\n\n"
+        f"⭐ AtomiCortex Premium\n\n"
+        f"Что включено:\n"
         f"🤖 AI сигналы BTC/ETH/SOL\n"
-        f"📊 Все режимы рынка (TREND/HIGH_VOL)\n"
-        f"⚡ Уверенность ≥ 65%\n"
-        f"📱 Мгновенные алерты\n\n"
-        f"Выбери способ и срок:\n"
+        f"📊 Trend + High_Vol режимы\n"
+        f"⚡ Confidence ≥ 65%\n"
+        f"📱 Мгновенные алерты 24/7\n\n"
+        f"Выбери способ оплаты:\n"
         f"{'━' * 30}",
         reply_markup=keyboard,
     )
@@ -168,12 +192,17 @@ async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 exp_dt = exp_dt.replace(tzinfo=timezone.utc)
             remaining = (exp_dt - datetime.now(timezone.utc)).days
             exp_str = exp_dt.strftime("%Y-%m-%d")
+
+            # Show renewal button if < 7 days remaining
+            reply_markup = get_renew_button() if remaining < 7 else None
+
             await update.effective_chat.send_message(
                 f"👤 Ваш статус\n"
                 f"{'═' * 30}\n"
                 f"Роль: Premium ✅\n"
                 f"Истекает: {exp_str} ({remaining} дней)\n"
-                f"{'═' * 30}"
+                f"{'═' * 30}",
+                reply_markup=reply_markup,
             )
         except (ValueError, TypeError):
             await update.effective_chat.send_message(

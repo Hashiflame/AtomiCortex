@@ -10,10 +10,17 @@ from pathlib import Path
 
 import psutil
 
+import math
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from src.telegram_bot.database import Database
+from src.telegram_bot.keyboards import (
+    get_health_buttons,
+    get_stats_admin_buttons,
+    get_users_pagination,
+)
 from src.telegram_bot.roles import require_role, OWNER_ID
 
 
@@ -38,9 +45,12 @@ def _resolve_user(db: Database, identifier: str) -> dict | None:
     return db.get_user_by_username(identifier)
 
 
+USERS_PER_PAGE = 10
+
+
 @require_role("owner")
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Table of all users (TG-017: mask user_id partially)."""
+    """Table of all users with pagination."""
     db: Database = context.bot_data["db"]
     users = db.get_all_users()
 
@@ -48,15 +58,8 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_chat.send_message("Нет зарегистрированных пользователей.")
         return
 
-    lines = ["👥 Пользователи:\n", "ID | Username | Role | Joined"]
-    lines.append("─" * 45)
-    for u in users[:50]:
-        un = f"@{u['username']}" if u.get("username") else "—"
-        joined = (u.get("joined_at") or "")[:10]
-        banned = " 🚫" if u.get("is_banned") else ""
-        lines.append(f"{u['user_id']} | {un} | {u['role']}{banned} | {joined}")
-
-    await update.effective_chat.send_message("\n".join(lines))
+    page = 1
+    await _send_users_page(update.effective_chat.send_message, users, page)
 
 
 @require_role("owner")
@@ -258,28 +261,14 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     regime = signals[0].get("regime", "N/A").upper() if signals else "N/A"
     open_signals = db.get_open_signals()
 
-    msg = (
-        f"{'═' * 30}\n"
-        f"🖥️ SERVER HEALTH\n{'═' * 30}\n"
-        f"CPU:      {cpu}% ({cpu_count} cores)\n"
-        f"RAM:      {mem.used / 1e9:.1f}/{mem.total / 1e9:.0f} GB "
-        f"({mem.percent}%)\n"
-        f"Disk:     {disk.used / 1e9:.1f}/{disk.total / 1e9:.0f} GB "
-        f"({disk.percent}%)\n"
-        f"Uptime:   {up_days}d {up_hours}h {up_mins}m\n\n"
-        f"🤖 BOT STATUS\n{'═' * 30}\n"
-        f"Status:   RUNNING ✅\n"
-        f"Signals today: {signals_today}\n\n"
-        f"📊 TRADING\n{'═' * 30}\n"
-        f"Regime:   {regime}\n"
-        f"Total:    {stats['total_trades']} signals\n"
-        f"Win rate: {stats['win_rate']:.1%}\n"
-        f"P&L:      {stats['total_pnl_pct']:+.2f}%\n"
-        f"Open:     {len(open_signals)} positions\n"
-        f"{'═' * 30}"
+    msg = _build_health_message(
+        cpu, cpu_count, mem, disk, up_days, up_hours, up_mins,
+        signals_today, regime, stats, open_signals,
     )
 
-    await update.effective_chat.send_message(msg)
+    await update.effective_chat.send_message(
+        msg, reply_markup=get_health_buttons(),
+    )
 
 
 # TG-010: asyncio.Lock for stop confirmation instead of bare dict
@@ -416,45 +405,13 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @require_role("owner")
 async def cmd_stats_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Full admin stats."""
+    """Full admin stats with period filter buttons."""
     db: Database = context.bot_data["db"]
-    stats = db.get_stats()
-    all_users = db.get_all_users()
+    msg = _build_stats_admin_message(db)
 
-    owners = sum(1 for u in all_users if u["role"] == "owner")
-    premium = sum(1 for u in all_users if u["role"] == "premium")
-    free = sum(1 for u in all_users if u["role"] == "free")
-    banned = sum(1 for u in all_users if u.get("is_banned"))
-
-    # Top signals
-    signals = db.get_signals_history(limit=5)
-    top_lines = []
-    for s in signals:
-        if s.get("pnl_pct") is not None:
-            top_lines.append(
-                f"  {s['symbol']} {s['direction']}: {s['pnl_pct']:+.2f}%"
-            )
-
-    msg = (
-        f"📊 Admin Statistics\n{'═' * 30}\n\n"
-        f"👥 Пользователи:\n"
-        f"  Owner: {owners}\n"
-        f"  Premium: {premium}\n"
-        f"  Free: {free}\n"
-        f"  Banned: {banned}\n"
-        f"  Total: {len(all_users)}\n\n"
-        f"📈 Trading:\n"
-        f"  Total signals: {stats['total_trades']}\n"
-        f"  Win rate: {stats['win_rate']:.1%}\n"
-        f"  Win rate 30d: {stats['win_rate_30d']:.1%}\n"
-        f"  Total P&L: {stats['total_pnl_pct']:+.2f}%\n\n"
+    await update.effective_chat.send_message(
+        msg, reply_markup=get_stats_admin_buttons(),
     )
-
-    if top_lines:
-        msg += "🏆 Последние сигналы:\n" + "\n".join(top_lines) + "\n"
-    msg += f"\n{'═' * 30}"
-
-    await update.effective_chat.send_message(msg)
 
 
 @require_role("owner")
@@ -493,6 +450,106 @@ async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
     await update.effective_chat.send_message("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper: build messages (reused by refresh callbacks)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _build_health_message(
+    cpu: float,
+    cpu_count: int,
+    mem,
+    disk,
+    up_days: int,
+    up_hours: int,
+    up_mins: int,
+    signals_today: int,
+    regime: str,
+    stats: dict,
+    open_signals: list,
+) -> str:
+    """Build the health report text (no I/O)."""
+    return (
+        f"{'═' * 30}\n"
+        f"🖥️ SERVER HEALTH\n{'═' * 30}\n"
+        f"CPU:      {cpu}% ({cpu_count} cores)\n"
+        f"RAM:      {mem.used / 1e9:.1f}/{mem.total / 1e9:.0f} GB "
+        f"({mem.percent}%)\n"
+        f"Disk:     {disk.used / 1e9:.1f}/{disk.total / 1e9:.0f} GB "
+        f"({disk.percent}%)\n"
+        f"Uptime:   {up_days}d {up_hours}h {up_mins}m\n\n"
+        f"🤖 BOT STATUS\n{'═' * 30}\n"
+        f"Status:   RUNNING ✅\n"
+        f"Signals today: {signals_today}\n\n"
+        f"📊 TRADING\n{'═' * 30}\n"
+        f"Regime:   {regime}\n"
+        f"Total:    {stats['total_trades']} signals\n"
+        f"Win rate: {stats['win_rate']:.1%}\n"
+        f"P&L:      {stats['total_pnl_pct']:+.2f}%\n"
+        f"Open:     {len(open_signals)} positions\n"
+        f"{'═' * 30}"
+    )
+
+
+def _build_stats_admin_message(db: Database) -> str:
+    """Build the admin stats text (no I/O aside from DB)."""
+    stats = db.get_stats()
+    all_users = db.get_all_users()
+
+    owners = sum(1 for u in all_users if u["role"] == "owner")
+    premium = sum(1 for u in all_users if u["role"] == "premium")
+    free = sum(1 for u in all_users if u["role"] == "free")
+    banned = sum(1 for u in all_users if u.get("is_banned"))
+
+    signals = db.get_signals_history(limit=5)
+    top_lines = []
+    for s in signals:
+        if s.get("pnl_pct") is not None:
+            top_lines.append(
+                f"  {s['symbol']} {s['direction']}: {s['pnl_pct']:+.2f}%"
+            )
+
+    msg = (
+        f"📊 Admin Statistics\n{'═' * 30}\n\n"
+        f"👥 Пользователи:\n"
+        f"  Owner: {owners}\n"
+        f"  Premium: {premium}\n"
+        f"  Free: {free}\n"
+        f"  Banned: {banned}\n"
+        f"  Total: {len(all_users)}\n\n"
+        f"📈 Trading:\n"
+        f"  Total signals: {stats['total_trades']}\n"
+        f"  Win rate: {stats['win_rate']:.1%}\n"
+        f"  Win rate 30d: {stats['win_rate_30d']:.1%}\n"
+        f"  Total P&L: {stats['total_pnl_pct']:+.2f}%\n\n"
+    )
+
+    if top_lines:
+        msg += "🏆 Последние сигналы:\n" + "\n".join(top_lines) + "\n"
+    msg += f"\n{'═' * 30}"
+    return msg
+
+
+async def _send_users_page(send_fn, users: list, page: int) -> None:
+    """Format and send a single page of the users list."""
+    total_pages = max(1, math.ceil(len(users) / USERS_PER_PAGE))
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * USERS_PER_PAGE
+    end = start + USERS_PER_PAGE
+    page_users = users[start:end]
+
+    lines = [f"👥 Пользователи ({len(users)} всего):\n", "ID | Username | Role | Joined"]
+    lines.append("─" * 45)
+    for u in page_users:
+        un = f"@{u['username']}" if u.get("username") else "—"
+        joined = (u.get("joined_at") or "")[:10]
+        banned = " 🚫" if u.get("is_banned") else ""
+        lines.append(f"{u['user_id']} | {un} | {u['role']}{banned} | {joined}")
+
+    pagination = get_users_pagination(page, total_pages) if total_pages > 1 else None
+    await send_fn("\n".join(lines), reply_markup=pagination)
 
 
 @require_role("owner")

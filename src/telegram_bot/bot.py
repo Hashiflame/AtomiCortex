@@ -4,13 +4,15 @@ AtomiCortex — Telegram Bot Application.
 Wires together database, handlers, broadcaster, and payment modules
 into a single ``python-telegram-bot`` v21 Application.
 
-Phase 7.1 — Payments.
+Phase 7.2 — UX menus.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
+import psutil
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -34,6 +36,10 @@ from src.telegram_bot.handlers_free import (
     cmd_subscribe,
 )
 from src.telegram_bot.handlers_owner import (
+    USERS_PER_PAGE,
+    _build_health_message,
+    _build_stats_admin_message,
+    _send_users_page,
     cmd_ban,
     cmd_broadcast,
     cmd_confirm_stop,
@@ -56,13 +62,31 @@ from src.telegram_bot.handlers_premium import (
     cmd_risk,
     cmd_signal,
 )
+from src.telegram_bot.keyboards import (
+    ALL_BUTTON_TEXTS,
+    BTN_FUNDING,
+    BTN_HEALTH,
+    BTN_HELP,
+    BTN_HISTORY,
+    BTN_REGIME,
+    BTN_SIGNAL,
+    BTN_STATS,
+    BTN_SUBSCRIBE,
+    BTN_USERS,
+    OWNER_BUTTONS,
+    PREMIUM_BUTTONS,
+    get_health_buttons,
+    get_subscribe_inline_button,
+    get_stats_admin_buttons,
+    get_users_pagination,
+)
 from src.telegram_bot.payments_crypto import CryptoBotPayment
 from src.telegram_bot.payments_stars import (
     pre_checkout_handler,
     send_invoice_stars,
     successful_payment_handler,
 )
-from src.telegram_bot.roles import OWNER_ID
+from src.telegram_bot.roles import OWNER_ID, _ensure_user
 
 _log = get_logger(__name__)
 
@@ -182,17 +206,85 @@ class TelegramBot:
             )
         )
 
+        # ReplyKeyboard button handler (text messages matching button labels)
+        button_filter = filters.TEXT & filters.Regex(
+            "|".join(re_escape(btn) for btn in ALL_BUTTON_TEXTS)
+        )
+        app.add_handler(MessageHandler(button_filter, self._handle_button_press))
+
         # Callback query handler for inline keyboard buttons
-        app.add_handler(CallbackQueryHandler(self._handle_pay_callback))
+        app.add_handler(CallbackQueryHandler(self._handle_callback))
 
-        _log.info("Registered %d handlers (commands + payments + callbacks)", 25)
+        _log.info("Registered handlers (commands + payments + buttons + callbacks)")
 
-    async def _handle_pay_callback(
+    # ------------------------------------------------------------------
+    # ReplyKeyboard button router
+    # ------------------------------------------------------------------
+
+    async def _handle_button_press(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Route inline keyboard callbacks for payment buttons."""
+        """Route ReplyKeyboard button presses to command handlers."""
+        if update.message is None or update.effective_user is None:
+            return
+
+        text = update.message.text or ""
+        db: Database = context.bot_data["db"]
+        user = _ensure_user(db, update)
+        role = user.get("role", "free") if user else "free"
+
+        _log.debug(
+            "Button press | user={uid} role={r} button={btn}",
+            uid=update.effective_user.id,
+            r=role,
+            btn=text,
+        )
+
+        # Check access for premium-only buttons
+        if text in PREMIUM_BUTTONS and role not in ("premium", "owner"):
+            await update.effective_chat.send_message(
+                "🔒 Эта функция только для Premium\n"
+                "Нажми ⭐ Подписка чтобы получить доступ",
+                reply_markup=get_subscribe_inline_button(),
+            )
+            return
+
+        # Check access for owner-only buttons
+        if text in OWNER_BUTTONS and role != "owner":
+            await update.effective_chat.send_message(
+                "🔒 Эта функция только для владельца."
+            )
+            return
+
+        # Route to the corresponding handler
+        handler_map = {
+            BTN_SIGNAL: cmd_signal,
+            BTN_HISTORY: cmd_history,
+            BTN_REGIME: cmd_regime,
+            BTN_FUNDING: cmd_funding,
+            BTN_STATS: cmd_stats,
+            BTN_SUBSCRIBE: cmd_subscribe,
+            BTN_HELP: cmd_help,
+            BTN_USERS: cmd_users,
+            BTN_HEALTH: cmd_health,
+        }
+
+        handler = handler_map.get(text)
+        if handler:
+            await handler(update, context)
+
+    # ------------------------------------------------------------------
+    # Inline callback router
+    # ------------------------------------------------------------------
+
+    async def _handle_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Route inline keyboard callbacks."""
         query = update.callback_query
         if query is None:
             return
@@ -201,33 +293,34 @@ class TelegramBot:
         data = query.data or ""
         prices = context.bot_data.get("prices", {})
 
-        if data == "pay_stars_30":
+        # ── Payment callbacks (legacy pay_ prefix) ──
+        if data == "pay_stars_30" or data == "buy_stars_30":
             await send_invoice_stars(
                 update, context,
                 days=30,
                 price_stars=prices.get("stars_30d", 500),
             )
 
-        elif data == "pay_stars_90":
+        elif data == "pay_stars_90" or data == "buy_stars_90":
             await send_invoice_stars(
                 update, context,
                 days=90,
                 price_stars=prices.get("stars_90d", 1200),
             )
 
-        elif data == "pay_usdt_30":
+        elif data == "pay_usdt_30" or data == "buy_usdt_30":
             await self._handle_crypto_pay(
                 update, context, days=30,
                 amount=prices.get("usdt_30d", 7.00),
             )
 
-        elif data == "pay_usdt_90":
+        elif data == "pay_usdt_90" or data == "buy_usdt_90":
             await self._handle_crypto_pay(
                 update, context, days=90,
                 amount=prices.get("usdt_90d", 18.00),
             )
 
-        elif data == "pay_manual":
+        elif data in ("pay_manual", "contact_owner"):
             owner_username = None
             if OWNER_ID is not None:
                 try:
@@ -241,6 +334,41 @@ class TelegramBot:
                 f"✉️ Для ручной оплаты свяжитесь с {contact}.\n\n"
                 f"Укажите желаемый срок подписки."
             )
+
+        elif data == "show_subscribe":
+            # Redirect to subscribe view
+            await cmd_subscribe(update, context)
+
+        # ── Health callbacks ──
+        elif data == "health_refresh":
+            await self._refresh_health(query, context)
+
+        elif data == "health_logs_20":
+            await self._send_logs_inline(query, context, n=20)
+
+        elif data == "health_restart":
+            await self._restart_bot_inline(query, context)
+
+        # ── Users pagination ──
+        elif data.startswith("users_page_"):
+            page = int(data.split("_")[-1])
+            await self._paginate_users(query, context, page)
+
+        elif data == "users_noop":
+            pass  # no-op for the page indicator
+
+        # ── Stats admin period ──
+        elif data.startswith("stats_period_"):
+            # For now, same as full stats (period filtering can be extended)
+            db: Database = context.bot_data["db"]
+            msg = _build_stats_admin_message(db)
+            await query.edit_message_text(
+                msg, reply_markup=get_stats_admin_buttons(),
+            )
+
+    # ------------------------------------------------------------------
+    # Inline action helpers
+    # ------------------------------------------------------------------
 
     async def _handle_crypto_pay(
         self,
@@ -285,6 +413,114 @@ class TelegramBot:
                 "❌ Не удалось создать invoice. Попробуйте позже."
             )
 
+    async def _refresh_health(self, query, context) -> None:
+        """Refresh /health inline."""
+        from datetime import datetime, timezone
+
+        db: Database = context.bot_data["db"]
+        cpu = psutil.cpu_percent(interval=1)
+        cpu_count = psutil.cpu_count() or 0
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        boot = datetime.fromtimestamp(psutil.boot_time(), tz=timezone.utc)
+        uptime = datetime.now(timezone.utc) - boot
+        up_days = uptime.days
+        up_hours = uptime.seconds // 3600
+        up_mins = (uptime.seconds % 3600) // 60
+
+        stats = db.get_stats()
+        signals_today = db.get_signals_today_count()
+        signals = db.get_signals_history(limit=1)
+        regime = signals[0].get("regime", "N/A").upper() if signals else "N/A"
+        open_signals = db.get_open_signals()
+
+        msg = _build_health_message(
+            cpu, cpu_count, mem, disk, up_days, up_hours, up_mins,
+            signals_today, regime, stats, open_signals,
+        )
+
+        try:
+            await query.edit_message_text(
+                msg, reply_markup=get_health_buttons(),
+            )
+        except Exception:
+            pass  # message unchanged
+
+    async def _send_logs_inline(self, query, context, n: int = 20) -> None:
+        """Send last N log lines as a follow-up message."""
+        import asyncio
+        from pathlib import Path
+
+        logs_dir = Path("./logs")
+        log_files = sorted(logs_dir.glob("trading_*.log"), reverse=True)
+
+        if not log_files:
+            await query.message.reply_text("📭 Логи не найдены.")
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tail", f"-n{n}", str(log_files[0]),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            output = stdout.decode("utf-8", errors="replace") if stdout else "Пусто."
+            if len(output) > 4000:
+                output = output[-4000:]
+            await query.message.reply_text(f"📋 Последние {n} строк:\n\n{output}")
+        except Exception as exc:
+            await query.message.reply_text(f"❌ Ошибка чтения логов: {exc}")
+
+    async def _restart_bot_inline(self, query, context) -> None:
+        """Restart trading bot via inline button."""
+        import asyncio
+
+        await query.edit_message_text("🔄 Перезапускаю торгового бота...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", "restart", "atomicortex-bot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                await query.message.reply_text("✅ Бот перезапущен.")
+            else:
+                await query.message.reply_text(
+                    f"❌ Ошибка перезапуска (код {proc.returncode})."
+                )
+        except asyncio.TimeoutError:
+            await query.message.reply_text("❌ Таймаут перезапуска (15с).")
+        except Exception as exc:
+            await query.message.reply_text(f"❌ Ошибка перезапуска: {exc}")
+
+    async def _paginate_users(self, query, context, page: int) -> None:
+        """Handle user list pagination callback."""
+        db: Database = context.bot_data["db"]
+        users = db.get_all_users()
+        total_pages = max(1, math.ceil(len(users) / USERS_PER_PAGE))
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * USERS_PER_PAGE
+        end = start + USERS_PER_PAGE
+        page_users = users[start:end]
+
+        lines = [f"👥 Пользователи ({len(users)} всего):\n", "ID | Username | Role | Joined"]
+        lines.append("─" * 45)
+        for u in page_users:
+            un = f"@{u['username']}" if u.get("username") else "—"
+            joined = (u.get("joined_at") or "")[:10]
+            banned = " 🚫" if u.get("is_banned") else ""
+            lines.append(f"{u['user_id']} | {un} | {u['role']}{banned} | {joined}")
+
+        pagination = get_users_pagination(page, total_pages) if total_pages > 1 else None
+        try:
+            await query.edit_message_text(
+                "\n".join(lines), reply_markup=pagination,
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
@@ -326,3 +562,13 @@ class TelegramBot:
     @property
     def crypto_payment(self) -> CryptoBotPayment | None:
         return self._crypto_payment
+
+
+# ── Utility ──
+
+import re as _re
+
+
+def re_escape(s: str) -> str:
+    """Escape a string for use in a regex alternation."""
+    return _re.escape(s)
