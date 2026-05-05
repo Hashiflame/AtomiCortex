@@ -67,7 +67,7 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     max_leverage: int = 10
     max_open_positions: int = 3
     initial_equity: float = 10_000.0
-    warmup_bars: int = 300
+    warmup_bars: int = 50
     dry_run: bool = False
     rr_ratio: float = 1.5
 
