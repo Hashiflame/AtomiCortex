@@ -186,10 +186,10 @@ class MLTradingStrategy(Strategy):
         # 7. Signal Bridge for Telegram integration
         try:
             from src.execution.signal_bridge import SignalBridge
-            db_path = str(
-                Path(self._config.features_dir).parent.parent
-                / "data" / "atomicortex.db"
-            )
+            # __file__ = src/execution/strategies/ml_strategy.py
+            # project root = 4 levels up
+            project_root = Path(__file__).resolve().parent.parent.parent.parent
+            db_path = str(project_root / "data" / "atomicortex.db")
             self._signal_bridge = SignalBridge(db_path=db_path)
             self.log.info(f"SignalBridge initialised | db={db_path}")
         except Exception as exc:
