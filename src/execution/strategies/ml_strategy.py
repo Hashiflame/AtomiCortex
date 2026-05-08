@@ -225,6 +225,10 @@ class MLTradingStrategy(Strategy):
 
     def on_bar(self, bar: Bar) -> None:
         """Core logic: regime → model → signal → risk → execute."""
+        self.log.info(
+            f"on_bar called | {bar.bar_type} | close={bar.close}"
+        )
+
         self._bars.append(bar)
         self._bar_count += 1
 
