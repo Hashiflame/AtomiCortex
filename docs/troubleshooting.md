@@ -2026,7 +2026,71 @@ print(bt)  # -> BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL
 
 ---
 
-*Последнее обновление: 2026-05 | Фаза: 4.4–4.5 — Live Trader (NT2-001–NT2-007)*
+---
+
+### [NT2-010] Binance USDT-M futures: kline WS endpoint мигрировал на `/market/stream`
+**Дата:** 2026-05-08
+**Фаза:** 4.5 — Live Trader (paper mode на mainnet)
+
+**Симптом:**
+Бот работает 6+ дней, `bars_processed=0` за всё время, `on_bar()` не вызывался ни разу.
+В логах Nautilus подписка успешна:
+```
+Subscribed BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL
+```
+но kline-сообщения физически не приходят.
+
+**Причина:**
+Binance отключил старые WS пути для USDT-M futures (`/stream`, `/ws`) — дедлайн миграции
+2026-04-23. Теперь market-data стримы живут на `/market/stream` и `/market/ws`,
+user-data — на `/private`.
+
+Nautilus 1.221.0 в `common/urls.py:69` использует дефолт `wss://fstream.binance.com`,
+а в `websocket/client.py:220` строит финальный URL как:
+```python
+ws_url = self._base_url + f"/stream?streams={initial_stream}"
+```
+Без override `base_url_ws` получается `wss://fstream.binance.com/stream?streams=...` —
+устаревший endpoint, сервер принимает соединение, но не шлёт данные.
+
+Проверка вручную:
+```bash
+# не работает (старый):
+wscat -c "wss://fstream.binance.com/ws/btcusdt@kline_1m"           # 0 messages
+# работает (новый):
+wscat -c "wss://fstream.binance.com/market/ws/btcusdt@kline_1m"    # данные идут
+wscat -c "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m"  # OK
+```
+
+**Решение:**
+В `LiveTrader.build_node()` пробросить `base_url_ws` для mainnet (testnet ещё на старом
+endpoint, его не трогать):
+
+```python
+if is_testnet:
+    ws_host_market  = "wss://stream.binancefuture.com"
+    ws_host_private = "wss://stream.binancefuture.com"
+else:
+    ws_host_market  = "wss://fstream.binance.com/market"
+    ws_host_private = "wss://fstream.binance.com/private"
+
+BinanceDataClientConfig(..., base_url_ws=ws_host_market)
+BinanceExecClientConfig(..., base_url_ws=ws_host_private)
+```
+
+После рестарта в логах должно появиться:
+```
+Base url WebSocket wss://fstream.binance.com/market
+```
+и в течение минуты — первый `on_bar` (на 1m timeframe для быстрой проверки).
+
+**Файл:** `src/execution/live_trader.py:111–141` — конфиги клиентов.
+**Что не трогали:** `bar_type` (`EXTERNAL` корректен), Nautilus core,
+testnet endpoint, exec/HTTP REST URL'ы.
+
+---
+
+*Последнее обновление: 2026-05-08 | Фаза: 4.4–4.5 — Live Trader (NT2-001–NT2-010)*
 
 ---
 

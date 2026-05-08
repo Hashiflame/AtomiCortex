@@ -111,6 +111,17 @@ class LiveTrader:
         # Instrument provider: load all futures instruments
         instrument_provider = InstrumentProviderConfig(load_all=True)
 
+        # Binance migrated futures WS to /market and /private path prefixes
+        # (mainnet deadline 2026-04-23). Nautilus appends "/stream?streams=..."
+        # to base_url_ws, so we override only the host+prefix here.
+        # Testnet still uses the legacy endpoint without the /market prefix.
+        if is_testnet:
+            ws_host_market = "wss://stream.binancefuture.com"
+            ws_host_private = "wss://stream.binancefuture.com"
+        else:
+            ws_host_market = "wss://fstream.binance.com/market"
+            ws_host_private = "wss://fstream.binance.com/private"
+
         # Data client
         data_client_config = BinanceDataClientConfig(
             api_key=api_key,
@@ -118,6 +129,7 @@ class LiveTrader:
             account_type=BinanceAccountType.USDT_FUTURES,
             testnet=is_testnet,
             instrument_provider=instrument_provider,
+            base_url_ws=ws_host_market,
         )
 
         # Exec client
@@ -128,6 +140,7 @@ class LiveTrader:
             testnet=is_testnet,
             instrument_provider=instrument_provider,
             use_reduce_only=True,
+            base_url_ws=ws_host_private,
         )
 
         # Build TradingNode config
