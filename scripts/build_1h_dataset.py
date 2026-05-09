@@ -85,7 +85,7 @@ def _load_klines(
             continue
 
         dfs = [pl.read_parquet(f, hive_partitioning=False) for f in files]
-        df = pl.concat(dfs, how="diagonal").sort("open_time").unique(subset=["open_time"])
+        df = pl.concat(dfs, how="diagonal").sort("open_time").unique(subset=["open_time"], maintain_order=True)
         _log.info(f"Loaded {len(df):,} bars from {base} ({symbol}/{interval})")
         return df
 

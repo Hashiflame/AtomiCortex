@@ -190,14 +190,37 @@ class TestWalkForward:
         df = _make_df_with_target(n=500)
         cv = PurgedKFoldCV(n_splits=3, embargo_pct=0.02)
 
+        # embargo_pct=0.02 on 500 rows = 10 rows; each row = 1 hour = 3600_000 ms
+        min_gap_ms = 1 * 3600_000  # at least 1 bar gap
+
         for train_df, test_df in cv.split(df):
             # Train end index < test start index (gap exists)
             train_end_time = train_df["open_time"][-1]
             test_start_time = test_df["open_time"][0]
-            assert test_start_time > train_end_time, (
-                f"No embargo gap: train ends at {train_end_time}, "
-                f"test starts at {test_start_time}"
+            gap_ms = test_start_time - train_end_time
+            assert gap_ms > min_gap_ms, (
+                f"Embargo gap too small: {gap_ms / 3600_000:.1f} hours "
+                f"(need > {min_gap_ms / 3600_000:.1f}h). "
+                f"Train ends at {train_end_time}, test starts at {test_start_time}"
             )
+
+    def test_wf_windows_no_overlap(self):
+        """Walk-forward train/test windows must not overlap."""
+        from src.execution.walk_forward import WalkForwardValidator
+        from datetime import datetime, timezone
+
+        start = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        wf = WalkForwardValidator(train_months=12, test_months=4, step_months=2)
+
+        for (ts, te), (vs, ve) in wf.split(start, end):
+            # Train end must be <= test start (no overlap)
+            assert te <= vs, (
+                f"Train/test overlap: train ends {te}, test starts {vs}"
+            )
+            # Test start must be strictly after train end or equal
+            # (the actual WF sets test_start = train_end, which is fine
+            # because train uses < te and test uses >= vs)
 
 
 class TestFeatures:

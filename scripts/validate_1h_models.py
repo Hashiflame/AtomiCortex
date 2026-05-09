@@ -68,6 +68,7 @@ _WF_PROFITABLE_THRESHOLD = 55.0  # % of walk-forward windows
 _FEE_MULTIPLIER_THRESHOLD = 4.0
 _ROUND_TRIP_FEES_BPS = 7.0  # ~0.07% (maker + taker on Binance Futures)
 _ROUND_TRIP_COST = _ROUND_TRIP_FEES_BPS / 10_000  # 0.0007
+_EMBARGO_BARS = 48  # 2 days × 24 bars/day — embargo gap for WF
 _DSR_THRESHOLD = 0.95
 _PBO_THRESHOLD = 0.30
 _TSTAT_THRESHOLD = 3.0
@@ -210,12 +211,17 @@ def _run_walk_forward(
 
     windows: list[WindowMLResult] = []
 
+    # Embargo offset: skip first _EMBARGO_BARS hours of test window
+    from datetime import timedelta
+    embargo_delta = timedelta(hours=_EMBARGO_BARS)
+
     for i, ((ts, te), (vs, ve)) in enumerate(wf.split(data_start, data_end)):
+        vs_embargoed = vs + embargo_delta  # shift test start by embargo
         train_df = df.filter(
             (pl.col("_wf_dt") >= ts) & (pl.col("_wf_dt") < te)
         ).drop("_wf_dt")
         test_df = df.filter(
-            (pl.col("_wf_dt") >= vs) & (pl.col("_wf_dt") < ve)
+            (pl.col("_wf_dt") >= vs_embargoed) & (pl.col("_wf_dt") < ve)
         ).drop("_wf_dt")
 
         if len(train_df) < 100 or len(test_df) < 20:
@@ -302,7 +308,9 @@ def _compute_oos_metrics(
         wins_abs = float(np.abs(signal_returns[correct]).sum())
         losses_abs = float(np.abs(signal_returns[~correct]).sum())
         profit_factor = wins_abs / losses_abs if losses_abs > 0 else 999.0
-        avg_return = float(np.mean(np.abs(signal_returns))) * 100
+        # avg_return = mean SIGNED PnL per trade (pred × return - cost)
+        signed_pnl = signal_preds * signal_returns - _ROUND_TRIP_COST
+        avg_return = float(np.mean(signed_pnl)) * 100
 
         # Sharpe: daily P&L aggregation with costs, annualized by sqrt(252)
         from datetime import datetime as _dt, timezone
@@ -329,7 +337,9 @@ def _compute_oos_metrics(
         else:
             sharpe = 0.0
 
-        fee_multiplier = avg_return / 100 / _ROUND_TRIP_COST if _ROUND_TRIP_COST > 0 else 0.0
+        # fee_multiplier: how many times the avg gross return exceeds costs
+        avg_gross_return = float(np.mean(signal_preds * signal_returns))
+        fee_multiplier = avg_gross_return / _ROUND_TRIP_COST if _ROUND_TRIP_COST > 0 else 0.0
     else:
         win_rate = 0.0
         profit_factor = 0.0

@@ -47,17 +47,16 @@ class MLStrategyConfig1H:
     # Fee filter (stricter than 4H)
     min_expected_return_vs_fees: float = 4.0  # 4H uses 3.0
 
-    # Regimes where we trade
+    # Regimes where we trade (must match RegimeDetector output — lowercase)
     valid_regimes: List[str] = field(default_factory=lambda: [
-        "TREND_UP_STRONG", "TREND_UP_WEAK",
-        "TREND_DOWN_STRONG", "TREND_DOWN_WEAK",
-        "HIGH_VOL", "SESSION_OVERLAP",
+        "trend_up", "trend_down",
+        "high_vol",
     ])
 
-    # Regimes to skip
+    # Regimes to skip (must match RegimeDetector output — lowercase)
     skip_regimes: List[str] = field(default_factory=lambda: [
-        "PRE_FUNDING",
-        "RANGE",
+        "range",
+        "unknown",
     ])
 
     # Session filters

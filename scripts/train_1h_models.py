@@ -95,12 +95,18 @@ def train_regime_model(
     )
 
     # Split: walk-forward style (80% train / 20% test, temporal)
+    # Apply embargo gap between train and test to prevent leakage
     n = len(df)
     train_n = int(n * 0.8)
+    embargo = min(_EMBARGO_BARS, n - train_n)  # don't exceed test size
+    test_start = train_n + embargo
     train_df = df.head(train_n)
-    test_df = df.tail(n - train_n)
+    test_df = df.slice(test_start, n - test_start)
 
-    _log.info(f"  Split: train={train_n:,}, test={n - train_n:,}")
+    _log.info(
+        f"  Split: train={train_n:,}, embargo={embargo}, "
+        f"test={len(test_df):,}"
+    )
 
     try:
         # Train
@@ -187,12 +193,17 @@ def run_walk_forward_validation(
 
     windows: list[WindowMLResult] = []
 
+    # Embargo offset: skip first _EMBARGO_BARS hours of test window
+    from datetime import timedelta
+    embargo_delta = timedelta(hours=_EMBARGO_BARS)
+
     for i, ((ts, te), (vs, ve)) in enumerate(wf.split(data_start, data_end)):
+        vs_embargoed = vs + embargo_delta  # shift test start by embargo
         train_df = df.filter(
             (pl.col("_wf_dt") >= ts) & (pl.col("_wf_dt") < te)
         ).drop("_wf_dt")
         test_df = df.filter(
-            (pl.col("_wf_dt") >= vs) & (pl.col("_wf_dt") < ve)
+            (pl.col("_wf_dt") >= vs_embargoed) & (pl.col("_wf_dt") < ve)
         ).drop("_wf_dt")
 
         if len(train_df) < 100 or len(test_df) < 20:
