@@ -95,6 +95,12 @@ def cli(ctx: click.Context) -> None:
     show_default=True,
     help="Max simultaneous downloads.",
 )
+@click.option(
+    "--intervals",
+    default="4h,1d",
+    show_default=True,
+    help="Comma-separated kline intervals, e.g. '4h,1d,1h,15m'.",
+)
 def cmd_download(
     symbols: str,
     start: datetime,
@@ -102,11 +108,13 @@ def cmd_download(
     data_dir: str,
     no_agg_trades: bool,
     concurrent: int,
+    intervals: str,
 ) -> None:
     """Download historical futures data from https://data.binance.vision."""
     log = get_logger(__name__)
 
     symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    intervals_list = [i.strip() for i in intervals.split(",") if i.strip()]
     start_date: date = start.date()
     end_date: date = end.date()
     base_dir = Path(data_dir)
@@ -115,8 +123,12 @@ def cmd_download(
         click.echo("❌ --start must be before --end", err=True)
         sys.exit(1)
 
+    if not intervals_list:
+        click.echo("❌ --intervals must contain at least one interval", err=True)
+        sys.exit(1)
+
     n_days = (end_date - start_date).days + 1
-    data_types = ["klines_4h", "klines_1d", "funding_rate", "metrics"]
+    data_types = [f"klines_{i}" for i in intervals_list] + ["funding_rate", "metrics"]
     if not no_agg_trades:
         data_types.append("agg_trades")
 
@@ -143,6 +155,7 @@ def cmd_download(
                 end_date=end_date,
                 base_dir=base_dir,
                 include_agg_trades=not no_agg_trades,
+                kline_intervals=intervals_list,
             )
 
     stats = asyncio.run(_run())

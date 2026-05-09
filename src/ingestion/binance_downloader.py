@@ -416,10 +416,17 @@ class BinanceDataDownloader:
         end_date: date,
         base_dir: Path,
         include_agg_trades: bool = True,
+        kline_intervals: list[str] | None = None,
     ) -> dict[str, Any]:
         """Download all data types for all symbols over the date range.
 
         Runs up to ``max_concurrent`` simultaneous downloads (set in __init__).
+
+        Parameters
+        ----------
+        kline_intervals:
+            Kline intervals to fetch (e.g. ``["4h", "1d", "1h", "15m"]``).
+            Defaults to ``["4h", "1d"]`` for backward compatibility.
 
         Returns
         -------
@@ -432,6 +439,9 @@ class BinanceDataDownloader:
             elapsed_seconds — wall-clock time
         """
         import time
+
+        if kline_intervals is None:
+            kline_intervals = ["4h", "1d"]
 
         t0 = time.monotonic()
         stats: dict[str, Any] = {
@@ -450,8 +460,8 @@ class BinanceDataDownloader:
         task_labels: list[str] = []
 
         for symbol in symbols:
-            # klines 4h + 1d
-            for interval in ("4h", "1d"):
+            # klines (configurable intervals — default: 4h + 1d)
+            for interval in kline_intervals:
                 d = self._symbol_data_dir(base_dir, symbol, f"klines_{interval}")
                 d.mkdir(parents=True, exist_ok=True)
                 for day in days:
