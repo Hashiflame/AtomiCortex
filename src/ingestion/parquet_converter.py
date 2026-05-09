@@ -6,7 +6,8 @@ ZSTD compression.  Reads with Polars, writes partitioned by date:
 
     {output_dir}/exchange=BINANCE_UM/symbol={symbol}/{data_type}/date={YYYY-MM-DD}/part-0.parquet
 
-Supported data_type values: klines_4h, klines_1d, funding_rate, metrics, agg_trades
+Supported data_type values: klines_<interval> (4h, 1d, 1h, 15m, 5m, 1m …),
+funding_rate, metrics, agg_trades
 """
 
 from __future__ import annotations
@@ -86,31 +87,26 @@ class _TypeConfig:
     datetime_format: str = ""                   # strptime format (when datetime_is_string)
 
 
+# Shared config for ALL klines intervals — Binance kline CSV format is
+# identical across 1m, 5m, 15m, 1h, 4h, 1d, etc.  Any data_type starting
+# with "klines_" reuses this config (registered lazily on first use).
+_KLINES_CONFIG = _TypeConfig(
+    csv_dtypes={
+        "open_time": pl.Int64, "open": pl.Float64, "high": pl.Float64,
+        "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64,
+        "close_time": pl.Int64, "quote_volume": pl.Float64,
+        "count": pl.Int32, "taker_buy_volume": pl.Float64,
+        "taker_buy_quote_volume": pl.Float64, "ignore": pl.Float64,
+    },
+    column_renames={"count": "trade_count"},
+    timestamp_col="open_time",
+    sort_col="open_time",
+)
+
+
 _CONFIGS: dict[str, _TypeConfig] = {
-    "klines_4h": _TypeConfig(
-        csv_dtypes={
-            "open_time": pl.Int64, "open": pl.Float64, "high": pl.Float64,
-            "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64,
-            "close_time": pl.Int64, "quote_volume": pl.Float64,
-            "count": pl.Int32, "taker_buy_volume": pl.Float64,
-            "taker_buy_quote_volume": pl.Float64, "ignore": pl.Float64,
-        },
-        column_renames={"count": "trade_count"},
-        timestamp_col="open_time",
-        sort_col="open_time",
-    ),
-    "klines_1d": _TypeConfig(
-        csv_dtypes={
-            "open_time": pl.Int64, "open": pl.Float64, "high": pl.Float64,
-            "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64,
-            "close_time": pl.Int64, "quote_volume": pl.Float64,
-            "count": pl.Int32, "taker_buy_volume": pl.Float64,
-            "taker_buy_quote_volume": pl.Float64, "ignore": pl.Float64,
-        },
-        column_renames={"count": "trade_count"},
-        timestamp_col="open_time",
-        sort_col="open_time",
-    ),
+    "klines_4h": _KLINES_CONFIG,
+    "klines_1d": _KLINES_CONFIG,
     "funding_rate": _TypeConfig(
         csv_dtypes={
             "fundingTime": pl.Int64,
@@ -153,6 +149,21 @@ _CONFIGS: dict[str, _TypeConfig] = {
 }
 
 ROW_GROUP_SIZE = 131_072   # 128 K rows per parquet row-group
+
+
+def _resolve_config(data_type: str) -> _TypeConfig | None:
+    """Return the type config for *data_type*, registering klines variants on demand.
+
+    Any data_type starting with ``klines_`` (e.g. ``klines_1h``, ``klines_15m``,
+    ``klines_5m``) automatically uses the shared ``_KLINES_CONFIG``.
+    """
+    cfg = _CONFIGS.get(data_type)
+    if cfg is not None:
+        return cfg
+    if data_type.startswith("klines_"):
+        _CONFIGS[data_type] = _KLINES_CONFIG
+        return _KLINES_CONFIG
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +238,13 @@ class ParquetConverter:
 
         Returns the output Parquet path, or ``None`` when the CSV is empty.
         """
-        if data_type not in _CONFIGS:
+        cfg = _resolve_config(data_type)
+        if cfg is None:
             raise ValueError(
                 f"Unknown data_type '{data_type}'. "
-                f"Valid values: {list(_CONFIGS)}"
+                f"Valid values: {list(_CONFIGS)} "
+                f"(or any 'klines_<interval>' such as klines_1h / klines_15m)"
             )
-
-        cfg = _CONFIGS[data_type]
         date_str = extract_date_from_stem(csv_path.stem)
         parquet_path = (
             output_dir
@@ -354,6 +365,16 @@ class ParquetConverter:
         t0 = time.monotonic()
         if data_types is None:
             data_types = list(_CONFIGS)
+
+        # Pre-register any klines_<interval> requested explicitly so the
+        # downstream loop (and worker processes) see them as known types.
+        for dt in data_types:
+            if _resolve_config(dt) is None:
+                raise ValueError(
+                    f"Unknown data_type '{dt}'. "
+                    f"Valid values: {list(_CONFIGS)} "
+                    f"(or any 'klines_<interval>')"
+                )
 
         stats: dict[str, Any] = {
             "converted": 0,
