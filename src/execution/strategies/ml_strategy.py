@@ -229,135 +229,173 @@ class MLTradingStrategy(Strategy):
             f"on_bar called | {bar.bar_type} | close={bar.close}"
         )
 
-        self._bars.append(bar)
-        self._bar_count += 1
+        try:
+            self.log.info(
+                f"on_bar step 1: adding to buffer, size={len(self._bars)}"
+            )
+            self._bars.append(bar)
+            self._bar_count += 1
 
-        # Record equity
-        self._record_equity(bar.ts_event)
+            # Record equity
+            self._record_equity(bar.ts_event)
 
-        # 1. Warmup check
-        if not self._warmup_complete:
-            if len(self._bars) >= self._config.warmup_bars:
-                self._warmup_complete = True
-                self.log.info(
-                    f"Warmup complete via live bars | "
-                    f"bars={len(self._bars)}"
-                )
-            else:
-                remaining = (
-                    self._config.warmup_bars - len(self._bars)
-                )
-                if self._bar_count % 50 == 0:
-                    self.log.debug(
-                        f"Warmup: {len(self._bars)}/"
-                        f"{self._config.warmup_bars} bars "
-                        f"({remaining} remaining)"
+            # 1. Warmup check
+            if not self._warmup_complete:
+                if len(self._bars) >= self._config.warmup_bars:
+                    self._warmup_complete = True
+                    self.log.info(
+                        f"Warmup complete via live bars | "
+                        f"bars={len(self._bars)}"
                     )
+                else:
+                    remaining = (
+                        self._config.warmup_bars - len(self._bars)
+                    )
+                    self.log.info(
+                        f"on_bar: warmup not complete "
+                        f"({len(self._bars)}/{self._config.warmup_bars}, "
+                        f"{remaining} remaining)"
+                    )
+                    return
+
+            # 2. Detect regime
+            self.log.info("on_bar step 2: detecting regime")
+            regime_state = self._detect_regime()
+            if regime_state is None:
+                self.log.info("on_bar: regime_state is None — skipping")
                 return
 
-        # 2. Detect regime
-        regime_state = self._detect_regime()
-        if regime_state is None:
-            return
+            regime_label = regime_state.regime.value  # e.g. "trend_up", "high_vol"
 
-        regime_label = regime_state.regime.value  # e.g. "trend_up", "high_vol"
+            # Compute last_return for diagnostics
+            last_return = 0.0
+            if len(self._bars) >= 2:
+                prev_close = self._bars[-2].close.as_double()
+                cur_close = self._bars[-1].close.as_double()
+                if prev_close > 0:
+                    last_return = (cur_close - prev_close) / prev_close
 
-        # 3. Select model by regime
-        model, features_list = self._select_model(regime_label)
-        if model is None:
-            self.log.debug(f"No model for regime '{regime_label}' — skipping")
-            return
-
-        # 4. Compute features
-        feature_vector = self._compute_features(features_list)
-        if feature_vector is None:
-            return
-
-        # 5. Get ML signal
-        from src.models.lgbm_trainer import LGBMTrainer
-        direction, confidence = LGBMTrainer.get_signal(
-            None,  # static-ish: only uses model.predict
-            model,
-            feature_vector,
-            confidence_threshold=self._config.confidence_threshold,
-        )
-
-        if direction == 0:
-            self.log.debug(
-                f"No signal | regime={regime_label} | confidence={confidence:.3f}"
-            )
-            return
-
-        # 6. Build TradeSignal
-        current_price = bar.close.as_double()
-        atr_dollar = regime_state.atr_pct * current_price
-        now_utc = datetime.fromtimestamp(bar.ts_event / 1e9, tz=timezone.utc)
-
-        # Read funding rate from feature data (PROD-003 fix)
-        funding_rate = self._get_funding_rate(feature_vector, feature_names)
-
-        signal = TradeSignal(
-            symbol=str(self._instrument_id),
-            direction=direction,
-            confidence=confidence,
-            regime=regime_label,
-            entry_price=current_price,
-            atr=atr_dollar,
-            atr_pct=regime_state.atr_pct,
-            funding_rate=funding_rate,
-            timestamp=now_utc,
-        )
-
-        # 7. Risk evaluation
-        portfolio_state = self._tracker.get_state()
-        decision = self._risk_engine.evaluate(signal, portfolio_state)
-
-        if not decision.approved:
             self.log.info(
-                f"Signal BLOCKED | {regime_label} | "
-                f"dir={direction} conf={confidence:.3f} | "
-                f"reason={decision.reason}"
+                f"on_bar step 3: regime={regime_label} | "
+                f"adx={regime_state.adx:.1f} | "
+                f"atr_pct={regime_state.atr_percentile:.2f} | "
+                f"last_return={last_return:.4f}"
             )
-            return
 
-        # 8. Execute
-        self.log.info(
-            f"Signal APPROVED | {regime_label} dir={direction} "
-            f"conf={confidence:.3f} | size={decision.position_size:.6f} "
-            f"notional=${decision.notional:.2f}"
-        )
-        if not self._config.dry_run:
-            self._open_position(decision, signal)
-        else:
+            # 3. Select model + per-regime confidence threshold
+            model, features_list, conf_threshold = self._select_model(regime_label)
+            if model is None:
+                self.log.warning(
+                    f"on_bar: no model loaded for regime '{regime_label}' — skipping"
+                )
+                return
+
+            # 4. Compute features
             self.log.info(
-                f"[DRY RUN] Would open {signal.direction} "
-                f"{decision.position_size:.6f} @ ${signal.entry_price:.2f} | "
-                f"SL=${decision.stop_loss:.2f} TP=${decision.take_profit:.2f}"
+                f"on_bar step 4: computing features "
+                f"(n={len(features_list)})"
+            )
+            feature_vector = self._compute_features(features_list)
+            if feature_vector is None:
+                self.log.info("on_bar: feature_vector is None — skipping")
+                return
+
+            # 5. Get ML signal
+            self.log.info("on_bar step 5: ML prediction")
+            from src.models.lgbm_trainer import LGBMTrainer
+            direction, confidence = LGBMTrainer.get_signal(
+                None,  # static-ish: only uses model.predict
+                model,
+                feature_vector,
+                confidence_threshold=conf_threshold,
+            )
+            self.log.info(
+                f"on_bar step 6: dir={direction} confidence={confidence:.3f}"
             )
 
-        # Regime change detection
-        if self._last_regime and regime_label != self._last_regime:
-            if self._signal_bridge:
+            if direction == 0:
+                self.log.info(
+                    f"on_bar: no signal | regime={regime_label} | "
+                    f"confidence={confidence:.3f}"
+                )
+                return
+
+            # 6. Build TradeSignal
+            current_price = bar.close.as_double()
+            atr_dollar = regime_state.atr_pct * current_price
+            now_utc = datetime.fromtimestamp(bar.ts_event / 1e9, tz=timezone.utc)
+
+            # Read funding rate from feature data (PROD-003 fix)
+            funding_rate = self._get_funding_rate(feature_vector, features_list)
+
+            signal = TradeSignal(
+                symbol=str(self._instrument_id),
+                direction=direction,
+                confidence=confidence,
+                regime=regime_label,
+                entry_price=current_price,
+                atr=atr_dollar,
+                atr_pct=regime_state.atr_pct,
+                funding_rate=funding_rate,
+                timestamp=now_utc,
+            )
+
+            # 7. Risk evaluation
+            self.log.info("on_bar step 7: risk evaluation")
+            portfolio_state = self._tracker.get_state()
+            decision = self._risk_engine.evaluate(signal, portfolio_state)
+
+            if not decision.approved:
+                self.log.info(
+                    f"Signal BLOCKED | {regime_label} | "
+                    f"dir={direction} conf={confidence:.3f} | "
+                    f"reason={decision.reason}"
+                )
+                return
+
+            # 8. Execute
+            self.log.info(
+                f"Signal APPROVED | {regime_label} dir={direction} "
+                f"conf={confidence:.3f} | size={decision.position_size:.6f} "
+                f"notional=${decision.notional:.2f}"
+            )
+            if not self._config.dry_run:
+                self._open_position(decision, signal)
+            else:
+                self.log.info(
+                    f"[DRY RUN] Would open {signal.direction} "
+                    f"{decision.position_size:.6f} @ ${signal.entry_price:.2f} | "
+                    f"SL=${decision.stop_loss:.2f} TP=${decision.take_profit:.2f}"
+                )
+
+            # Regime change detection
+            if self._last_regime and regime_label != self._last_regime:
+                if self._signal_bridge:
+                    try:
+                        self._signal_bridge.log_regime_change(
+                            self._last_regime, regime_label,
+                        )
+                    except Exception:
+                        pass
+            self._last_regime = regime_label
+
+            # Periodic metrics update (every 6 bars = ~24H)
+            if self._bar_count % 6 == 0 and self._signal_bridge and self._tracker:
                 try:
-                    self._signal_bridge.log_regime_change(
-                        self._last_regime, regime_label,
+                    state = self._tracker.get_state()
+                    self._signal_bridge.update_metrics(
+                        equity=state.equity,
+                        daily_pnl=state.daily_pnl_pct,
+                        regime=regime_label,
+                        open_positions=state.open_positions,
                     )
                 except Exception:
                     pass
-        self._last_regime = regime_label
 
-        # Periodic metrics update (every 6 bars = ~24H)
-        if self._bar_count % 6 == 0 and self._signal_bridge and self._tracker:
-            try:
-                state = self._tracker.get_state()
-                self._signal_bridge.update_metrics(
-                    equity=state.equity,
-                    daily_pnl=state.daily_pnl_pct,
-                    regime=regime_label,
-                    open_positions=state.open_positions,
-                )
-            except Exception:
-                pass
+        except Exception as exc:
+            import traceback
+            self.log.error(f"on_bar EXCEPTION: {exc}")
+            self.log.error(traceback.format_exc())
 
     # ------------------------------------------------------------------
     # Order events
@@ -795,14 +833,31 @@ class MLTradingStrategy(Strategy):
 
     def _select_model(
         self, regime_label: str,
-    ) -> tuple[Any, list[str]]:
-        """Select model + feature list by regime."""
+    ) -> tuple[Any, list[str], float]:
+        """Select model, feature list, and confidence threshold by regime.
+
+        Returns
+        -------
+        (model, feature_names, confidence_threshold)
+
+        Mapping:
+        * trend_up / trend_down → trend model, threshold = config default (0.65)
+        * range                 → trend model, threshold = 0.70 (stricter)
+        * high_vol              → high-vol model, threshold = config default
+        * anything else (should never happen) → trend model, threshold = 0.70
+        """
+        base_threshold = self._config.confidence_threshold
         if regime_label in ("trend_up", "trend_down"):
-            return self._trend_model, self._trend_features
-        elif regime_label == "high_vol":
-            return self._highvol_model, self._highvol_features
-        # range / unknown → no model
-        return None, []
+            return self._trend_model, self._trend_features, base_threshold
+        if regime_label == "range":
+            return self._trend_model, self._trend_features, max(base_threshold, 0.70)
+        if regime_label == "high_vol":
+            return self._highvol_model, self._highvol_features, base_threshold
+        # Defensive fallback — RegimeDetector no longer produces "unknown"
+        self.log.warning(
+            f"Unexpected regime '{regime_label}' — falling back to trend model"
+        )
+        return self._trend_model, self._trend_features, max(base_threshold, 0.70)
 
     # ------------------------------------------------------------------
     # Historical bar preloading

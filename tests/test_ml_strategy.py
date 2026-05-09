@@ -190,15 +190,16 @@ class TestModelSelection:
     def test_trend_up_selects_trend_model(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
-        """trend_up regime should select the trend model."""
+        """trend_up regime should select the trend model with base threshold."""
         strategy = MLTradingStrategy(config=default_strategy_config)
         strategy._trend_model = MagicMock(name="trend")
         strategy._trend_features = ["f1", "f2"]
         strategy._highvol_model = MagicMock(name="highvol")
 
-        model, feats = strategy._select_model("trend_up")
+        model, feats, threshold = strategy._select_model("trend_up")
         assert model is strategy._trend_model
         assert feats == ["f1", "f2"]
+        assert threshold == pytest.approx(default_strategy_config.confidence_threshold)
 
     def test_trend_down_selects_trend_model(
         self, default_strategy_config: MLStrategyConfig,
@@ -208,8 +209,9 @@ class TestModelSelection:
         strategy._trend_model = MagicMock(name="trend")
         strategy._trend_features = ["f1"]
 
-        model, _ = strategy._select_model("trend_down")
+        model, _, threshold = strategy._select_model("trend_down")
         assert model is strategy._trend_model
+        assert threshold == pytest.approx(default_strategy_config.confidence_threshold)
 
     def test_high_vol_selects_highvol_model(
         self, default_strategy_config: MLStrategyConfig,
@@ -219,26 +221,33 @@ class TestModelSelection:
         strategy._highvol_model = MagicMock(name="highvol")
         strategy._highvol_features = ["hv1"]
 
-        model, feats = strategy._select_model("high_vol")
+        model, feats, threshold = strategy._select_model("high_vol")
         assert model is strategy._highvol_model
         assert feats == ["hv1"]
+        assert threshold == pytest.approx(default_strategy_config.confidence_threshold)
 
-    def test_range_returns_none(
+    def test_range_uses_trend_model_with_higher_threshold(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
-        """range regime has no model → returns None."""
+        """range regime now uses the trend model with a stricter (>=0.70) threshold."""
         strategy = MLTradingStrategy(config=default_strategy_config)
-        model, feats = strategy._select_model("range")
-        assert model is None
-        assert feats == []
+        strategy._trend_model = MagicMock(name="trend")
+        strategy._trend_features = ["f1"]
+        model, feats, threshold = strategy._select_model("range")
+        assert model is strategy._trend_model
+        assert feats == ["f1"]
+        assert threshold >= 0.70
 
-    def test_unknown_returns_none(
+    def test_unknown_falls_back_to_trend_model(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
-        """unknown regime has no model → returns None."""
+        """Defensive: unexpected regime falls back to trend model with strict threshold."""
         strategy = MLTradingStrategy(config=default_strategy_config)
-        model, feats = strategy._select_model("unknown")
-        assert model is None
+        strategy._trend_model = MagicMock(name="trend")
+        strategy._trend_features = ["f1"]
+        model, _, threshold = strategy._select_model("unknown")
+        assert model is strategy._trend_model
+        assert threshold >= 0.70
 
 
 # ═══════════════════════════════════════════════════════════════════════════

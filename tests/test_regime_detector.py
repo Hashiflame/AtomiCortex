@@ -314,6 +314,111 @@ class TestRegimeStatistics:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 7b. New classification rules — RD-004 fix
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestNewClassificationRules:
+    """Verify the no-UNKNOWN rules from the RD-004 redesign."""
+
+    @staticmethod
+    def _close_for_return(last_return: float, base: float = 40_000.0) -> np.ndarray:
+        """Build a 2-element close array with the desired last return."""
+        return np.array([base, base * (1.0 + last_return)], dtype=np.float64)
+
+    def test_adx_22_positive_return_is_trend_up(self):
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(+0.005)
+        regime = det._classify(hurst=0.5, adx=22.0, atr_percentile=0.5,
+                                close=close, idx=1)
+        assert regime == MarketRegime.TREND_UP
+
+    def test_adx_22_negative_return_is_trend_down(self):
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(-0.005)
+        regime = det._classify(hurst=0.5, adx=22.0, atr_percentile=0.5,
+                                close=close, idx=1)
+        assert regime == MarketRegime.TREND_DOWN
+
+    def test_adx_15_is_range(self):
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(+0.001)
+        regime = det._classify(hurst=0.5, adx=15.0, atr_percentile=0.5,
+                                close=close, idx=1)
+        assert regime == MarketRegime.RANGE
+
+    def test_adx_22_low_return_falls_in_range_when_below_threshold(self):
+        """Transitional ADX (was UNKNOWN) — must now be classified as a real regime."""
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(+0.0005)
+        regime = det._classify(hurst=0.5, adx=18.0, atr_percentile=0.5,
+                                close=close, idx=1)
+        # adx <= threshold → range (no longer UNKNOWN)
+        assert regime == MarketRegime.RANGE
+
+    def test_atr_percentile_above_threshold_is_high_vol(self):
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(+0.001)
+        regime = det._classify(hurst=0.5, adx=15.0, atr_percentile=0.85,
+                                close=close, idx=1)
+        assert regime == MarketRegime.HIGH_VOL
+
+    def test_high_vol_takes_priority_over_trend(self):
+        """ATR-percentile gate fires even when ADX would qualify as trend."""
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        close = self._close_for_return(+0.01)
+        regime = det._classify(hurst=0.5, adx=30.0, atr_percentile=0.85,
+                                close=close, idx=1)
+        assert regime == MarketRegime.HIGH_VOL
+
+    def test_classifier_never_returns_unknown(self):
+        """Sweep ADX / ATR percentile / return — UNKNOWN must never appear."""
+        det = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        for adx in np.linspace(0, 50, 26):
+            for pct in np.linspace(0, 1, 11):
+                for ret in (-0.01, 0.0, +0.01):
+                    close = self._close_for_return(ret)
+                    regime = det._classify(
+                        hurst=0.5, adx=float(adx),
+                        atr_percentile=float(pct),
+                        close=close, idx=1,
+                    )
+                    assert regime != MarketRegime.UNKNOWN, (
+                        f"UNKNOWN leaked at adx={adx}, pct={pct}, ret={ret}"
+                    )
+
+    def test_detect_never_returns_unknown_on_realistic_data(self):
+        """End-to-end detect() across multiple synthetic regimes — no UNKNOWN."""
+        for gen in (_trending_klines, _ranging_klines, _high_vol_klines):
+            df = gen(500)
+            det = RegimeDetector(hurst_window=200)
+            state = det.detect(df)
+            assert state.regime != MarketRegime.UNKNOWN
+
+    def test_parametrization_thresholds(self):
+        """Different thresholds should change the classification boundary."""
+        # adx=19 → range under default 20.0, but trend_up under 18.0
+        close = TestNewClassificationRules._close_for_return(+0.005)
+        det_default = RegimeDetector(adx_trend_threshold=20.0, atr_vol_threshold=0.80)
+        det_15m = RegimeDetector(adx_trend_threshold=18.0, atr_vol_threshold=0.70)
+
+        r1 = det_default._classify(0.5, 19.0, 0.5, close, 1)
+        r2 = det_15m._classify(0.5, 19.0, 0.5, close, 1)
+        assert r1 == MarketRegime.RANGE
+        assert r2 == MarketRegime.TREND_UP
+
+        # ATR percentile=0.72 → range under default 0.80, but high_vol under 0.70
+        r3 = det_default._classify(0.5, 15.0, 0.72, close, 1)
+        r4 = det_15m._classify(0.5, 15.0, 0.72, close, 1)
+        assert r3 == MarketRegime.RANGE
+        assert r4 == MarketRegime.HIGH_VOL
+
+    def test_timeframe_attribute(self):
+        det = RegimeDetector(timeframe="15m")
+        assert det.timeframe == "15m"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 8. Integration: real BTCUSDT data
 # ──────────────────────────────────────────────────────────────────────────────
 

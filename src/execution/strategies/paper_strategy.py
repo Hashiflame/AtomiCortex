@@ -83,8 +83,8 @@ class PaperTradingStrategy(MLTradingStrategy):
 
         regime_label = regime_state.regime
 
-        # Model selection
-        model, feature_names = self._select_model(regime_label)
+        # Model selection (with per-regime confidence threshold)
+        model, feature_names, conf_threshold = self._select_model(regime_label)
         if model is None:
             return
 
@@ -102,8 +102,8 @@ class PaperTradingStrategy(MLTradingStrategy):
             self.log.warning(f"Prediction error: {exc}")
             return
 
-        # Confidence threshold
-        if confidence < self._config.confidence_threshold:
+        # Confidence threshold (per-regime)
+        if confidence < conf_threshold:
             return
 
         self._signals_total += 1

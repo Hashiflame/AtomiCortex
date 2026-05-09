@@ -19,6 +19,47 @@
 
 ---
 
+## Фаза 3 — Regime Detection
+
+---
+
+### [RD-004] regime=unknown блокирует все сигналы
+**Дата:** 2026-05
+**Фаза:** 3.3 — Regime Detector
+
+**Ошибка:**
+```
+on_bar step 3: regime=unknown
+on_bar: no model for regime 'unknown' — skipping
+```
+повторяется на каждом 4H баре → сигналы не генерируются.
+
+**Причина:** ADX BTCUSDT в боковике (~$80k) колеблется в зоне 20–25.
+Старая логика `_classify` имела двойной порог (`adx_range_threshold=20`,
+`adx_trend_threshold=25`) и возвращала `MarketRegime.UNKNOWN` для всего,
+что попадало между ними. Для UNKNOWN не была определена ни модель, ни
+размер позиции (multiplier=0), поэтому стратегия всегда выходила из
+`on_bar` без сделок.
+
+**Решение:**
+* `src/features/regime_detector.py::_classify` — единый порог
+  `adx_trend_threshold` (по умолчанию 20.0). Логика теперь:
+  1. `atr_percentile > atr_vol_threshold` → HIGH_VOL
+  2. `adx > adx_trend_threshold` + `last_return ≥ 0` → TREND_UP
+  3. `adx > adx_trend_threshold` + `last_return < 0` → TREND_DOWN
+  4. иначе → RANGE  (UNKNOWN больше не возвращается)
+* `RegimeDetector` теперь принимает `timeframe` и `atr_vol_threshold`,
+  что упрощает MTF-настройку (1H: 20/0.75, 15m: 18/0.70).
+* `MLTradingStrategy._select_model` теперь возвращает
+  `(model, features, threshold)`. Для RANGE используется trend-модель
+  с более строгим порогом 0.70 (вместо 0.65), а размер позиции × 0.7
+  через существующий `position_size_multiplier`.
+* `_unknown()` (fallback при пустом DataFrame) тоже возвращает RANGE.
+
+**Файл:** src/features/regime_detector.py, src/execution/strategies/ml_strategy.py
+
+---
+
 ## Фаза 1 — Data Pipeline
 
 ---

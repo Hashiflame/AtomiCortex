@@ -242,17 +242,27 @@ class RegimeDetector:
         adx_period: int = 14,
         atr_period: int = 14,
         atr_lookback: int = 540,       # 90 days × 6 bars
-        adx_trend_threshold: float = 25.0,
-        adx_range_threshold: float = 20.0,
-        high_vol_percentile: float = 0.8,
+        adx_trend_threshold: float = 20.0,
+        atr_vol_threshold: float = 0.80,
+        timeframe: str = "4h",
+        # Deprecated aliases (kept for backward compatibility):
+        adx_range_threshold: float | None = None,
+        high_vol_percentile: float | None = None,
     ) -> None:
         self.hurst_window = hurst_window
         self.adx_period = adx_period
         self.atr_period = atr_period
         self.atr_lookback = atr_lookback
         self.adx_trend_threshold = adx_trend_threshold
-        self.adx_range_threshold = adx_range_threshold
-        self.high_vol_percentile = high_vol_percentile
+        self.atr_vol_threshold = (
+            high_vol_percentile if high_vol_percentile is not None else atr_vol_threshold
+        )
+        self.timeframe = timeframe
+        # Legacy attrs (some external code may still reference them)
+        self.adx_range_threshold = (
+            adx_range_threshold if adx_range_threshold is not None else adx_trend_threshold
+        )
+        self.high_vol_percentile = self.atr_vol_threshold
 
     # ------------------------------------------------------------------
     # Single-bar detection
@@ -377,8 +387,8 @@ class RegimeDetector:
         atr_arr = atr_ind.average_true_range().values
         atr_arr = np.where(np.isnan(atr_arr), 0.0, atr_arr)
 
-        # Result arrays
-        regimes = ["unknown"] * n
+        # Result arrays — default to "range" (never "unknown" in normal flow)
+        regimes = ["range"] * n
         hursts = np.full(n, 0.5)
         adxs = np.zeros(n)
         atr_pcts = np.zeros(n)
@@ -494,35 +504,38 @@ class RegimeDetector:
         close: np.ndarray,
         idx: int,
     ) -> MarketRegime:
-        """ADX-first classification rules (deterministic, no ML).
+        """Deterministic regime classification — never returns UNKNOWN.
 
-        1. atr_percentile > 0.8   → HIGH_VOL
-        2. adx > 25               → TREND_UP / TREND_DOWN
-        3. adx < 20               → RANGE
-        4. 20 ≤ adx ≤ 25          → UNKNOWN (transitional)
+        Priority (top → bottom):
+        1. atr_percentile > atr_vol_threshold      → HIGH_VOL
+        2. adx > adx_trend_threshold AND last_return > 0  → TREND_UP
+        3. adx > adx_trend_threshold AND last_return < 0  → TREND_DOWN
+        4. otherwise                                → RANGE  (range/transitional)
 
-        Hurst is deliberately excluded from the rules — it serves
-        as a numeric feature for downstream ML models.
+        Hurst is deliberately excluded — it remains a numeric ML feature.
         """
-        if atr_percentile > self.high_vol_percentile:
+        if atr_percentile > self.atr_vol_threshold:
             return MarketRegime.HIGH_VOL
 
         if adx > self.adx_trend_threshold:
-            # Direction from recent return
-            if idx >= 1 and close[idx] >= close[idx - 1]:
+            last_return = 0.0
+            if idx >= 1 and close[idx - 1] > 0:
+                last_return = (close[idx] - close[idx - 1]) / close[idx - 1]
+            if last_return >= 0:
                 return MarketRegime.TREND_UP
             return MarketRegime.TREND_DOWN
 
-        if adx < self.adx_range_threshold:
-            return MarketRegime.RANGE
-
-        return MarketRegime.UNKNOWN
+        return MarketRegime.RANGE
 
     @staticmethod
     def _unknown() -> RegimeState:
-        """Return a neutral UNKNOWN state."""
+        """Neutral fallback state for empty/invalid input.
+
+        Returns RANGE (not UNKNOWN) so downstream code never has to
+        special-case an unknown regime — RANGE is the safest default.
+        """
         return RegimeState(
-            regime=MarketRegime.UNKNOWN,
+            regime=MarketRegime.RANGE,
             hurst=0.5,
             adx=0.0,
             atr_pct=0.0,
@@ -555,9 +568,9 @@ class RegimeDetector1H(RegimeDetector):
             adx_period=10,
             atr_period=10,
             atr_lookback=168,        # 1 week * 24 bars/day
-            adx_trend_threshold=25.0,
-            adx_range_threshold=20.0,
-            high_vol_percentile=0.8,
+            adx_trend_threshold=20.0,
+            atr_vol_threshold=0.75,
+            timeframe="1h",
         )
         defaults.update(kwargs)
         super().__init__(**defaults)
@@ -580,9 +593,9 @@ class RegimeDetector15M(RegimeDetector):
             adx_period=7,
             atr_period=7,
             atr_lookback=672,        # 1 week * 96 bars/day
-            adx_trend_threshold=25.0,
-            adx_range_threshold=20.0,
-            high_vol_percentile=0.8,
+            adx_trend_threshold=18.0,
+            atr_vol_threshold=0.70,
+            timeframe="15m",
         )
         defaults.update(kwargs)
         super().__init__(**defaults)
