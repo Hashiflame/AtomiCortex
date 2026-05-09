@@ -530,3 +530,60 @@ class RegimeDetector:
             trend_strength=0.0,
             confidence=0.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Extended Regime Detectors for MTF (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class RegimeDetector1H(RegimeDetector):
+    """Extended regime detection for 1H timeframe.
+
+    Inherits from RegimeDetector but uses faster parameters suited
+    to the higher bar frequency of 1H data.
+
+    Key differences from 4H RegimeDetector:
+    - Faster ADX period (10 vs 14)
+    - Shorter Hurst window (100 vs 300)
+    - Shorter ATR lookback (168 = 1 week of 1H bars)
+    """
+
+    def __init__(self, **kwargs) -> None:
+        defaults = dict(
+            hurst_window=100,
+            adx_period=10,
+            atr_period=10,
+            atr_lookback=168,        # 1 week * 24 bars/day
+            adx_trend_threshold=25.0,
+            adx_range_threshold=20.0,
+            high_vol_percentile=0.8,
+        )
+        defaults.update(kwargs)
+        super().__init__(**defaults)
+
+
+class RegimeDetector15M(RegimeDetector):
+    """Micro-regime detection for 15m timeframe.
+
+    Uses very fast parameters for the highest bar frequency.
+
+    Key differences:
+    - Very fast ADX/ATR period (7)
+    - Shortest Hurst window (50)
+    - ATR lookback of 672 (1 week of 15m bars)
+    """
+
+    def __init__(self, **kwargs) -> None:
+        defaults = dict(
+            hurst_window=50,
+            adx_period=7,
+            atr_period=7,
+            atr_lookback=672,        # 1 week * 96 bars/day
+            adx_trend_threshold=25.0,
+            adx_range_threshold=20.0,
+            high_vol_percentile=0.8,
+        )
+        defaults.update(kwargs)
+        super().__init__(**defaults)
+

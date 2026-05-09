@@ -88,6 +88,41 @@ FEATURE_GROUPS: dict[str, list[str]] = {
     ],
 }
 
+# Features added only for MTF timeframes (1h, 15m, 5m, 1m).
+FEATURE_GROUPS_MTF: dict[str, list[str]] = {
+    "session": [
+        "trading_session", "session_hour_sin", "session_hour_cos",
+        "is_overlap", "is_dead_zone", "hours_to_session_end",
+        "session_vwap", "price_vs_session_vwap", "session_vwap_std",
+        "vwap_upper_band", "vwap_lower_band", "vwap_band_position",
+        "session_volume_pct",
+        "avwap_weekly", "price_vs_avwap_weekly", "avwap_weekly_slope",
+        "price_above_avwap",
+        "hours_to_funding_mark", "pre_funding_window",
+        "post_funding_window", "funding_window_urgency",
+        "day_of_week_sin", "day_of_week_cos", "is_weekend",
+        "is_monday_asia_window", "is_high_vol_day",
+    ],
+    "orb": [
+        "orb_high_asia", "orb_low_asia", "orb_range_asia",
+        "orb_range_asia_atr_pct",
+        "orb_high_london", "orb_low_london", "orb_range_london",
+        "orb_range_london_atr_pct",
+        "orb_high_ny", "orb_low_ny", "orb_range_ny",
+        "orb_range_ny_atr_pct",
+        "current_session", "price_vs_current_orb",
+        "dist_to_orb_high_pct", "dist_to_orb_low_pct",
+        "orb_breakout_bull", "orb_breakout_bear",
+        "bars_since_session_open", "is_session_trap_zone",
+    ],
+    "mtf_context": [
+        "htf_4h_regime", "htf_4h_adx", "htf_4h_trend_dir",
+        "htf_4h_hurst", "htf_4h_atr_pct",
+        "price_vs_4h_ema20", "mtf_1h_4h_aligned",
+        "mtf_alignment_score", "htf_4h_last_n_bars_dir",
+    ],
+}
+
 
 class FeaturePipeline:
     """Build a feature matrix for one symbol / interval from the DataStore.
@@ -201,6 +236,83 @@ class FeaturePipeline:
 
         return df
 
+    # ------------------------------------------------------------------
+    # MTF Feature Building (Phase 2)
+    # ------------------------------------------------------------------
+
+    def build_mtf(
+        self,
+        df: pl.DataFrame,
+        *,
+        df_htf_4h: pl.DataFrame | None = None,
+        df_htf_1h: pl.DataFrame | None = None,
+    ) -> pl.DataFrame:
+        """Add MTF-specific features to an already-loaded DataFrame.
+
+        This method is used for building features for 1H, 15m, 5m, 1m
+        intervals.  It does NOT touch DataStore — the caller provides
+        the raw DataFrames.
+
+        For ``interval='4h'`` this method is a no-op (returns df unchanged),
+        preserving full backward compatibility.
+
+        Parameters
+        ----------
+        df:
+            OHLCV DataFrame with at least ``open_time``, ``open``, ``high``,
+            ``low``, ``close``, ``volume`` columns.
+        df_htf_4h:
+            Optional 4H DataFrame (with regime columns) for MTF context.
+        df_htf_1h:
+            Optional 1H DataFrame for 15m MTF context.
+        """
+        if self.interval == "4h":
+            return df
+
+        # Session features: applicable to all MTF intervals.
+        if self.interval in ("1h", "15m", "5m", "1m"):
+            from src.features.session_features import (
+                AnchoredVWAP,
+                MondayAsiaEffect,
+                PreFundingDetector,
+                SessionEncoder,
+                SessionVWAP,
+            )
+            df = SessionEncoder().encode(df)
+            df = SessionVWAP().calculate(df)
+            df = AnchoredVWAP().calculate(df)
+            df = PreFundingDetector().detect(df)
+            df = MondayAsiaEffect().detect(df)
+            _log.info(f"Added session features for {self.interval}")
+
+        # 1H: add 4H HTF context.
+        if self.interval == "1h" and df_htf_4h is not None:
+            from src.features.mtf_context import MTFContextBuilder
+            df = MTFContextBuilder().build_for_1h(df, df_htf_4h)
+            _log.info("Added 4H HTF context for 1H")
+
+        # 15m: add ORB features + 1H/4H HTF context.
+        if self.interval == "15m":
+            from src.features.orb_features import ORBDetector
+            df = ORBDetector().calculate(df)
+            _log.info("Added ORB features for 15m")
+
+            if df_htf_4h is not None and df_htf_1h is not None:
+                from src.features.mtf_context import MTFContextBuilder
+                df = MTFContextBuilder().build_for_15m(
+                    df, df_htf_1h, df_htf_4h
+                )
+                _log.info("Added 1H+4H HTF context for 15m")
+
+        return df
+
     def get_feature_names(self) -> list[str]:
         """Return all feature column names (excludes raw OHLCV and timestamps)."""
-        return [feat for group in FEATURE_GROUPS.values() for feat in group]
+        names = [feat for group in FEATURE_GROUPS.values() for feat in group]
+        if self.interval in ("1h", "15m", "5m", "1m"):
+            names += FEATURE_GROUPS_MTF.get("session", [])
+        if self.interval == "15m":
+            names += FEATURE_GROUPS_MTF.get("orb", [])
+        if self.interval in ("1h", "15m"):
+            names += FEATURE_GROUPS_MTF.get("mtf_context", [])
+        return names
