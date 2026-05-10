@@ -311,6 +311,75 @@ class TestGetSignalHighConfidence:
         assert found_directional or True  # test structure exists
 
 
+class TestGetSignalBinaryInvariants:
+    """ML-017 regression: binary get_signal must satisfy these invariants
+    on every input — independent of training data or model state.
+    """
+
+    def test_direction_never_zero_when_confidence_meets_threshold(self):
+        """If confidence >= threshold, direction MUST be +1 or -1, never 0."""
+        # Synthetic stub model whose predict() returns a controllable P(UP).
+        class StubBooster:
+            def __init__(self, p): self._p = p
+            def predict(self, X): return np.array([self._p])
+
+        # P(UP) values that produce confidence in [0.50, 1.00]
+        cases = [
+            (0.50, 0.50),  # boundary: confidence == 0.5
+            (0.51, 0.50),  # confidence 0.51 vs threshold 0.50
+            (0.55, 0.55),  # boundary equality
+            (0.575, 0.55), # the exact prod symptom: conf > thr
+            (0.60, 0.55),
+            (0.99, 0.55),
+            (0.45, 0.55),  # P(DOWN) side
+            (0.425, 0.55), # symmetric symptom: conf > thr on DOWN side
+            (0.40, 0.55),
+            (0.01, 0.55),
+        ]
+        for p, thr in cases:
+            d, c = LGBMTrainer.get_signal(StubBooster(p), np.zeros(10), thr)
+            if c >= thr:
+                assert d in {-1, 1}, (
+                    f"p={p} thr={thr} → conf={c:.3f} >= thr but dir={d} (must be ±1)"
+                )
+            else:
+                assert d == 0, (
+                    f"p={p} thr={thr} → conf={c:.3f} < thr but dir={d} (must be 0)"
+                )
+
+    def test_direction_sign_matches_p_up(self):
+        """direction = +1 ↔ p_up > 0.5;  direction = -1 ↔ p_up <= 0.5."""
+        class StubBooster:
+            def __init__(self, p): self._p = p
+            def predict(self, X): return np.array([self._p])
+
+        # threshold=0.0 forces a directional signal regardless of confidence
+        for p in [0.01, 0.30, 0.49, 0.50, 0.51, 0.70, 0.99]:
+            d, c = LGBMTrainer.get_signal(StubBooster(p), np.zeros(10), 0.0)
+            expected = 1 if p > 0.5 else -1
+            assert d == expected, f"p={p}: expected dir={expected}, got {d}"
+            # confidence is always max(p, 1-p)
+            assert c == pytest.approx(max(p, 1.0 - p), abs=1e-9)
+
+    def test_callable_without_self_argument(self):
+        """ML-017: get_signal is @staticmethod — caller must NOT pass self.
+
+        Old caller had ``LGBMTrainer.get_signal(None, model, ...)``.  After
+        the staticmethod conversion, that extra ``None`` would raise
+        TypeError (too many positional args).
+        """
+        class StubBooster:
+            def predict(self, X): return np.array([0.7])
+
+        # Correct call: no leading None
+        d, c = LGBMTrainer.get_signal(StubBooster(), np.zeros(5), 0.55)
+        assert d == 1 and c == pytest.approx(0.7)
+
+        # Old style with None must now fail loudly
+        with pytest.raises(TypeError):
+            LGBMTrainer.get_signal(None, StubBooster(), np.zeros(5), 0.55)
+
+
 class TestEvaluationResultThresholds:
     """Test EvaluationResult.passes_minimum_thresholds."""
 

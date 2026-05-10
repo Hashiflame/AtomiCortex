@@ -385,8 +385,8 @@ class LGBMTrainer:
     # Signal generation
     # ------------------------------------------------------------------
 
+    @staticmethod
     def get_signal(
-        self,
         model: lgb.Booster,
         features: np.ndarray,
         confidence_threshold: float = 0.55,
@@ -397,6 +397,9 @@ class LGBMTrainer:
         Direction is +1 if P(UP) > 0.5, otherwise -1.  Confidence is
         ``max(P(UP), 1-P(UP))``.  No signal fires if confidence is below
         *confidence_threshold* (random baseline = 0.50, default 0.55).
+
+        Static (no self) — the body never needed an instance.  Previously
+        callers passed ``None`` as ``self``; new callers should drop it.
 
         Returns
         -------
@@ -411,6 +414,13 @@ class LGBMTrainer:
         p_up = float(model.predict(features)[0])
         direction = 1 if p_up > 0.5 else -1
         confidence = p_up if direction == 1 else 1.0 - p_up
+
+        # ML-017 diagnostic: log everything so a "dir=0 conf=0.57 thr=0.55"
+        # discrepancy in prod can be traced to whichever value is wrong.
+        _log.debug(
+            f"get_signal | p_up={p_up:.4f} | direction={direction} | "
+            f"confidence={confidence:.4f} | threshold={confidence_threshold}"
+        )
 
         if confidence < confidence_threshold:
             return 0, confidence

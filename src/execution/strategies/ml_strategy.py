@@ -304,13 +304,13 @@ class MLTradingStrategy(Strategy):
             self.log.info("on_bar step 5: ML prediction")
             from src.models.lgbm_trainer import LGBMTrainer
             direction, confidence = LGBMTrainer.get_signal(
-                None,  # static-ish: only uses model.predict
                 model,
                 feature_vector,
                 confidence_threshold=conf_threshold,
             )
             self.log.info(
-                f"on_bar step 6: dir={direction} confidence={confidence:.3f}"
+                f"on_bar step 6: dir={direction} confidence={confidence:.3f} "
+                f"threshold={conf_threshold} regime={regime_label}"
             )
 
             if direction == 0:
