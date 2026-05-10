@@ -191,12 +191,12 @@ class TestGetFeatureColumns:
 
 
 class TestLabelEncoding:
-    """Test label encoding is correct (-1→0, 0→1, 1→2)."""
+    """Test label encoding is correct (binary, ML-017): -1→0, +1→1."""
 
     def test_label_mapping(self):
         assert LABEL_TO_CLASS[-1] == 0
-        assert LABEL_TO_CLASS[0] == 1
-        assert LABEL_TO_CLASS[1] == 2
+        assert LABEL_TO_CLASS[1] == 1
+        assert 0 not in LABEL_TO_CLASS  # FLAT class removed
 
     def test_inverse_mapping(self):
         for orig, cls in LABEL_TO_CLASS.items():
@@ -298,7 +298,7 @@ class TestGetSignalHighConfidence:
         model = trainer.train(train_df)
 
         X, _, _ = trainer._prepare_xy(train_df)
-        # With threshold=0.0, any non-FLAT prediction is a signal
+        # Binary (ML-017): with threshold=0.0, every prediction is directional
         # Test multiple samples to find a directional one
         found_directional = False
         for i in range(min(20, len(X))):
@@ -445,8 +445,9 @@ class TestModelLoadsAndPredicts:
 
         X_test, _, _ = trainer._prepare_xy(test_df)
         preds = loaded_model.predict(X_test)
-        assert preds.shape[0] == len(test_df)
-        assert preds.shape[1] == 3  # multiclass: 3 classes
+        # Binary (ML-017): predict returns 1-D vector of P(UP)
+        assert preds.shape == (len(test_df),)
+        assert float(preds.min()) >= 0.0 and float(preds.max()) <= 1.0
 
 
 class TestRegimeFilter:

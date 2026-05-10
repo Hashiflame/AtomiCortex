@@ -2919,4 +2919,83 @@ Broadcaster не уведомляет о critical alerts если OWNER_ID не 
 
 ---
 
-*Последнее обновление: 2026-05 | Фаза: 7 Code Review (TG-001–TG-018)*
+## Фаза 3 — ML Model Imbalance
+
+---
+
+### [ML-017] Multiclass FLAT-доминирование → бинарная классификация
+**Дата:** 2026-05
+**Фаза:** 3.4 — LightGBM Trainer
+
+**Симптом:**
+```
+on_bar step 6: dir=0 confidence=0.35-0.44
+on_bar: no signal | regime=trend_up | confidence=0.3xx
+```
+повторяется на каждом 4H баре — направленные сигналы не генерируются,
+confidence всегда ниже порога.
+
+**Причина:** target в `dataset_builder.create_target` создавался как
+3-классовый (UP / FLAT / DOWN) с ATR-порогом
+`|return| < ATR×0.5 → FLAT`. По реальным данным FLAT занимал 62-66%
+баров (BTC 65%, ETH 66%, SOL 62% — 4180 баров каждый). LightGBM с
+`objective=multiclass` коллапсировал к предсказанию FLAT почти всегда;
+вероятности направленных классов редко превышали 0.35.
+`compute_sample_weight("balanced")` не помог — ATR-определённый FLAT
+содержит реальные направленные движения, шум перекрывает сигнал.
+
+**Решение:** убрали FLAT-класс полностью, перешли на бинарную
+классификацию.
+
+* `dataset_builder.create_target`: `target = +1 if return > 0 else -1`
+  (ATR-порог игнорируется).
+* `lgbm_trainer`:
+  * `LABEL_TO_CLASS = {-1: 0, 1: 1}` (вместо `{-1:0, 0:1, 1:2}`).
+  * `lgbm_params`: `objective="binary"`, `metric="binary_logloss"`,
+    убран `num_class=3`.
+  * `evaluate` / `_compute_per_symbol`: `model.predict()` теперь
+    возвращает 1-D вектор `P(UP)` вместо `(n, 3)` softmax.
+  * `get_signal`: `direction = +1 if P(UP) > 0.5 else -1`,
+    `confidence = max(P(UP), 1 - P(UP))`.
+  * Default `confidence_threshold = 0.55` (random baseline = 0.50;
+    раньше было 0.35 для 3-классов где baseline = 0.33).
+* `ml_strategy.MLStrategyConfig.confidence_threshold = 0.55`
+  (раньше 0.65); `range`-режим = 0.60 (раньше 0.70).
+* `risk_engine.RiskConfig.confidence_threshold = 0.55`
+  (раньше 0.65).
+
+**Метрики после переобучения (test=20%, 858 баров):**
+
+| Regime    | Win Rate | PF   | Signal% | Passes |
+|-----------|----------|------|---------|--------|
+| trend     | 56.25%   | 1.34 | 50.3%   | ✅     |
+| range     | 50.00%   | 1.64 | 4.4%    | ❌     |
+| high_vol  | 0.00%    | 0.00 | 0.0%    | ❌     |
+
+* trend (prod): WR > 52%, PF > 1.3, sig > 10% — passes go-live criteria.
+* range: BTC WR=57%/PF=3.28, SOL WR=56%/PF=1.81 (per-symbol OK),
+  aggregate signal-rate низкий — модель консервативна.
+* high_vol: max(P(UP), 1-P(UP)) на test < 0.55 → нет сигналов
+  (no-trade — корректный исход).
+
+**Проверка совместимости с существующими .pkl:**
+```python
+import pickle
+with open('data/features/models/trend_model.pkl', 'rb') as f:
+    bundle = pickle.load(f)
+print(bundle['booster'].dump_model().get('objective'))
+# → "binary sigmoid:1"   (старая multiclass: "multiclass softmax:3")
+```
+
+**Файлы:**
+* `src/models/dataset_builder.py:160` (`create_target`)
+* `src/models/lgbm_trainer.py:43, 65-77, 254-256, 327-352, 388-417, 600-612`
+* `src/execution/strategies/ml_strategy.py:64, 844-860`
+* `src/risk/risk_engine.py:46`
+
+**Backup старых multiclass моделей:**
+`data/features/models/{trend,range,high_vol}_model_backup.pkl`
+
+---
+
+*Последнее обновление: 2026-05 | Фаза: 7 Code Review (TG-001–TG-018) + ML-017*

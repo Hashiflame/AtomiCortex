@@ -43,7 +43,7 @@ class RiskConfig:
     max_drawdown_kill: float = -0.15    # -15% → full stop
 
     # Filters
-    confidence_threshold: float = 0.65  # ML confidence minimum
+    confidence_threshold: float = 0.55  # ML confidence minimum (binary, ML-017)
     min_expected_return_bps: float = 15 # at least 15 bps
     max_funding_rate: float = 0.001     # 0.1% extreme
     vol_spike_multiplier: float = 2.0   # ATR > 2× average

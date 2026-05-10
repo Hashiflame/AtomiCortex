@@ -102,7 +102,7 @@ class TestMLStrategyConfig:
         assert cfg.instrument_id == "BTCUSDT-PERP.BINANCE"
         assert cfg.warmup_bars == 300
         assert cfg.dry_run is False
-        assert cfg.confidence_threshold == 0.65
+        assert cfg.confidence_threshold == 0.55  # binary, ML-017
 
     def test_config_custom_values(self) -> None:
         """Custom values should be applied."""
@@ -229,14 +229,14 @@ class TestModelSelection:
     def test_range_uses_trend_model_with_higher_threshold(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
-        """range regime now uses the trend model with a stricter (>=0.70) threshold."""
+        """range regime uses the trend model with a stricter (>=0.60) threshold (binary, ML-017)."""
         strategy = MLTradingStrategy(config=default_strategy_config)
         strategy._trend_model = MagicMock(name="trend")
         strategy._trend_features = ["f1"]
         model, feats, threshold = strategy._select_model("range")
         assert model is strategy._trend_model
         assert feats == ["f1"]
-        assert threshold >= 0.70
+        assert threshold >= 0.60
 
     def test_unknown_falls_back_to_trend_model(
         self, default_strategy_config: MLStrategyConfig,
@@ -247,7 +247,7 @@ class TestModelSelection:
         strategy._trend_features = ["f1"]
         model, _, threshold = strategy._select_model("unknown")
         assert model is strategy._trend_model
-        assert threshold >= 0.70
+        assert threshold >= 0.60  # binary, ML-017
 
 
 # ═══════════════════════════════════════════════════════════════════════════

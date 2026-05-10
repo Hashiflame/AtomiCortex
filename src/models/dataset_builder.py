@@ -161,37 +161,28 @@ class DatasetBuilder:
         self,
         df: pl.DataFrame,
         forward_bars: int = 1,
-        threshold_atr_multiplier: float = 0.5,
+        threshold_atr_multiplier: float = 0.5,  # kept for API compat; unused
     ) -> pl.DataFrame:
-        """Create classification target: UP(1) / FLAT(0) / DOWN(-1).
+        """Create binary classification target: UP(+1) / DOWN(-1).
 
-        Logic
-        -----
+        ML-017: dropped the FLAT(0) class to fix severe class imbalance
+        (FLAT was ~62-65% of bars, causing the multiclass model to predict
+        FLAT almost always with confidence < 0.35 on directional signals).
+
         * ``future_return = (close[t+forward_bars] - close[t]) / close[t]``
-        * ``atr_threshold = atr_pct × threshold_atr_multiplier``
-        * ``target = 1``  if future_return > atr_threshold
-        * ``target = -1`` if future_return < -atr_threshold
-        * ``target = 0``  otherwise (FLAT)
-
-        Rows where target cannot be computed (last *forward_bars*) are dropped.
+        * ``target = +1`` if future_return > 0
+        * ``target = -1`` otherwise (return <= 0)
         """
-        if "close" not in df.columns or "atr_pct" not in df.columns:
-            raise ValueError("DataFrame must contain 'close' and 'atr_pct' columns")
+        if "close" not in df.columns:
+            raise ValueError("DataFrame must contain a 'close' column")
 
-        # Future return
         future_close = df["close"].shift(-forward_bars)
         future_return = (future_close - df["close"]) / df["close"]
 
-        # ATR-based threshold
-        atr_threshold = df["atr_pct"] * threshold_atr_multiplier
-
-        # Target: 1=UP, -1=DOWN, 0=FLAT
         target = (
-            pl.when(future_return > atr_threshold)
+            pl.when(future_return > 0)
             .then(pl.lit(1))
-            .when(future_return < -atr_threshold)
-            .then(pl.lit(-1))
-            .otherwise(pl.lit(0))
+            .otherwise(pl.lit(-1))
         )
 
         df = df.with_columns([
@@ -199,13 +190,12 @@ class DatasetBuilder:
             target.alias("target"),
         ])
 
-        # Drop rows where target is undefined (last forward_bars rows)
+        # Drop rows where future_return is undefined (last forward_bars rows)
         df = df.head(len(df) - forward_bars)
 
         _log.info(
-            f"Target created: {len(df)} rows, "
+            f"Target created (binary): {len(df)} rows, "
             f"UP={df['target'].eq(1).sum()}, "
-            f"FLAT={df['target'].eq(0).sum()}, "
             f"DOWN={df['target'].eq(-1).sum()}"
         )
         return df

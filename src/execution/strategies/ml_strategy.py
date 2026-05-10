@@ -61,7 +61,7 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: str = "BTCUSDT-PERP.BINANCE"
     bar_type: str = "BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL"
     interval: str = "4h"
-    confidence_threshold: float = 0.65
+    confidence_threshold: float = 0.55
     models_dir: str = "./data/features/models"
     features_dir: str = "./data/features/ml_features"
     risk_per_trade: float = 0.01
@@ -841,23 +841,24 @@ class MLTradingStrategy(Strategy):
         (model, feature_names, confidence_threshold)
 
         Mapping:
-        * trend_up / trend_down → trend model, threshold = config default (0.65)
-        * range                 → trend model, threshold = 0.70 (stricter)
+        Mapping (binary model — random baseline 0.50, ML-017):
+        * trend_up / trend_down → trend model, threshold = config default (0.55)
+        * range                 → trend model, threshold = 0.60 (stricter)
         * high_vol              → high-vol model, threshold = config default
-        * anything else (should never happen) → trend model, threshold = 0.70
+        * anything else (should never happen) → trend model, threshold = 0.60
         """
         base_threshold = self._config.confidence_threshold
         if regime_label in ("trend_up", "trend_down"):
             return self._trend_model, self._trend_features, base_threshold
         if regime_label == "range":
-            return self._trend_model, self._trend_features, max(base_threshold, 0.70)
+            return self._trend_model, self._trend_features, max(base_threshold, 0.60)
         if regime_label == "high_vol":
             return self._highvol_model, self._highvol_features, base_threshold
         # Defensive fallback — RegimeDetector no longer produces "unknown"
         self.log.warning(
             f"Unexpected regime '{regime_label}' — falling back to trend model"
         )
-        return self._trend_model, self._trend_features, max(base_threshold, 0.70)
+        return self._trend_model, self._trend_features, max(base_threshold, 0.60)
 
     # ------------------------------------------------------------------
     # Historical bar preloading

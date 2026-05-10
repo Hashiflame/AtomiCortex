@@ -1,7 +1,11 @@
 """
 src/models/lgbm_trainer.py
 
-LightGBM multiclass trainer for regime-specific directional prediction.
+LightGBM binary trainer for regime-specific directional prediction.
+
+ML-017: switched from 3-class (UP/FLAT/DOWN) to binary (UP/DOWN) to fix
+class imbalance — FLAT dominated ~62-65% of bars and the multiclass model
+collapsed to predicting FLAT almost always.
 
 Classes
 -------
@@ -38,9 +42,9 @@ SYMBOL_ENCODING: dict[str, int] = {
     "SOLUSDT": 2,
 }
 
-# Label mapping: original target → LightGBM class
-# -1 (DOWN) → 0,  0 (FLAT) → 1,  1 (UP) → 2
-LABEL_TO_CLASS: dict[int, int] = {-1: 0, 0: 1, 1: 2}
+# Label mapping: original target → LightGBM class (binary, ML-017)
+# -1 (DOWN) → 0,  +1 (UP) → 1
+LABEL_TO_CLASS: dict[int, int] = {-1: 0, 1: 1}
 CLASS_TO_LABEL: dict[int, int] = {v: k for k, v in LABEL_TO_CLASS.items()}
 
 
@@ -55,16 +59,15 @@ class ModelConfig:
     regime: str  # "trend", "range", "high_vol", "all"
     symbols: list[str]
     forward_bars: int = 1
-    threshold_atr_multiplier: float = 0.5
+    threshold_atr_multiplier: float = 0.5  # unused (binary target ignores it)
     test_size_pct: float = 0.2
-    confidence_threshold: float = 0.35
+    confidence_threshold: float = 0.55
     random_state: int = 42
 
     # LightGBM hyperparameters (defaults; Optuna can refine later)
     lgbm_params: dict[str, Any] = field(default_factory=lambda: {
-        "objective": "multiclass",
-        "num_class": 3,
-        "metric": "multi_logloss",
+        "objective": "binary",
+        "metric": "binary_logloss",
         "num_leaves": 31,
         "learning_rate": 0.05,
         "feature_fraction": 0.8,
@@ -252,8 +255,7 @@ class LGBMTrainer:
         _log.info(
             f"Class balance — train: "
             f"DOWN(0)={int((y_train_fit==0).sum())}, "
-            f"FLAT(1)={int((y_train_fit==1).sum())}, "
-            f"UP(2)={int((y_train_fit==2).sum())} "
+            f"UP(1)={int((y_train_fit==1).sum())} "
             f"→ weight range [{train_weights.min():.2f}, {train_weights.max():.2f}]"
         )
 
@@ -324,9 +326,9 @@ class LGBMTrainer:
         X_test, y_test_raw, _ = self._prepare_xy(test_df)
         y_true_labels = np.array([CLASS_TO_LABEL[int(c)] for c in y_test_raw])
 
-        # Predict probabilities: shape (n_samples, 3)
-        proba = model.predict(X_test)
-        y_pred_class = np.argmax(proba, axis=1)
+        # Binary: predict() returns 1D vector of P(class=1=UP)
+        proba_up = model.predict(X_test)
+        y_pred_class = (proba_up >= 0.5).astype(int)
         y_pred_labels = np.array([CLASS_TO_LABEL[int(c)] for c in y_pred_class])
 
         # --- ML metrics ---
@@ -338,17 +340,12 @@ class LGBMTrainer:
         # --- Trading metrics ---
         future_returns = test_df["future_return"].to_numpy()
 
-        # Confidence: for a 3-class softmax, a signal fires when:
-        #   1. The argmax is a directional class (UP=2 or DOWN=0, not FLAT=1)
-        #   2. The probability of that class exceeds the threshold
-        # Threshold 0.35 is calibrated for 3-class (random baseline ≈ 0.33)
+        # Binary: confidence = max(p, 1-p); fires whenever above threshold.
+        # Threshold 0.55 is calibrated for binary (random baseline = 0.50, ML-017).
         confidence_threshold = self.config.confidence_threshold
 
-        # Per-sample: confidence = probability of the predicted class
-        max_proba = np.max(proba, axis=1)
-        # Signal = directional prediction AND confidence above threshold
-        is_directional = y_pred_class != 1  # not FLAT
-        signal_mask = is_directional & (max_proba >= confidence_threshold)
+        max_proba = np.maximum(proba_up, 1.0 - proba_up)
+        signal_mask = max_proba >= confidence_threshold
         signal_rate = float(signal_mask.sum()) / len(signal_mask) if len(signal_mask) > 0 else 0.0
 
         # Win rate & profit factor on signal bars
@@ -392,39 +389,33 @@ class LGBMTrainer:
         self,
         model: lgb.Booster,
         features: np.ndarray,
-        confidence_threshold: float = 0.35,
+        confidence_threshold: float = 0.55,
     ) -> tuple[int, float]:
         """Return ``(direction, confidence)`` for a single feature vector.
 
-        For a 3-class softmax, a signal fires when the argmax is a
-        directional class (UP or DOWN) and its probability exceeds
-        *confidence_threshold*.  Default 0.35 is calibrated for the
-        3-class distribution (random baseline ≈ 0.33).
+        Binary model (ML-017): ``model.predict`` returns scalar P(UP).
+        Direction is +1 if P(UP) > 0.5, otherwise -1.  Confidence is
+        ``max(P(UP), 1-P(UP))``.  No signal fires if confidence is below
+        *confidence_threshold* (random baseline = 0.50, default 0.55).
 
         Returns
         -------
         direction:
             1 = UP, -1 = DOWN, 0 = NO_SIGNAL
         confidence:
-            probability of the predicted directional class
+            probability of the predicted direction
         """
         if features.ndim == 1:
             features = features.reshape(1, -1)
 
-        proba = model.predict(features)[0]  # [P(DOWN), P(FLAT), P(UP)]
+        p_up = float(model.predict(features)[0])
+        direction = 1 if p_up > 0.5 else -1
+        confidence = p_up if direction == 1 else 1.0 - p_up
 
-        pred_class = int(np.argmax(proba))
-        pred_prob = float(proba[pred_class])
+        if confidence < confidence_threshold:
+            return 0, confidence
 
-        # Only fire signal for directional classes (not FLAT=1)
-        if pred_class == 1:  # FLAT
-            return 0, pred_prob
-
-        if pred_prob < confidence_threshold:
-            return 0, pred_prob
-
-        direction = 1 if pred_class == 2 else -1
-        return direction, pred_prob
+        return direction, confidence
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -607,18 +598,17 @@ class LGBMTrainer:
                 continue
 
             X_sym = X_test[mask]
-            proba_sym = model.predict(X_sym)
+            proba_up_sym = model.predict(X_sym)  # binary: 1D P(UP)
 
             # Target & returns for this symbol
             y_true_sym = test_df.filter(pl.col("symbol") == symbol)["target"].to_numpy()
             returns_sym = test_df.filter(pl.col("symbol") == symbol)["future_return"].to_numpy()
 
-            # Predictions & confidence
-            y_pred_class = np.argmax(proba_sym, axis=1)
+            # Predictions & confidence (binary)
+            y_pred_class = (proba_up_sym >= 0.5).astype(int)
             y_pred_labels = np.array([CLASS_TO_LABEL[int(c)] for c in y_pred_class])
-            max_proba_sym = np.max(proba_sym, axis=1)
-            is_dir_sym = y_pred_class != 1  # not FLAT
-            signal_mask_sym = is_dir_sym & (max_proba_sym >= confidence_threshold)
+            max_proba_sym = np.maximum(proba_up_sym, 1.0 - proba_up_sym)
+            signal_mask_sym = max_proba_sym >= confidence_threshold
 
             signal_rate_sym = float(signal_mask_sym.sum()) / len(signal_mask_sym)
 
