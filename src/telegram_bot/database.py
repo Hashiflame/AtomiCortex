@@ -475,6 +475,29 @@ class Database:
         finally:
             conn.close()
 
+    def get_latest_metrics(self) -> dict[str, Any] | None:
+        """Return the latest bot_metrics row written by SignalBridge.
+
+        Returns ``None`` if the table is missing (Database is the
+        Telegram-side read API and never creates ``bot_metrics``;
+        SignalBridge in the trading process owns its schema) or the
+        table is empty (trading bot has not called ``update_metrics``
+        yet).  On success returns a dict with keys: equity, daily_pnl,
+        regime, open_positions, updated_at.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT equity, daily_pnl, regime, open_positions, updated_at "
+                "FROM bot_metrics WHERE id = 1",
+            ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.OperationalError:
+            # bot_metrics table not created yet — trading bot hasn't started
+            return None
+        finally:
+            conn.close()
+
     def get_signals_today_count(self) -> int:
         """Return number of signals created today (UTC)."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

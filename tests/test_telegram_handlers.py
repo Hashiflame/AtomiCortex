@@ -136,6 +136,104 @@ class TestPremiumHandlers:
         assert "TREND" in msg
 
     @pytest.mark.asyncio
+    async def test_regime_prefers_bot_metrics_over_signals(self, db):
+        """ML/TG: when bot_metrics has a fresher regime than signals_log,
+        /regime must surface the metrics row (it's the live regime)."""
+        from src.telegram_bot.handlers_premium import cmd_regime
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+        # Old signal says "range"; live metrics say "trend_up"
+        db.log_signal({"symbol": "BTC", "direction": "long", "regime": "range"})
+        import sqlite3
+        conn = sqlite3.connect(str(db._db_path))
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS bot_metrics ("
+            " id INTEGER PRIMARY KEY DEFAULT 1, equity REAL, daily_pnl REAL,"
+            " regime TEXT, open_positions INTEGER, updated_at TIMESTAMP);"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_metrics VALUES (1, ?, ?, ?, ?, ?)",
+            (10_000.0, 0.0, "trend_up", 0, "2026-05-10T13:00:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+        update = _make_update()
+        ctx = _make_context(db)
+        await cmd_regime(update, ctx)
+        msg = update.effective_chat.send_message.call_args[0][0]
+        assert "TREND_UP" in msg
+        assert "Обновлено" in msg
+
+    @pytest.mark.asyncio
+    async def test_regime_no_metrics_table(self, db):
+        """Fresh DB without bot_metrics table → fall back gracefully to N/A
+        (and not raise OperationalError)."""
+        from src.telegram_bot.handlers_premium import cmd_regime
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+        update = _make_update()
+        ctx = _make_context(db)
+        await cmd_regime(update, ctx)
+        msg = update.effective_chat.send_message.call_args[0][0]
+        assert "N/A" in msg
+
+    @pytest.mark.asyncio
+    async def test_funding_live_success(self, db):
+        """/funding fetches Binance premiumIndex and renders top-3 by |rate|."""
+        from src.telegram_bot import handlers_premium
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+
+        fake_payload = [
+            {"symbol": "BTCUSDT", "lastFundingRate": "0.0001"},
+            {"symbol": "AAAUSDT", "lastFundingRate": "-0.009"},  # |rate|=0.9%
+            {"symbol": "BBBUSDT", "lastFundingRate": "0.0070"},  # 0.70%
+            {"symbol": "CCCUSDT", "lastFundingRate": "-0.005"},  # 0.50%
+            {"symbol": "DDDUSDT", "lastFundingRate": "0.0001"},
+        ]
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return fake_payload
+
+        class FakeClient:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url): return FakeResp()
+
+        with patch.object(handlers_premium.httpx, "AsyncClient", FakeClient):
+            update = _make_update()
+            ctx = _make_context(db)
+            await handlers_premium.cmd_funding(update, ctx)
+
+        msg = update.effective_chat.send_message.call_args[0][0]
+        # Top-3 by absolute rate: AAA (0.9%), BBB (0.7%), CCC (0.5%)
+        assert "AAAUSDT" in msg and "BBBUSDT" in msg and "CCCUSDT" in msg
+        assert "BTCUSDT" not in msg and "DDDUSDT" not in msg
+
+    @pytest.mark.asyncio
+    async def test_funding_network_error(self, db):
+        """Binance fetch failure must not crash the handler."""
+        from src.telegram_bot import handlers_premium
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+
+        class BoomClient:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url): raise RuntimeError("network down")
+
+        with patch.object(handlers_premium.httpx, "AsyncClient", BoomClient):
+            update = _make_update()
+            ctx = _make_context(db)
+            await handlers_premium.cmd_funding(update, ctx)
+
+        msg = update.effective_chat.send_message.call_args[0][0]
+        assert "Не удалось" in msg
+
+    @pytest.mark.asyncio
     async def test_risk_no_args(self, db):
         from src.telegram_bot.handlers_premium import cmd_risk
         db.create_user(12345, "owner", "Owner")
