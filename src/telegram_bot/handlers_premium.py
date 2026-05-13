@@ -40,7 +40,7 @@ def _format_age(updated_at: str) -> str:
 @require_role("premium")
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Last active signal with full details."""
-    db: Database = context.bot_data["db"]
+    db: Database = context.bot_data["shared_db"]
     signals = db.get_open_signals()
 
     if not signals:
@@ -80,7 +80,7 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @require_role("premium")
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Last 10 signals with results."""
-    db: Database = context.bot_data["db"]
+    db: Database = context.bot_data["shared_db"]
     signals = db.get_signals_history(limit=10)
 
     if not signals:
@@ -109,7 +109,7 @@ async def cmd_regime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     process upserts every ~24h via SignalBridge.update_metrics).  Falls
     back to the most recent signal's regime if metrics are absent (e.g.
     fresh DB before the trading bot has produced anything)."""
-    db: Database = context.bot_data["db"]
+    db: Database = context.bot_data["shared_db"]
 
     metrics = db.get_latest_metrics()
     regime = "N/A"

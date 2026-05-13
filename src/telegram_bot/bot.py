@@ -134,6 +134,11 @@ class TelegramBot:
         # Store DB and prices in bot_data
         self._app.bot_data["db"] = self._db
 
+        # Shared DB — written by the trading bot's SignalBridge (atomicortex.db).
+        # Telegram-bot reads signals/metrics from here; user/payment data stays in self._db.
+        shared_db_path = self._get_shared_db_path()
+        self._app.bot_data["shared_db"] = Database(shared_db_path)
+
         settings = get_settings()
         self._app.bot_data["prices"] = {
             "stars_30d": settings.premium_price_stars_30d,
