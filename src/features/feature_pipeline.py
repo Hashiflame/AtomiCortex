@@ -86,6 +86,31 @@ FEATURE_GROUPS: dict[str, list[str]] = {
         "trend_strength",
         "regime_confidence",
     ],
+    # Scalar features computed at signal-emit time from external sources
+    # (Binance allForceOrders, aggTrades, alternative.me F&G). Not part of
+    # the vectorized polars pipeline — populated by SignalBridge / live
+    # enrichers. Listed here so downstream consumers (model trainers,
+    # NaN audits) can opt in once data is being persisted.
+    "live_enrichment": [
+        "liq_cluster_long_pct",
+        "liq_cluster_short_pct",
+        "liq_imbalance",
+        "liq_cascade_risk",
+        "liq_volume_1h",
+        "vpin",
+        "basis_bps",
+        "basis_annualized",
+        "basis_zscore_30d",
+        "oi_velocity",
+        "oi_acceleration",
+        "oi_price_divergence",
+        "oi_exhaustion",
+        "oi_velocity_zscore",
+        "fear_greed_norm",
+        "fear_greed_extreme",
+        "ls_divergence",
+        "sentiment_score",
+    ],
 }
 
 # Features added only for MTF timeframes (1h, 15m, 5m, 1m).

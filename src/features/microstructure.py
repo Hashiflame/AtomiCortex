@@ -103,3 +103,113 @@ def add_price_features(df: pl.DataFrame) -> pl.DataFrame:
     ])
     _log.debug("add_price_features: done")
     return df
+
+
+# =============================================================================
+# VPIN — Volume-Synchronized Probability of Informed Trading
+# Reference: Easley, López de Prado, O'Hara (2012).
+# =============================================================================
+
+import math as _math
+from statistics import pstdev as _pstdev
+
+
+def _phi(z: float) -> float:
+    """Standard-normal CDF via math.erf."""
+    return 0.5 * (1.0 + _math.erf(z / _math.sqrt(2.0)))
+
+
+def compute_vpin(
+    trades: list[dict],
+    bucket_size: int = 50,
+    num_buckets: int = 50,
+) -> float:
+    """Volume-synchronized probability of informed trading.
+
+    Parameters
+    ----------
+    trades:
+        List of aggTrade-like dicts.  Each must carry a price (``p`` or
+        ``price``) and a quantity (``q`` or ``qty``); a side flag is not
+        required — bulk volume classification (BVC) splits buy/sell
+        volume from the return distribution alone.
+    bucket_size:
+        Volume units per bucket (in quantity, not notional).
+    num_buckets:
+        Rolling window of buckets to average over.
+
+    Returns
+    -------
+    float in [0, 1].  Returns ``0.5`` (neutral) when there is too little
+    data to form even one bucket — matches the project-wide fallback
+    convention for missing data.
+    """
+    if not trades or bucket_size <= 0 or num_buckets <= 0:
+        return 0.5
+
+    # Extract (price, qty) pairs robustly.
+    series: list[tuple[float, float]] = []
+    for t in trades:
+        try:
+            p = float(t.get("p", t.get("price", 0.0)))
+            q = float(t.get("q", t.get("qty", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if p > 0 and q > 0 and not _math.isnan(p) and not _math.isnan(q):
+            series.append((p, q))
+
+    if len(series) < 2:
+        return 0.5
+
+    # Per-trade log returns for BVC.
+    returns: list[float] = [0.0]
+    for i in range(1, len(series)):
+        prev_p = series[i - 1][0]
+        cur_p = series[i][0]
+        if prev_p > 0 and cur_p > 0:
+            returns.append(_math.log(cur_p / prev_p))
+        else:
+            returns.append(0.0)
+
+    sigma = _pstdev(returns) if len(returns) > 1 else 0.0
+    if sigma <= 0.0 or _math.isnan(sigma):
+        return 0.5
+
+    # Walk trades, filling fixed-size volume buckets.
+    buckets: list[float] = []  # |V_buy - V_sell| per bucket
+    cur_buy = 0.0
+    cur_sell = 0.0
+    cur_vol = 0.0
+
+    for (_p, q), r in zip(series, returns):
+        z = r / sigma
+        buy_frac = _phi(z)
+        v_buy = q * buy_frac
+        v_sell = q - v_buy
+
+        remaining = q
+        while remaining > 0 and len(buckets) < num_buckets:
+            capacity = bucket_size - cur_vol
+            take = min(capacity, remaining)
+            share = take / q if q > 0 else 0.0
+            cur_buy += v_buy * share
+            cur_sell += v_sell * share
+            cur_vol += take
+            remaining -= take
+
+            if cur_vol >= bucket_size - 1e-12:
+                buckets.append(abs(cur_buy - cur_sell))
+                cur_buy = 0.0
+                cur_sell = 0.0
+                cur_vol = 0.0
+
+        if len(buckets) >= num_buckets:
+            break
+
+    if not buckets:
+        return 0.5
+
+    vpin = sum(buckets) / (len(buckets) * bucket_size)
+    if _math.isnan(vpin) or _math.isinf(vpin):
+        return 0.5
+    return float(max(0.0, min(1.0, vpin)))
