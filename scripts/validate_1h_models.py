@@ -346,8 +346,10 @@ def _compute_oos_metrics(
         else:
             sharpe = 0.0
 
-        # fee_multiplier: how many times the avg gross return exceeds costs
-        avg_gross_return = float(np.mean(signal_preds * signal_returns))
+        # fee_multiplier: is avg absolute move large enough to justify fees?
+        # Uses |future_return| on signal bars — measures move magnitude,
+        # not edge (edge is captured by Sharpe / avg_return).
+        avg_gross_return = float(np.mean(np.abs(signal_returns)))
         fee_multiplier = avg_gross_return / _ROUND_TRIP_COST if _ROUND_TRIP_COST > 0 else 0.0
     else:
         win_rate = 0.0
