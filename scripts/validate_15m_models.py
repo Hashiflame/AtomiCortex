@@ -66,7 +66,7 @@ _WIN_RATE_THRESHOLD = 51.0
 _PROFIT_FACTOR_THRESHOLD = 1.20
 _MIN_TRADES = {"trend": 1500, "orb": 500}  # orb has fewer bars
 _WF_PROFITABLE_THRESHOLD = 50.0  # % of walk-forward windows
-_FEE_MULTIPLIER_THRESHOLD = 5.0  # stricter than 1H (4.0)
+_FEE_MULTIPLIER_THRESHOLD = 2.0  # shorter horizon (1h) = smaller avg move than 1H/4H
 _ROUND_TRIP_FEES_BPS = 7.0  # ~0.07% (maker + taker on Binance Futures)
 _ROUND_TRIP_COST = _ROUND_TRIP_FEES_BPS / 10_000  # 0.0007
 _EMBARGO_BARS = 16  # 4 hours × 4 bars/hour — embargo gap for WF
@@ -347,10 +347,8 @@ def _compute_oos_metrics(
         else:
             sharpe = 0.0
 
-        # fee_multiplier: is avg absolute move large enough to justify fees?
-        # Uses |future_return| on signal bars — measures move magnitude,
-        # not edge (edge is captured by Sharpe / avg_return).
-        avg_gross_return = float(np.mean(np.abs(signal_returns)))
+        # fee_multiplier: avg net PnL per trade / round-trip fees
+        avg_gross_return = float(np.mean(signal_preds * signal_returns))
         fee_multiplier = avg_gross_return / _ROUND_TRIP_COST if _ROUND_TRIP_COST > 0 else 0.0
     else:
         win_rate = 0.0
