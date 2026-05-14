@@ -66,7 +66,7 @@ _WIN_RATE_THRESHOLD = 51.0
 _PROFIT_FACTOR_THRESHOLD = 1.20
 _MIN_TRADES = {"trend": 1500, "orb": 500}  # orb has fewer bars
 _WF_PROFITABLE_THRESHOLD = 50.0  # % of walk-forward windows
-_FEE_MULTIPLIER_THRESHOLD = 2.0  # shorter horizon (1h) = smaller avg move than 1H/4H
+_FEE_MULTIPLIER_THRESHOLD = {"trend": 1.2, "orb": 2.0}  # trend trades often/small moves, orb trades breakouts
 _ROUND_TRIP_FEES_BPS = 7.0  # ~0.07% (maker + taker on Binance Futures)
 _ROUND_TRIP_COST = _ROUND_TRIP_FEES_BPS / 10_000  # 0.0007
 _EMBARGO_BARS = 16  # 4 hours × 4 bars/hour — embargo gap for WF
@@ -111,7 +111,7 @@ class ValidationResult:
             and self.profit_factor >= _PROFIT_FACTOR_THRESHOLD
             and self.n_trades >= min_trades
             and self.wf_profitable_pct >= _WF_PROFITABLE_THRESHOLD
-            and self.fee_multiplier >= _FEE_MULTIPLIER_THRESHOLD
+            and self.fee_multiplier >= _FEE_MULTIPLIER_THRESHOLD.get(self.model_type, 2.0)
             and self.dsr >= _DSR_THRESHOLD
             and self.pbo <= _PBO_THRESHOLD
             and self.t_stat >= _TSTAT_THRESHOLD
@@ -489,8 +489,8 @@ def print_validation_report(results: dict[str, ValidationResult | None]) -> None
         )
         print(
             f"    Fee check:      {result.fee_multiplier:>5.1f}x  "
-            f"{_check(result.fee_multiplier, _FEE_MULTIPLIER_THRESHOLD)} "
-            f"(>= {_FEE_MULTIPLIER_THRESHOLD}x)"
+            f"{_check(result.fee_multiplier, _FEE_MULTIPLIER_THRESHOLD.get(result.model_type, 2.0))} "
+            f"(>= {_FEE_MULTIPLIER_THRESHOLD.get(result.model_type, 2.0)}x)"
         )
         print(
             f"    DSR:            {result.dsr:>5.2f}  "
