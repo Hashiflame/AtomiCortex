@@ -290,15 +290,24 @@ def _compute_oos_metrics(
     X_oos = np.nan_to_num(X_oos, nan=0.0, posinf=0.0, neginf=0.0)
 
     proba = booster.predict(X_oos)
-    y_pred_class = np.argmax(proba, axis=1)
-    y_pred_labels = np.array([CLASS_TO_LABEL[int(c)] for c in y_pred_class])
+
+    if proba.ndim == 1:
+        # Binary: proba = P(class=1=UP)
+        y_pred_up_prob = proba
+        y_pred_direction = np.where(proba >= 0.5, 1, -1)
+        max_proba = np.maximum(proba, 1.0 - proba)
+    else:
+        # Legacy multiclass fallback
+        y_pred_class = np.argmax(proba, axis=1)
+        y_pred_direction = np.array([CLASS_TO_LABEL[int(c)] for c in y_pred_class])
+        max_proba = np.max(proba, axis=1)
+
     future_returns = oos_df["future_return"].to_numpy()
-    max_proba = np.max(proba, axis=1)
 
-    is_directional = y_pred_class != 1
-    signal_mask = is_directional & (max_proba >= 0.35)
+    # Signal fires when confidence >= 0.35 AND direction is non-zero
+    signal_mask = (max_proba >= 0.35) & (y_pred_direction != 0)
 
-    signal_preds = y_pred_labels[signal_mask]
+    signal_preds = y_pred_direction[signal_mask]
     signal_returns = future_returns[signal_mask]
     n_signals = int(signal_mask.sum())
 
