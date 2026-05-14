@@ -136,9 +136,8 @@ def create_objective(
 
         # ── Build per-trial LightGBM params ──────────────────────────
         lgbm_defaults: dict[str, Any] = {
-            "objective": "multiclass",
-            "num_class": 3,
-            "metric": "multi_logloss",
+            "objective": "binary",
+            "metric": "binary_logloss",
             "random_state": base_config.random_state,
             "verbose": -1,
             # OPT-012: cap threads per worker to avoid oversubscription
@@ -449,9 +448,8 @@ class OptunaTrainer:
         # OPT-014: use .get() instead of .pop() to avoid mutating caller's dict
         # Filter out non-LightGBM keys safely
         lgbm_params: dict[str, Any] = {
-            "objective": "multiclass",
-            "num_class": 3,
-            "metric": "multi_logloss",
+            "objective": "binary",
+            "metric": "binary_logloss",
             "random_state": 42,
             "verbose": -1,
         }
@@ -491,7 +489,7 @@ class OptunaTrainer:
 
         # Log best params to MLflow
         try:
-            mlflow.set_tracking_uri("./mlruns")
+            mlflow.set_tracking_uri("sqlite:///data/mlflow.db")
             mlflow.set_experiment("AtomiCortex_Optuna")
             with mlflow.start_run(run_name=f"optuna_best_{regime}"):
                 mlflow.log_params({

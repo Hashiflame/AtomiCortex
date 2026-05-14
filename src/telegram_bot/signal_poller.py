@@ -31,7 +31,10 @@ class SignalPoller:
     Parameters
     ----------
     db_path:
-        Absolute path to the shared SQLite database.
+        Absolute path to the shared SQLite database (legacy, single-DB).
+    db_paths:
+        List of DB paths to poll (multi-timeframe isolation).
+        If *db_path* is given, it is prepended to *db_paths*.
     broadcaster:
         The Telegram Broadcaster instance for sending messages.
     poll_interval:
@@ -40,17 +43,32 @@ class SignalPoller:
 
     def __init__(
         self,
-        db_path: str,
-        broadcaster: Broadcaster,
+        db_path: str | None = None,
+        broadcaster: Broadcaster | None = None,
         poll_interval: int = 30,
+        *,
+        db_paths: list[str] | None = None,
     ) -> None:
-        self._db_path = str(db_path)
+        # Normalise to a list of unique paths
+        paths: list[str] = []
+        if db_path is not None:
+            paths.append(str(db_path))
+        if db_paths is not None:
+            for p in db_paths:
+                if str(p) not in paths:
+                    paths.append(str(p))
+        if not paths:
+            paths = ["data/atomicortex.db"]
+
+        self._db_paths: list[str] = paths
+        # Backward-compatible single-path accessor
+        self._db_path: str = paths[0]
         self._broadcaster = broadcaster
         self._poll_interval = poll_interval
 
-        # High-water marks to avoid re-processing
-        self._last_signal_id: int = 0
-        self._last_event_id: int = 0
+        # Per-DB high-water marks to avoid re-processing
+        self._last_signal_ids: dict[str, int] = {p: 0 for p in paths}
+        self._last_event_ids: dict[str, int] = {p: 0 for p in paths}
 
         # Cached metrics for /health and /stats commands
         self._cached_metrics: dict[str, Any] = {}
@@ -63,8 +81,9 @@ class SignalPoller:
     # Connection helper
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
+    @staticmethod
+    def _connect(db_path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -80,8 +99,8 @@ class SignalPoller:
         self._init_high_water_marks()
         self._task = asyncio.create_task(self._poll_loop())
         _log.info(
-            "SignalPoller started | interval={i}s | db={p}",
-            i=self._poll_interval, p=self._db_path,
+            "SignalPoller started | interval={i}s | dbs={p}",
+            i=self._poll_interval, p=self._db_paths,
         )
 
     async def stop(self) -> None:
@@ -100,42 +119,52 @@ class SignalPoller:
     # ------------------------------------------------------------------
 
     def _init_high_water_marks(self) -> None:
-        """Set last_signal_id and last_event_id to current max."""
-        try:
-            conn = self._connect()
+        """Set per-DB last_signal_id and last_event_id to current max."""
+        for db_path in self._db_paths:
             try:
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) FROM signals_log"
-                ).fetchone()
-                self._last_signal_id = row[0] if row else 0
+                conn = self._connect(db_path)
+                try:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM signals_log"
+                    ).fetchone()
+                    self._last_signal_ids[db_path] = row[0] if row else 0
 
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) FROM bot_events"
-                ).fetchone()
-                self._last_event_id = row[0] if row else 0
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM bot_events"
+                    ).fetchone()
+                    self._last_event_ids[db_path] = row[0] if row else 0
 
-                _log.info(
-                    "High-water marks | signal_id={s} event_id={e}",
-                    s=self._last_signal_id, e=self._last_event_id,
+                    _log.info(
+                        "High-water marks | db={db} signal_id={s} event_id={e}",
+                        db=db_path,
+                        s=self._last_signal_ids[db_path],
+                        e=self._last_event_ids[db_path],
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error(
+                    "Failed to init high-water marks for {db}: {err}",
+                    db=db_path, err=str(exc),
                 )
-            finally:
-                conn.close()
-        except Exception as exc:
-            _log.error("Failed to init high-water marks: {err}", err=str(exc))
 
     # ------------------------------------------------------------------
     # Poll loop
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
-        """Main polling loop (runs until stopped)."""
+        """Main polling loop — polls all DBs each cycle."""
         while self._running:
-            try:
-                await self._check_new_signals()
-                await self._check_new_events()
-                await self._update_cached_metrics()
-            except Exception as exc:
-                _log.error("Poll cycle error: {err}", err=str(exc))
+            for db_path in self._db_paths:
+                try:
+                    await self._check_new_signals(db_path)
+                    await self._check_new_events(db_path)
+                    await self._update_cached_metrics(db_path)
+                except Exception as exc:
+                    _log.error(
+                        "Poll cycle error for {db}: {err}",
+                        db=db_path, err=str(exc),
+                    )
 
             await asyncio.sleep(self._poll_interval)
 
@@ -143,23 +172,23 @@ class SignalPoller:
     # Check new signals
     # ------------------------------------------------------------------
 
-    async def _check_new_signals(self) -> None:
+    async def _check_new_signals(self, db_path: str) -> None:
         """Find signals with id > last_signal_id and broadcast them."""
         try:
-            conn = self._connect()
+            conn = self._connect(db_path)
             try:
                 rows = conn.execute(
                     "SELECT * FROM signals_log "
                     "WHERE id > ? AND result = 'open' "
                     "ORDER BY id ASC",
-                    (self._last_signal_id,),
+                    (self._last_signal_ids[db_path],),
                 ).fetchall()
             finally:
                 conn.close()
 
             for row in rows:
                 signal_data = dict(row)
-                self._last_signal_id = signal_data["id"]
+                self._last_signal_ids[db_path] = signal_data["id"]
 
                 _log.info(
                     "New signal detected | id={sid} {dir} {sym}",
@@ -177,15 +206,15 @@ class SignalPoller:
                     )
 
             # Also check for newly closed signals
-            await self._check_closed_signals()
+            await self._check_closed_signals(db_path)
 
         except Exception as exc:
             _log.error("_check_new_signals failed: {err}", err=str(exc))
 
-    async def _check_closed_signals(self) -> None:
+    async def _check_closed_signals(self, db_path: str) -> None:
         """Check for recently closed signals and broadcast close events."""
         try:
-            conn = self._connect()
+            conn = self._connect(db_path)
             try:
                 # Get signals closed in the last 2 poll intervals
                 rows = conn.execute(
@@ -214,23 +243,23 @@ class SignalPoller:
     # Check new events
     # ------------------------------------------------------------------
 
-    async def _check_new_events(self) -> None:
+    async def _check_new_events(self, db_path: str) -> None:
         """Find events with id > last_event_id and broadcast them."""
         try:
-            conn = self._connect()
+            conn = self._connect(db_path)
             try:
                 rows = conn.execute(
                     "SELECT * FROM bot_events "
                     "WHERE id > ? "
                     "ORDER BY id ASC",
-                    (self._last_event_id,),
+                    (self._last_event_ids[db_path],),
                 ).fetchall()
             finally:
                 conn.close()
 
             for row in rows:
                 event = dict(row)
-                self._last_event_id = event["id"]
+                self._last_event_ids[db_path] = event["id"]
 
                 event_type = event.get("event_type", "")
                 message = event.get("message", "")
@@ -262,10 +291,10 @@ class SignalPoller:
     # Update cached metrics
     # ------------------------------------------------------------------
 
-    async def _update_cached_metrics(self) -> None:
+    async def _update_cached_metrics(self, db_path: str) -> None:
         """Read bot_metrics and cache them for /health and /stats."""
         try:
-            conn = self._connect()
+            conn = self._connect(db_path)
             try:
                 row = conn.execute(
                     "SELECT * FROM bot_metrics WHERE id = 1"
@@ -276,7 +305,8 @@ class SignalPoller:
             if row:
                 self._cached_metrics = dict(row)
                 # Also update broadcaster's cache reference
-                self._broadcaster._cached_metrics = self._cached_metrics
+                if self._broadcaster is not None:
+                    self._broadcaster._cached_metrics = self._cached_metrics
         except Exception as exc:
             _log.error("_update_cached_metrics failed: {err}", err=str(exc))
 

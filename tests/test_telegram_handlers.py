@@ -144,7 +144,10 @@ class TestPremiumHandlers:
         db.set_role(12345, "owner")
         # Old signal says "range"; live metrics say "trend_up"
         db.log_signal({"symbol": "BTC", "direction": "long", "regime": "range"})
-        import sqlite3
+        try:
+            import sqlite3
+        except ImportError:
+            import pysqlite3 as sqlite3  # type: ignore[no-redef]
         conn = sqlite3.connect(str(db._db_path))
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS bot_metrics ("

@@ -278,7 +278,7 @@ class TestSignalPollerNewSignals:
         # Write a signal AFTER initialising marks
         shared_bridge.log_signal("BTC", "long", 100, 90, 110, 0.7, "trend")
 
-        await poller._check_new_signals()
+        await poller._check_new_signals(db_path)
 
         mock_broadcaster.broadcast_signal.assert_awaited_once()
         call_data = mock_broadcaster.broadcast_signal.call_args[0][0]
@@ -295,8 +295,8 @@ class TestSignalPollerNewSignals:
 
         shared_bridge.log_signal("ETH", "short", 3000, 3100, 2900, 0.6, "high_vol")
 
-        await poller._check_new_signals()
-        await poller._check_new_signals()  # second poll
+        await poller._check_new_signals(db_path)
+        await poller._check_new_signals(db_path)  # second poll
 
         # Only one broadcast
         assert mock_broadcaster.broadcast_signal.await_count == 1
@@ -317,7 +317,7 @@ class TestSignalPollerNewEvents:
 
         shared_bridge.log_regime_change("trend", "high_vol")
 
-        await poller._check_new_events()
+        await poller._check_new_events(db_path)
 
         mock_broadcaster.broadcast_regime_change.assert_awaited_once_with(
             "trend", "high_vol",
@@ -333,7 +333,7 @@ class TestSignalPollerNewEvents:
 
         shared_bridge.log_circuit_breaker("Max drawdown")
 
-        await poller._check_new_events()
+        await poller._check_new_events(db_path)
 
         mock_broadcaster.broadcast_circuit_breaker.assert_awaited_once_with(
             "Max drawdown",
@@ -357,7 +357,7 @@ class TestSignalPollerMetrics:
             regime="trend", open_positions=2,
         )
 
-        await poller._update_cached_metrics()
+        await poller._update_cached_metrics(db_path)
 
         assert poller.cached_metrics["equity"] == pytest.approx(12_000)
         assert poller.cached_metrics["regime"] == "trend"
@@ -397,7 +397,7 @@ class TestSignalPollerLifecycle:
         )
 
         # Run a single poll cycle manually
-        await poller._check_new_signals()
+        await poller._check_new_signals(db_path)
 
         mock_broadcaster.broadcast_signal.assert_awaited_once()
         assert mock_broadcaster.broadcast_signal.call_args[0][0]["symbol"] == "SOL"
@@ -423,7 +423,7 @@ class TestSignalPollerHighWaterMarks:
         poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
         poller._init_high_water_marks()
 
-        await poller._check_new_signals()
+        await poller._check_new_signals(db_path)
 
         # No broadcast — both signals existed before init
         mock_broadcaster.broadcast_signal.assert_not_awaited()
@@ -441,7 +441,7 @@ class TestSignalPollerHighWaterMarks:
         # This one is new
         shared_bridge.log_signal("SOL", "short", 180, 185, 170, 0.8, "high_vol")
 
-        await poller._check_new_signals()
+        await poller._check_new_signals(db_path)
 
         assert mock_broadcaster.broadcast_signal.await_count == 1
         assert mock_broadcaster.broadcast_signal.call_args[0][0]["symbol"] == "SOL"

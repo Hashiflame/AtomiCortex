@@ -509,7 +509,7 @@ class LGBMTrainer:
         try:
             import mlflow  # lazy: avoids matplotlib OSError under systemd
 
-            mlflow.set_tracking_uri("./mlruns")
+            mlflow.set_tracking_uri("sqlite:///data/mlflow.db")
             mlflow.set_experiment("AtomiCortex_LightGBM")
 
             with mlflow.start_run(run_name=f"lgbm_{self.config.regime}") as run:

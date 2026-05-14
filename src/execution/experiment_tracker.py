@@ -19,7 +19,7 @@ log = get_logger(__name__)
 class ExperimentTracker:
     """Thin MLflow wrapper for logging backtests and walk-forward results.
 
-    Tracking URI defaults to ``./mlruns`` (local filesystem).  For tests,
+    Tracking URI defaults to ``sqlite:///data/mlflow.db``.  For tests,
     pass a temp SQLite URI::
 
         ExperimentTracker("test_exp", tracking_uri="sqlite:///tmp/test.db")
@@ -28,7 +28,7 @@ class ExperimentTracker:
     def __init__(
         self,
         experiment_name: str = "AtomiCortex",
-        tracking_uri: str = "./mlruns",
+        tracking_uri: str = "sqlite:///data/mlflow.db",
     ) -> None:
         self._experiment_name = experiment_name
         self._tracking_uri = tracking_uri

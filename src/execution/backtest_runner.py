@@ -35,7 +35,7 @@ class BacktestConfig:
     maker_fee: float = 0.0002
     taker_fee: float = 0.0005
     data_dir: Path = field(
-        default_factory=lambda: Path("/mnt/hdd/AtomiCortex/data/features")
+        default_factory=lambda: Path("data/features")
     )
     fee_config: FeeConfig = field(default_factory=FeeConfig)
     avg_daily_volume_usdt: float = 30_000_000_000.0  # $30B default for BTC

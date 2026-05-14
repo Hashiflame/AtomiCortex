@@ -73,6 +73,9 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     rr_ratio: float = 1.5
     preload_enabled: bool = True
     trading_mode: str = "testnet"  # testnet / paper / live
+    # Isolation — consistent with MLStrategyConfig1H / MLStrategyConfig15M
+    signal_db_path: str = "data/atomicortex.db"
+    heartbeat_key: str = "atomicortex:heartbeat"
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +189,8 @@ class MLTradingStrategy(Strategy):
         # 7. Signal Bridge for Telegram integration
         try:
             from src.execution.signal_bridge import SignalBridge
-            # __file__ = src/execution/strategies/ml_strategy.py
-            # project root = 4 levels up
             project_root = Path(__file__).resolve().parent.parent.parent.parent
-            db_path = str(project_root / "data" / "atomicortex.db")
+            db_path = str(project_root / self._config.signal_db_path)
             self._signal_bridge = SignalBridge(db_path=db_path)
             self.log.info(f"SignalBridge initialised | db={db_path}")
         except Exception as exc:
