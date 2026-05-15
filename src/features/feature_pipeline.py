@@ -120,7 +120,7 @@ FEATURE_GROUPS_MTF: dict[str, list[str]] = {
         "is_overlap", "is_dead_zone", "hours_to_session_end",
         "session_vwap", "price_vs_session_vwap", "session_vwap_std",
         "vwap_upper_band", "vwap_lower_band", "vwap_band_position",
-        "session_volume_pct",
+        "session_cumulative_volume_ratio",
         "avwap_weekly", "price_vs_avwap_weekly", "avwap_weekly_slope",
         "price_above_avwap",
         "hours_to_funding_mark", "pre_funding_window",

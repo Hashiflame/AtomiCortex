@@ -30,6 +30,17 @@ _log = get_logger(__name__)
 # EMA smoothing factor helpers.
 _EMA_SPAN_20 = 20
 
+# Bar duration in milliseconds — used to compute close_time from open_time
+# so that ASOF joins only match *closed* HTF bars (preventing lookahead).
+_BAR_DURATION_MS: dict[str, int] = {
+    "1m":  60_000,
+    "5m":  300_000,
+    "15m": 900_000,
+    "1h":  3_600_000,
+    "4h":  14_400_000,
+    "1d":  86_400_000,
+}
+
 
 def _ema_column(col: str, span: int) -> pl.Expr:
     """Exponential moving average with given span (as Polars expression)."""
@@ -55,8 +66,9 @@ def _trend_direction(close: pl.Expr, lookback: int = 3) -> pl.Expr:
 class MTFContextBuilder:
     """Build multi-timeframe context features via backward ASOF joins.
 
-    All joins use ``strategy='backward'`` to prevent lookahead bias:
-    a 4H bar at timestamp T is only visible to LTF bars with timestamp >= T.
+    All joins use ``strategy='backward'`` on **close_time** of HTF bars
+    to prevent lookahead bias: a 4H bar opening at 08:00 and closing at
+    12:00 is only matched to LTF bars with open_time >= 12:00.
     """
 
     # ----------------------------------------------------------------
@@ -75,8 +87,8 @@ class MTFContextBuilder:
             htf_4h_atr_pct, price_vs_4h_ema20, mtf_1h_4h_aligned,
             mtf_alignment_score, htf_4h_last_n_bars_dir
         """
-        # Prepare 4H features for joining.
-        htf = self._prepare_htf(df_4h, prefix="4h")
+        # Prepare 4H features for joining (close_time–based).
+        htf = self._prepare_htf(df_4h, prefix="4h", htf_interval="4h")
 
         if htf.is_empty():
             _log.warning("build_for_1h: empty 4H data — filling defaults")
@@ -146,25 +158,26 @@ class MTFContextBuilder:
             htf_4h_regime, htf_4h_trend_dir,
             mtf_3tf_alignment, htf_conflict, htf_both_strong_trend
         """
-        htf_1h = self._prepare_htf(df_1h, prefix="1h")
-        htf_4h = self._prepare_htf(df_4h, prefix="4h")
+        htf_1h = self._prepare_htf(df_1h, prefix="1h", htf_interval="1h")
+        htf_4h = self._prepare_htf(df_4h, prefix="4h", htf_interval="4h")
 
         df = df_15m.sort("open_time")
 
         # Join 1H context.
         if not htf_1h.is_empty():
             # Add session_vwap from 1H if available.
-            vwap_cols = ["_htf_time"]
+            # Use close_time for the VWAP join too — prevents lookahead.
             if "session_vwap" in df_1h.columns:
+                _1h_dur = _BAR_DURATION_MS["1h"]
                 htf_vwap = df_1h.select([
-                    pl.col("open_time").alias("_vwap_time"),
+                    (pl.col("open_time") + _1h_dur).alias("_vwap_close_time"),
                     pl.col("session_vwap").alias("_htf_1h_vwap"),
-                ]).sort("_vwap_time")
+                ]).sort("_vwap_close_time")
 
                 df = df.join_asof(
                     htf_vwap,
                     left_on="open_time",
-                    right_on="_vwap_time",
+                    right_on="_vwap_close_time",
                     strategy="backward",
                 )
                 df = df.with_columns(
@@ -258,12 +271,23 @@ class MTFContextBuilder:
     # Internal helpers
     # ----------------------------------------------------------------
 
-    def _prepare_htf(self, df_htf: pl.DataFrame, prefix: str) -> pl.DataFrame:
-        """Extract key HTF columns for joining."""
+    def _prepare_htf(
+        self,
+        df_htf: pl.DataFrame,
+        prefix: str,
+        htf_interval: str = "4h",
+    ) -> pl.DataFrame:
+        """Extract key HTF columns for joining.
+
+        The join key ``_htf_time`` is set to ``open_time + bar_duration``
+        (i.e. **close_time**) so that the ASOF backward join only matches
+        bars that have already closed — preventing lookahead.
+        """
         if df_htf.is_empty() or "open_time" not in df_htf.columns:
             return pl.DataFrame()
 
-        cols = [pl.col("open_time").alias("_htf_time")]
+        bar_dur = _BAR_DURATION_MS.get(htf_interval, 14_400_000)
+        cols = [(pl.col("open_time") + bar_dur).alias("_htf_time")]
 
         # Regime.
         if "regime" in df_htf.columns:

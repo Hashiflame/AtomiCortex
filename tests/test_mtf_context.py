@@ -94,24 +94,34 @@ def _make_15m(n: int = 1600) -> pl.DataFrame:
 
 class TestAsofJoinNoLookahead:
     def test_asof_join_no_lookahead_bias(self) -> None:
-        """CRITICAL: 4H bar closing at 12:00 must NOT be available
-        for 1H bar at 12:00 (it hasn't closed yet)."""
+        """CRITICAL: 4H bar opening at 08:00 (closes at 12:00) must NOT be
+        available for 1H bar at 10:00 — the 4H bar hasn't closed yet.
+
+        The 1H bar at 10:00 should see the *previous* closed 4H bar (04:00-08:00)
+        or NULL if no closed 4H bar exists.
+        """
         builder = MTFContextBuilder()
 
-        # 4H bar at timestamp 08:00 (closes at 12:00, visible after 08:00).
-        # 4H bar at timestamp 12:00 (closes at 16:00, visible after 12:00).
+        # 4H bar 04:00 (closes 08:00) → visible to bars at open_time >= 08:00
+        # 4H bar 08:00 (closes 12:00) → visible to bars at open_time >= 12:00
+        # 4H bar 12:00 (closes 16:00) → visible to bars at open_time >= 16:00
         df_4h = pl.DataFrame({
-            "open_time": [_ts_ms(2024, 1, 1, 8), _ts_ms(2024, 1, 1, 12)],
-            "open": [40000.0, 40100.0],
-            "high": [40050.0, 40150.0],
-            "low":  [39950.0, 40050.0],
-            "close": [40020.0, 40120.0],
-            "volume": [500.0, 500.0],
-            "regime": ["trend_up", "range"],
-            "adx": [30.0, 15.0],
+            "open_time": [
+                _ts_ms(2024, 1, 1, 4),
+                _ts_ms(2024, 1, 1, 8),
+                _ts_ms(2024, 1, 1, 12),
+            ],
+            "open": [39900.0, 40000.0, 40100.0],
+            "high": [39950.0, 40050.0, 40150.0],
+            "low":  [39850.0, 39950.0, 40050.0],
+            "close": [39920.0, 40020.0, 40120.0],
+            "volume": [500.0, 500.0, 500.0],
+            "regime": ["range", "trend_up", "range"],
+            "adx": [15.0, 30.0, 15.0],
         })
 
-        # 1H bar at 10:00 should see 4H bar at 08:00 (backward), not 12:00.
+        # 1H bar at 10:00: the 08:00 4H bar hasn't closed yet (closes 12:00).
+        # → should see the 04:00 4H bar (closed at 08:00), regime="range".
         df_1h = pl.DataFrame({
             "open_time": [_ts_ms(2024, 1, 1, 10)],
             "open": [40010.0], "high": [40030.0],
@@ -120,7 +130,8 @@ class TestAsofJoinNoLookahead:
         })
 
         result = builder.build_for_1h(df_1h, df_4h)
-        assert result["htf_4h_regime"][0] == "trend_up"  # The 08:00 bar
+        # Must see the 04:00 bar (range), NOT the 08:00 bar (trend_up)
+        assert result["htf_4h_regime"][0] == "range"
 
     def test_4h_bar_08utc_available_for_1h_bar_10utc(self) -> None:
         """1H bar at 10:00 should use 4H bar from 08:00 (latest closed)."""
@@ -145,11 +156,12 @@ class TestBuildFor1H:
         assert expected.issubset(set(result.columns))
 
     def test_mtf_alignment_score_range(self) -> None:
-        """mtf_alignment_score should be 0, 1, or 2."""
+        """mtf_alignment_score should be 0, 1, or 2 (or null for early bars)."""
         builder = MTFContextBuilder()
         result = builder.build_for_1h(_make_1h(), _make_htf_4h())
         valid = {0, 1, 2}
-        actual = set(result["mtf_alignment_score"].to_list())
+        non_null = result.filter(pl.col("mtf_alignment_score").is_not_null())
+        actual = set(non_null["mtf_alignment_score"].to_list())
         assert actual.issubset(valid)
 
     def test_alignment_when_both_trending(self) -> None:
@@ -272,11 +284,12 @@ class TestMTFContextEdgeCases:
         assert (result["htf_4h_regime"] == "unknown").all()
 
     def test_htf_trend_dir_values(self) -> None:
-        """htf_4h_trend_dir should be -1, 0, or 1."""
+        """htf_4h_trend_dir should be -1, 0, or 1 (ignoring null for early bars)."""
         builder = MTFContextBuilder()
         result = builder.build_for_1h(_make_1h(), _make_htf_4h())
         valid = {-1, 0, 1}
-        actual = set(result["htf_4h_trend_dir"].to_list())
+        non_null = result.filter(pl.col("htf_4h_trend_dir").is_not_null())
+        actual = set(non_null["htf_4h_trend_dir"].to_list())
         assert actual.issubset(valid)
 
     def test_no_internal_columns_in_output(self) -> None:

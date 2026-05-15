@@ -78,9 +78,14 @@ _WF_TRAIN_MONTHS = 12
 _WF_TEST_MONTHS = 4
 _WF_STEP_MONTHS = 2
 
-# N experiments estimate for DSR
-# = n_wf_windows × n_regimes × n_tuning_attempts
-_N_EXPERIMENTS = 10 * 2 * 1  # 20 (conservative for first run, no Optuna)
+# N experiments estimate for DSR.
+# How to count N:
+#   N = n_wf_windows × n_regimes × n_tuning_attempts
+#   Example without tuning: 10 × 2 × 1 = 20
+#   With Optuna (50 trials): 10 × 2 × 50 = 1000
+#   If you tested multiple forward_bars / ATR multipliers, multiply further.
+# If you ran tune_models.py — use --n-experiments 200+ on CLI.
+_N_EXPERIMENTS_DEFAULT = 20  # conservative default (no Optuna tuning)
 
 
 @dataclass
@@ -414,7 +419,7 @@ def validate_model(
         stat_result = run_all_tests(
             cv_results=cv_results,
             wf_result=wf_result,
-            n_experiments=_N_EXPERIMENTS,
+            n_experiments=_N_EXPERIMENTS_DEFAULT,
         )
         dsr = stat_result.dsr
         pbo = stat_result.pbo
@@ -525,6 +530,15 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="Directory with trained models",
     )
+    p.add_argument(
+        "--n-experiments",
+        default=_N_EXPERIMENTS_DEFAULT,
+        type=int,
+        help=(
+            "Number of strategy configurations tested (for DSR). "
+            "Default=20 (no tuning). Use 200+ if Optuna was run."
+        ),
+    )
     return p.parse_args()
 
 
@@ -537,13 +551,15 @@ def main() -> None:
     dataset_base = Path(args.dataset_dir) / f"symbol={symbol}" / "interval=1h"
     models_dir = Path(args.models_dir)
 
+    n_experiments = args.n_experiments
+
     print(f"\n{'='*60}")
     print(f"  AtomiCortex — 1H Model Validation")
     print(f"{'='*60}")
     print(f"  Symbol        : {symbol}")
     print(f"  Datasets      : {dataset_base}")
     print(f"  Models        : {models_dir}")
-    print(f"  N experiments : {_N_EXPERIMENTS}")
+    print(f"  N experiments : {n_experiments}")
     print(f"{'='*60}\n")
 
     results: dict[str, ValidationResult | None] = {}

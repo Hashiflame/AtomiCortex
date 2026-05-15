@@ -51,6 +51,14 @@ _EXCLUDE_COLUMNS: set[str] = {
     "taker_buy_quote_volume",
 }
 
+# Features excluded from training due to zero importance on BTCUSDT-only
+# datasets.  Kept in the feature pipeline so they remain available if
+# multi-symbol training is added later.
+_TRAINING_EXCLUDE: set[str] = {
+    "mtf_alignment_score",   # zero importance in both 1H models
+    "symbol_encoded",        # only one symbol = no information
+}
+
 
 class DatasetBuilder:
     """Prepare multi-symbol feature data for LightGBM training.
@@ -208,11 +216,12 @@ class DatasetBuilder:
         """Return feature column names suitable for ML.
 
         Excludes timestamps, raw prices, regime string, target/leak columns,
-        and non-numeric columns.
+        non-numeric columns, and zero-importance training exclusions.
         """
+        exclude = _EXCLUDE_COLUMNS | _TRAINING_EXCLUDE
         feature_cols: list[str] = []
         for col in df.columns:
-            if col in _EXCLUDE_COLUMNS:
+            if col in exclude:
                 continue
             dtype = df[col].dtype
             # Only numeric columns

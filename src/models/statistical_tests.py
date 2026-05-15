@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from itertools import combinations
 
 import numpy as np
 from scipy import stats as sp_stats
@@ -119,12 +118,16 @@ def calculate_pbo(
 ) -> float:
     """Probability of Backtest Overfitting (Bailey et al. 2014).
 
-    Simplified combinatorial approach:
+    Leave-one-out cross-validation approach:
 
-    1. Split CV fold results into pairs of (IS, OOS) subsets.
-    2. For each partition, find which fold is "best" in-sample.
-    3. Check whether that same fold performs *below median* out-of-sample.
-    4. PBO = fraction of partitions where best-IS is below-median-OOS.
+    For each fold *i* (treated as the held-out OOS fold):
+      1. IS = all folds **except** *i*.
+      2. Find the fold with the best IS metric.
+      3. Check whether that same fold's **OOS-like** metric (its own
+         performance value) ranks below the median of all other folds.
+      4. Count this as an "overfit" instance.
+
+    PBO = fraction of leave-one-out iterations that overfit.
 
     Interpretation:
         PBO = 0.0 → no overfitting
@@ -159,37 +162,32 @@ def calculate_pbo(
 
     metrics_arr = np.array(metrics)
 
-    # Combinatorial split: partition folds into two halves
-    fold_indices = list(range(n))
-    half = n // 2
+    # Leave-one-out: treat each fold as OOS in turn.
     overfit_count = 0
-    total_partitions = 0
 
-    for is_indices in combinations(fold_indices, half):
-        is_set = set(is_indices)
-        oos_indices = [i for i in fold_indices if i not in is_set]
+    for oos_idx in range(n):
+        # IS = all folds except the current OOS fold
+        is_indices = [j for j in range(n) if j != oos_idx]
+        is_metrics = metrics_arr[is_indices]
 
-        is_metrics = metrics_arr[list(is_indices)]
-        oos_metrics = metrics_arr[oos_indices]
-
-        # Find the index (within IS) of the best IS fold
+        # Best IS fold (mapped back to original index)
         best_is_pos = int(np.argmax(is_metrics))
-        # Map back to the original fold index
-        best_is_idx = list(is_indices)[best_is_pos]
+        best_is_original = is_indices[best_is_pos]
 
-        # Check OOS performance of this fold
-        oos_median = float(np.median(oos_metrics))
-        best_is_oos_val = metrics_arr[best_is_idx]
+        # Check: does the best IS fold's metric rank below the median
+        # of all *other* folds (simulating unseen OOS performance)?
+        # We compare its value against the median of the remaining folds
+        # (excluding itself to avoid self-comparison).
+        other_vals = np.delete(metrics_arr, best_is_original)
+        other_median = float(np.median(other_vals))
 
-        # Count as overfit if best-IS performs below OOS median
-        if best_is_oos_val < oos_median:
+        if metrics_arr[best_is_original] < other_median:
             overfit_count += 1
-        total_partitions += 1
 
-    pbo = overfit_count / total_partitions if total_partitions > 0 else 0.5
+    pbo = overfit_count / n
 
     _log.info(
-        f"PBO ({metric}): {overfit_count}/{total_partitions} = {pbo:.4f} "
+        f"PBO ({metric}): {overfit_count}/{n} = {pbo:.4f} "
         f"(metrics={[f'{m:.2f}' for m in metrics]})"
     )
     return pbo
@@ -298,6 +296,8 @@ def run_all_tests(
     cv_results: list[EvaluationResult],
     wf_result: "WalkForwardMLResult",  # forward ref to avoid circular import
     n_experiments: int = 10,
+    per_fold_daily_returns: list[np.ndarray] | None = None,
+    annualization_factor: float = 365.0,
 ) -> StatTestResult:
     """Run DSR + PBO + t-stat and return aggregated StatTestResult.
 
@@ -309,30 +309,69 @@ def run_all_tests(
         WalkForwardMLResult from walk-forward ML validation.
     n_experiments:
         Number of model configurations tested (for DSR).
+        Default 10 — update if Optuna tuning was run.
+    per_fold_daily_returns:
+        Optional list of daily P&L arrays (one per fold/window).
+        If provided, real Sharpe ratios are computed from these returns
+        along with their true skewness and kurtosis.
+        If ``None``, a proxy SR is computed from win_rate and profit_factor
+        (backward-compatible fallback).
+    annualization_factor:
+        Number of trading days per year for SR annualization.
+        Default 365 (crypto trades 24/7).
 
     Returns
     -------
     StatTestResult
     """
     # --- DSR ---
-    # Use profit_factor as proxy for Sharpe (PF > 1 ≈ positive returns)
-    sharpe_proxies = []
-    for r in cv_results:
-        # Convert win_rate + profit_factor into a simple Sharpe proxy
-        wr_frac = r.win_rate / 100.0
-        pf = r.profit_factor if r.profit_factor < 100 else 1.0
-        # Simple proxy: (wr - 0.5) * pf acts as risk-adjusted return
-        sr_proxy = (wr_frac - 0.5) * pf * 10  # scaled to SR-like range
-        sharpe_proxies.append(sr_proxy)
+    if per_fold_daily_returns is not None and len(per_fold_daily_returns) >= 2:
+        # REAL SHARPE path: compute from daily returns.
+        sharpe_list: list[float] = []
+        skew_list: list[float] = []
+        kurt_list: list[float] = []
 
-    # Also include WF window-level metrics for richer sample
-    for w in wf_result.windows:
-        wr_frac = w.win_rate / 100.0
-        pf = w.profit_factor if w.profit_factor < 100 else 1.0
-        sr_proxy = (wr_frac - 0.5) * pf * 10
-        sharpe_proxies.append(sr_proxy)
+        for daily_rets in per_fold_daily_returns:
+            if len(daily_rets) < 5:
+                continue
+            sr = (
+                float(np.mean(daily_rets))
+                / (float(np.std(daily_rets, ddof=1)) + 1e-10)
+                * math.sqrt(annualization_factor)
+            )
+            sharpe_list.append(sr)
+            skew_list.append(float(sp_stats.skew(daily_rets)))
+            kurt_list.append(float(sp_stats.kurtosis(daily_rets, fisher=False)))
 
-    dsr = calculate_dsr(sharpe_proxies, n_trials=n_experiments)
+        avg_skew = float(np.mean(skew_list)) if skew_list else 0.0
+        avg_kurt = float(np.mean(kurt_list)) if kurt_list else 3.0
+
+        dsr = calculate_dsr(
+            sharpe_list,
+            n_trials=n_experiments,
+            skewness=avg_skew,
+            kurtosis=avg_kurt,
+        )
+        _log.info(
+            "DSR computed from REAL daily returns "
+            f"(skew={avg_skew:.3f}, kurt={avg_kurt:.3f})"
+        )
+    else:
+        # PROXY path (backward compat): build SR proxy from WR × PF.
+        sharpe_proxies: list[float] = []
+        for r in cv_results:
+            wr_frac = r.win_rate / 100.0
+            pf = r.profit_factor if r.profit_factor < 100 else 1.0
+            sr_proxy = (wr_frac - 0.5) * pf * 10
+            sharpe_proxies.append(sr_proxy)
+
+        for w in wf_result.windows:
+            wr_frac = w.win_rate / 100.0
+            pf = w.profit_factor if w.profit_factor < 100 else 1.0
+            sr_proxy = (wr_frac - 0.5) * pf * 10
+            sharpe_proxies.append(sr_proxy)
+
+        dsr = calculate_dsr(sharpe_proxies, n_trials=n_experiments)
 
     # --- PBO ---
     pbo = calculate_pbo(cv_results, metric="win_rate")

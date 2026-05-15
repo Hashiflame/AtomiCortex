@@ -133,7 +133,7 @@ class SessionVWAP:
     Added columns:
         session_vwap, price_vs_session_vwap, session_vwap_std,
         vwap_upper_band, vwap_lower_band, vwap_band_position,
-        session_volume_pct
+        session_cumulative_volume_ratio
     """
 
     def calculate(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -148,18 +148,34 @@ class SessionVWAP:
 
         typical = (pl.col("high") + pl.col("low") + pl.col("close")) / 3.0
 
-        df = df.with_columns([
+        df = df.with_columns(
             safe_divide(
                 (typical * pl.col("volume")).cum_sum().over("_date"),
                 pl.col("volume").cum_sum().over("_date"),
             ).alias("session_vwap"),
+        )
 
-            # Daily volume share (%) for current bar.
+        # --- Cumulative volume ratio (no lookahead) ---
+        # cum_vol_today / trailing 30-day average daily volume.
+        # Trailing avg uses a 720-bar rolling window on 1H (30 days × 24 bars),
+        # which intentionally looks back beyond the current day.
+        df = df.with_columns(
+            pl.col("volume").cum_sum().over("_date").alias("_cum_vol_today")
+        )
+        # Rolling mean of per-bar volume over trailing 720 bars as proxy for
+        # average daily volume: rolling_mean × 24 (bars/day on 1H).
+        # For other timeframes the ratio is still meaningful — it tracks
+        # intraday volume accumulation relative to recent history.
+        df = df.with_columns(
+            (pl.col("volume").rolling_mean(window_size=720).fill_null(pl.col("volume")) * 24.0)
+            .alias("_avg_daily_vol")
+        )
+        df = df.with_columns(
             safe_divide(
-                pl.col("volume"),
-                pl.col("volume").sum().over("_date"),
-            ).alias("session_volume_pct"),
-        ])
+                pl.col("_cum_vol_today"),
+                pl.col("_avg_daily_vol"),
+            ).alias("session_cumulative_volume_ratio")
+        )
 
         # Price vs VWAP (%).
         df = df.with_columns(
@@ -169,9 +185,29 @@ class SessionVWAP:
             ).alias("price_vs_session_vwap")
         )
 
-        # Intraday std of close prices.
+        # --- Expanding intraday std (no lookahead) ---
+        # For each bar compute std of close prices from the start of the
+        # current UTC day up to and including the current bar.
+        # Uses Welford-like identity: Var = E[X²] - E[X]² with Bessel
+        # correction.  cum_count().over() gives the expanding bar index.
+
+        # Compute expanding mean and expanding var within each day.
+        cum_close = pl.col("close").cum_sum().over("_date")
+        cum_close_sq = (pl.col("close") ** 2).cum_sum().over("_date")
+        bar_idx = pl.col("close").cum_count().over("_date").cast(pl.Float64)
+
+        expanding_mean = cum_close / bar_idx
+        # Var = E[X²] - E[X]² (population), then Bessel correction.
+        expanding_var_pop = cum_close_sq / bar_idx - expanding_mean ** 2
+        # Bessel correction: std = sqrt(var_pop * n / (n-1)); 0 if n < 2.
+        expanding_std = (
+            pl.when(bar_idx >= 2.0)
+            .then((expanding_var_pop * bar_idx / (bar_idx - 1.0)).clip(0.0, None).sqrt())
+            .otherwise(0.0)
+        )
+
         df = df.with_columns(
-            pl.col("close").std().over("_date").fill_null(0.0).alias("session_vwap_std")
+            expanding_std.fill_null(0.0).fill_nan(0.0).alias("session_vwap_std")
         )
 
         # Bands: vwap ± 1×std.
@@ -191,7 +227,9 @@ class SessionVWAP:
             .alias("vwap_band_position")
         )
 
-        df = df.drop([c for c in ["_date", "_ts"] if c in df.columns])
+        df = df.drop([c for c in ["_date", "_ts", "_cum_vol_today",
+                                   "_avg_daily_vol"]
+                       if c in df.columns])
         _log.debug("SessionVWAP.calculate: done")
         return df
 

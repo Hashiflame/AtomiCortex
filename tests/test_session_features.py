@@ -210,12 +210,20 @@ class TestSessionVWAP:
         assert (vals >= -4.0).all()
         assert (vals <= 4.0).all()
 
-    def test_session_volume_pct_sums_to_about_1(self) -> None:
-        """Daily volume % should sum to approximately 1.0."""
+    def test_session_cumulative_volume_ratio_positive(self) -> None:
+        """Cumulative volume ratio should be non-negative."""
         df = _1h_klines(24, start_hour=0)
         out = SessionVWAP().calculate(df)
-        total = out["session_volume_pct"].sum()
-        assert total == pytest.approx(1.0, abs=0.01)
+        assert "session_cumulative_volume_ratio" in out.columns
+        assert (out["session_cumulative_volume_ratio"] >= 0).all()
+
+    def test_session_cumulative_volume_ratio_increases_intraday(self) -> None:
+        """Cumulative volume ratio should generally increase within a day."""
+        df = _1h_klines(24, start_hour=0)
+        out = SessionVWAP().calculate(df)
+        ratios = out["session_cumulative_volume_ratio"].to_list()
+        # First few bars should be smaller than last bars
+        assert ratios[0] < ratios[-1]
 
     def test_vwap_bands_symmetric(self) -> None:
         """Upper band - vwap == vwap - lower band."""
@@ -225,6 +233,39 @@ class TestSessionVWAP:
         lower_dist = (out["session_vwap"] - out["vwap_lower_band"]).to_list()
         for u, l in zip(upper_dist, lower_dist):
             assert u == pytest.approx(l, abs=1e-6)
+
+    def test_session_vwap_std_no_lookahead(self) -> None:
+        """std at bar t must NOT equal full-day std.
+
+        The old implementation used ``close.std().over('_date')`` which
+        computed the std over **all** bars of the day — a lookahead bug.
+        The fix uses expanding (cumulative) std so each bar only sees
+        bars up to and including itself.
+        """
+        df = _1h_klines(24, start_hour=0)  # 1 full day
+        out = SessionVWAP().calculate(df)
+
+        stds = out["session_vwap_std"].to_list()
+        # Full-day std (what the old code produced) — identical for every bar.
+        import numpy as np
+        full_day_std = float(np.std(out["close"].to_numpy(), ddof=1))
+
+        # With expanding std the mid-day bars must differ from full_day_std.
+        mid = len(stds) // 2  # bar 12
+        assert stds[mid] != pytest.approx(full_day_std, rel=0.01), (
+            "Mid-day expanding std should NOT equal the full-day std "
+            "(that would indicate lookahead)"
+        )
+
+        # Additionally, std should grow as the day progresses
+        # (more data → std converges to true value).
+        assert stds[2] < stds[-1] or stds[2] == pytest.approx(stds[-1], rel=0.3)
+
+    def test_session_vwap_std_first_bar_zero(self) -> None:
+        """First bar of the day has only 1 data point → std must be 0."""
+        df = _1h_klines(24, start_hour=0)
+        out = SessionVWAP().calculate(df)
+        assert out["session_vwap_std"][0] == pytest.approx(0.0, abs=1e-9)
 
 
 # ═══════════════════════════════════════════════════════════════
