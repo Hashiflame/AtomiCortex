@@ -101,6 +101,10 @@ class ValidationResult:
     wf_windows_profitable: int
     fee_multiplier: float
     avg_return_per_trade: float
+    signal_coverage: float = 0.0
+    avg_confidence: float = 0.0
+    suggested_threshold: float = 0.0
+    suggested_coverage: float = 0.0
     # Statistical tests
     dsr: float = 0.0
     pbo: float = 1.0
@@ -129,6 +133,27 @@ def _check(value: float, threshold: float, higher_better: bool = True) -> str:
     return "✓" if value <= threshold else "✗"
 
 
+def suggest_confidence_threshold(
+    proba: np.ndarray,
+    min_coverage: float = 0.10,  # at least 10% of bars should trade
+    max_coverage: float = 0.40,  # at most 40%
+) -> float:
+    """Suggest a confidence threshold from the OOS proba distribution.
+
+    Finds the highest threshold T in [0.52, 0.70] such that the
+    two-sided coverage P(proba >= T or proba <= 1-T) lands within
+    [min_coverage, max_coverage]. Informational only — does not
+    change gate logic; the user decides whether to update the config.
+    """
+    if proba.ndim != 1:
+        return 0.55
+    for threshold in np.arange(0.70, 0.51, -0.01):
+        coverage = float(np.mean((proba >= threshold) | (proba <= 1 - threshold)))
+        if min_coverage <= coverage <= max_coverage:
+            return round(float(threshold), 2)
+    return 0.55  # fallback
+
+
 # ---------------------------------------------------------------------------
 # Purged K-Fold CV (adapted for 1H pre-built datasets)
 # ---------------------------------------------------------------------------
@@ -149,7 +174,7 @@ def _run_purged_kfold(
         symbols=[symbol],
         forward_bars=_CFG.forward_bars,
         threshold_atr_multiplier=_CFG.atr_threshold_multiplier,
-        confidence_threshold=0.35,
+        confidence_threshold=_CFG.confidence_threshold,
     )
 
     cv = PurgedKFoldCV(n_splits=n_splits, embargo_pct=embargo_pct)
@@ -165,6 +190,7 @@ def _run_purged_kfold(
                 config=config,
                 features_dir=Path("."),
                 models_dir=Path("data/models/1h"),
+                use_mtf_params=True,  # DSR/PBO on production reg. params
             )
             model = trainer.train(train_df)
             result = trainer.evaluate(model, test_df)
@@ -193,7 +219,7 @@ def _run_walk_forward(
         symbols=[symbol],
         forward_bars=_CFG.forward_bars,
         threshold_atr_multiplier=_CFG.atr_threshold_multiplier,
-        confidence_threshold=0.35,
+        confidence_threshold=_CFG.confidence_threshold,
     )
 
     if "open_time" not in df.columns:
@@ -237,6 +263,7 @@ def _run_walk_forward(
                 config=config,
                 features_dir=Path("."),
                 models_dir=Path("data/models/1h"),
+                use_mtf_params=True,  # DSR/PBO on production reg. params
             )
             model = trainer.train(train_df)
             result = trainer.evaluate(model, test_df)
@@ -296,25 +323,41 @@ def _compute_oos_metrics(
 
     proba = booster.predict(X_oos)
 
+    # Binary confidence gate: proba = P(UP). 0.5 is the random baseline
+    # (ML-017), so max(p, 1-p) is always >= 0.5 — a sub-0.5 threshold
+    # never filters. Trade only when the model is confident on one side.
+    conf_threshold = _CFG.confidence_threshold
+
     if proba.ndim == 1:
-        # Binary: proba = P(class=1=UP)
-        y_pred_up_prob = proba
-        y_pred_direction = np.where(proba >= 0.5, 1, -1)
-        max_proba = np.maximum(proba, 1.0 - proba)
+        up_mask = proba >= conf_threshold
+        down_mask = proba <= (1.0 - conf_threshold)
+        signal_mask = up_mask | down_mask
+        y_pred_direction = np.where(up_mask, 1, np.where(down_mask, -1, 0))
+        confidence = np.maximum(proba, 1.0 - proba)
     else:
         # Legacy multiclass fallback
         y_pred_class = np.argmax(proba, axis=1)
         y_pred_direction = np.array([CLASS_TO_LABEL[int(c)] for c in y_pred_class])
-        max_proba = np.max(proba, axis=1)
+        confidence = np.max(proba, axis=1)
+        signal_mask = (confidence >= conf_threshold) & (y_pred_direction != 0)
 
     future_returns = oos_df["future_return"].to_numpy()
-
-    # Signal fires when confidence >= 0.35 AND direction is non-zero
-    signal_mask = (max_proba >= 0.35) & (y_pred_direction != 0)
 
     signal_preds = y_pred_direction[signal_mask]
     signal_returns = future_returns[signal_mask]
     n_signals = int(signal_mask.sum())
+    n_bars = len(signal_mask)
+    signal_coverage = n_signals / n_bars * 100 if n_bars else 0.0
+    avg_confidence = (
+        float(confidence[signal_mask].mean()) * 100 if n_signals > 0 else 0.0
+    )
+    suggested_threshold = suggest_confidence_threshold(proba)
+    if proba.ndim == 1:
+        suggested_coverage = float(np.mean(
+            (proba >= suggested_threshold) | (proba <= 1 - suggested_threshold)
+        )) * 100
+    else:
+        suggested_coverage = 0.0
 
     if n_signals > 0:
         correct = (signal_preds * signal_returns) > 0
@@ -368,6 +411,10 @@ def _compute_oos_metrics(
         "n_trades": n_signals,
         "fee_multiplier": round(fee_multiplier, 1),
         "avg_return_per_trade": round(avg_return, 2),
+        "signal_coverage": round(signal_coverage, 1),
+        "avg_confidence": round(avg_confidence, 1),
+        "suggested_threshold": suggested_threshold,
+        "suggested_coverage": round(suggested_coverage, 1),
     }
 
 
@@ -441,6 +488,10 @@ def validate_model(
         wf_windows_profitable=n_prof,
         fee_multiplier=oos["fee_multiplier"],
         avg_return_per_trade=oos["avg_return_per_trade"],
+        signal_coverage=oos["signal_coverage"],
+        avg_confidence=oos["avg_confidence"],
+        suggested_threshold=oos["suggested_threshold"],
+        suggested_coverage=oos["suggested_coverage"],
         dsr=dsr,
         pbo=pbo,
         t_stat=t_stat,
@@ -480,6 +531,19 @@ def print_validation_report(results: dict[str, ValidationResult | None]) -> None
         print(
             f"    OOS trades:     {result.n_trades:>6}  "
             f"{_check(result.n_trades, min_trades)} (>= {min_trades})"
+        )
+        print(
+            f"    Signal coverage:{result.signal_coverage:>5.1f}%  "
+            f"(bars with a signal; ~100% means gate not filtering)"
+        )
+        print(
+            f"    Avg confidence: {result.avg_confidence:>5.1f}%  "
+            f"(mean max(p,1-p) on signal bars)"
+        )
+        print(
+            f"    Suggested threshold: {result.suggested_threshold:.2f}  "
+            f"(coverage: {result.suggested_coverage:.1f}%)  "
+            f"[informational — config unchanged]"
         )
         print(
             f"    WF windows:     {result.wf_windows_profitable}/{result.wf_windows_total} "

@@ -48,6 +48,35 @@ LABEL_TO_CLASS: dict[int, int] = {-1: 0, 1: 1}
 CLASS_TO_LABEL: dict[int, int] = {v: k for k, v in LABEL_TO_CLASS.items()}
 
 
+# Stricter regularization profile for MTF (1H / 15m) models.
+# These models overfit with the default params (train WR ~67% vs OOS ~50%
+# after the lookahead fix), so constrain tree complexity, add L1/L2, slow
+# the learning rate and lean on early stopping. 4H keeps ModelConfig
+# defaults — do NOT route 4H through this profile.
+MTF_LGBM_PARAMS: dict[str, Any] = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "verbose": -1,
+    # Complexity ceiling — primary overfit control
+    "num_leaves": 15,          # default 31
+    "max_depth": 4,
+    "min_child_samples": 50,   # default 20
+    # Feature / data subsampling
+    "feature_fraction": 0.7,   # default 0.8
+    "bagging_fraction": 0.7,   # default 0.8
+    "bagging_freq": 5,
+    # Regularization
+    "lambda_l1": 0.1,
+    "lambda_l2": 0.1,
+    "min_gain_to_split": 0.01,
+    # Slower learning, more trees, early stopping
+    "learning_rate": 0.03,     # default 0.05
+    "n_estimators": 500,       # default 200
+    "early_stopping_rounds": 50,
+    "random_state": 42,
+}
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -130,8 +159,13 @@ class LGBMTrainer:
         config: ModelConfig,
         features_dir: Path,
         models_dir: Path,
+        use_mtf_params: bool = False,
     ) -> None:
         self.config = config
+        # When True, train() uses the stricter MTF_LGBM_PARAMS profile
+        # instead of config.lgbm_params (1H/15m anti-overfit). 4H stays
+        # on defaults (use_mtf_params=False).
+        self.use_mtf_params = use_mtf_params
         self.features_dir = Path(features_dir)
         self.models_dir = Path(models_dir)
         self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -269,12 +303,23 @@ class LGBMTrainer:
             reference=train_data,
         )
 
-        # Extract n_estimators from params (lgb.train uses num_boost_round)
-        params = {k: v for k, v in self.config.lgbm_params.items() if k != "n_estimators"}
-        num_rounds = self.config.lgbm_params.get("n_estimators", 200)
+        # MTF profile (1H/15m) uses stricter regularization; 4H uses
+        # config.lgbm_params defaults.
+        raw_params = MTF_LGBM_PARAMS if self.use_mtf_params else self.config.lgbm_params
+        # n_estimators / early_stopping_rounds are not lgb.train params:
+        # the former maps to num_boost_round, the latter to a callback.
+        params = {
+            k: v for k, v in raw_params.items()
+            if k not in ("n_estimators", "early_stopping_rounds")
+        }
+        num_rounds = raw_params.get("n_estimators", 200)
+        stopping_rounds = raw_params.get("early_stopping_rounds", 50)
+
+        if self.use_mtf_params:
+            _log.info("Using MTF_LGBM_PARAMS (stricter regularization profile)")
 
         callbacks = [
-            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.early_stopping(stopping_rounds=stopping_rounds, verbose=False),
             lgb.log_evaluation(period=0),  # suppress per-iteration output
         ]
 

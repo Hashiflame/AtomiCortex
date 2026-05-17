@@ -92,6 +92,7 @@ def train_regime_model(
         config=config,
         features_dir=dataset_path.parent,
         models_dir=models_dir,
+        use_mtf_params=True,  # stricter regularization for 1H (anti-overfit)
     )
 
     # Split: walk-forward style (80% train / 20% test, temporal)
@@ -215,6 +216,7 @@ def run_walk_forward_validation(
                 config=config,
                 features_dir=dataset_path.parent,
                 models_dir=models_dir,
+                use_mtf_params=True,  # stricter regularization for 1H (anti-overfit)
             )
             model = trainer.train(train_df)
             result = trainer.evaluate(model, test_df)
