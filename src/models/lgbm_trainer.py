@@ -57,22 +57,29 @@ MTF_LGBM_PARAMS: dict[str, Any] = {
     "objective": "binary",
     "metric": "binary_logloss",
     "verbose": -1,
-    # Complexity ceiling — primary overfit control
-    "num_leaves": 15,          # default 31
-    "max_depth": 4,
-    "min_child_samples": 50,   # default 20
-    # Feature / data subsampling
-    "feature_fraction": 0.7,   # default 0.8
-    "bagging_fraction": 0.7,   # default 0.8
-    "bagging_freq": 5,
+    # Tree complexity ceiling
+    "num_leaves": 25,
+    "max_depth": 5,
+    # Feature subsampling — strongest regularizer vs noisy financial
+    # features (75% of features considered per tree).
+    "feature_fraction": 0.75,
+    "feature_fraction_seed": 42,
+    # Data subsampling (bagging) — 80% of rows per tree, every iteration.
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "bagging_seed": 42,
     # Regularization
-    "lambda_l1": 0.1,
-    "lambda_l2": 0.1,
+    "lambda_l1": 0.05,
+    "lambda_l2": 0.05,
     "min_gain_to_split": 0.01,
-    # Slower learning, more trees, early stopping
-    "learning_rate": 0.03,     # default 0.05
-    "n_estimators": 500,       # default 200
-    "early_stopping_rounds": 50,
+    # More trees + slower LR — early stopping (100 rounds) decides the
+    # actual stopping point, so n_estimators is just an upper bound.
+    "n_estimators": 2000,      # was 500 — early stopping caps it
+    "learning_rate": 0.02,     # was 0.03 — slightly slower
+    "early_stopping_rounds": 100,  # patient — financial data is noisy
+    # Default leaf size (1H ≈ 8k train rows). Overridden per-timeframe
+    # via LGBMTrainer(min_child_samples=...): 1H=30, 15m=20.
+    "min_child_samples": 30,
     "random_state": 42,
 }
 
@@ -160,12 +167,17 @@ class LGBMTrainer:
         features_dir: Path,
         models_dir: Path,
         use_mtf_params: bool = False,
+        min_child_samples: int | None = None,
     ) -> None:
         self.config = config
         # When True, train() uses the stricter MTF_LGBM_PARAMS profile
         # instead of config.lgbm_params (1H/15m anti-overfit). 4H stays
         # on defaults (use_mtf_params=False).
         self.use_mtf_params = use_mtf_params
+        # Per-timeframe leaf-size override for the MTF profile only
+        # (1H=30, 15m=20). None → keep MTF_LGBM_PARAMS default. Ignored
+        # when use_mtf_params=False (4H untouched).
+        self.min_child_samples = min_child_samples
         self.features_dir = Path(features_dir)
         self.models_dir = Path(models_dir)
         self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -275,8 +287,11 @@ class LGBMTrainer:
         self._feature_columns = feature_names
         _log.info(f"Feature columns ({len(feature_names)}): {feature_names[:5]}...")
 
-        # Validation set: last 10% of training data (temporal)
-        val_split = int(len(X_train) * 0.9)
+        # Validation set for early stopping (temporal, from train — NOT
+        # the OOS test set). MTF profile uses the last 15% (noisier
+        # financial features → larger, more stable val); 4H keeps 10%.
+        val_frac = 0.85 if self.use_mtf_params else 0.90
+        val_split = int(len(X_train) * val_frac)
         X_val = X_train[val_split:]
         y_val = y_train[val_split:]
         X_train_fit = X_train[:val_split]
@@ -316,7 +331,13 @@ class LGBMTrainer:
         stopping_rounds = raw_params.get("early_stopping_rounds", 50)
 
         if self.use_mtf_params:
-            _log.info("Using MTF_LGBM_PARAMS (stricter regularization profile)")
+            if self.min_child_samples is not None:
+                params["min_child_samples"] = self.min_child_samples
+            _log.info(
+                "Using MTF_LGBM_PARAMS (stricter regularization profile, "
+                f"min_child_samples={params.get('min_child_samples')}, "
+                f"val_frac={1 - val_frac:.0%}, early_stop={stopping_rounds})"
+            )
 
         callbacks = [
             lgb.early_stopping(stopping_rounds=stopping_rounds, verbose=False),
