@@ -32,6 +32,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.configs.strategy_1h import MLStrategyConfig1H
+from src.features.derivatives import add_funding_features, add_oi_features
 from src.features.feature_pipeline import FeaturePipeline
 from src.features.microstructure import (
     add_cvd_features,
@@ -39,6 +40,7 @@ from src.features.microstructure import (
     add_volume_features,
 )
 from src.features.regime_detector import RegimeDetector, RegimeDetector1H
+from src.ingestion.data_store import DataStore
 from src.logger import get_logger, setup_logging
 
 _log = get_logger(__name__)
@@ -93,6 +95,40 @@ def _load_klines(
     return pl.DataFrame()
 
 
+def _load_derivatives(
+    data_dir: Path,
+    raw_dir: Path,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Load funding_rate + metrics via DataStore (same logic as 4H build).
+
+    Tries ``data_dir`` first, then ``raw_dir`` (DataStore convention:
+    ``<root>/exchange=BINANCE_UM/symbol={symbol}/{funding_rate,metrics}``).
+    Returns ``(funding_df, metrics_df)`` — empty frames when absent;
+    add_funding_features/add_oi_features zero-fill gracefully downstream.
+    """
+    funding_df, metrics_df = pl.DataFrame(), pl.DataFrame()
+    for root in (data_dir, raw_dir):
+        store = DataStore(root)
+        if funding_df.is_empty():
+            try:
+                funding_df = store.get_funding_rate(symbol, start, end)
+            except Exception as exc:
+                _log.warning(f"get_funding_rate failed for {root}: {exc}")
+        if metrics_df.is_empty():
+            try:
+                metrics_df = store.get_metrics(symbol, start, end)
+            except Exception as exc:
+                _log.warning(f"get_metrics failed for {root}: {exc}")
+    _log.info(
+        f"Derivatives: funding={len(funding_df):,} rows, "
+        f"metrics={len(metrics_df):,} rows"
+    )
+    return funding_df, metrics_df
+
+
 # ---------------------------------------------------------------------------
 # Feature pipeline
 # ---------------------------------------------------------------------------
@@ -101,6 +137,9 @@ def build_feature_matrix(
     df_1h: pl.DataFrame,
     df_4h: pl.DataFrame,
     symbol: str,
+    *,
+    funding_df: pl.DataFrame | None = None,
+    metrics_df: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Build full feature matrix for 1H data.
 
@@ -124,6 +163,15 @@ def build_feature_matrix(
     df_1h = add_cvd_features(df_1h)
     df_1h = add_volume_features(df_1h)
     df_1h = add_price_features(df_1h)
+
+    # 2b. Derivatives (funding + OI) — base columns for MTF momentum
+    # features. add_* zero-fill when data is empty (fail-soft).
+    df_1h = add_funding_features(
+        df_1h, funding_df if funding_df is not None else pl.DataFrame()
+    )
+    df_1h = add_oi_features(
+        df_1h, metrics_df if metrics_df is not None else pl.DataFrame()
+    )
 
     # 3. Regime detection (1H-tuned parameters)
     detector = RegimeDetector1H()
@@ -388,9 +436,18 @@ def main() -> None:
         _log.warning("No 4H data — MTF context features will be absent")
         df_4h = pl.DataFrame()
 
+    # 2c. Load derivatives (funding + OI) via DataStore
+    _log.info("Loading funding + metrics (derivatives)...")
+    funding_df, metrics_df = _load_derivatives(
+        args.data_dir, args.raw_dir, symbol, start, end
+    )
+
     # 3. Build feature matrix
     _log.info("Building feature matrix...")
-    df = build_feature_matrix(df_1h, df_4h, symbol)
+    df = build_feature_matrix(
+        df_1h, df_4h, symbol,
+        funding_df=funding_df, metrics_df=metrics_df,
+    )
 
     if df.is_empty():
         print("ERROR: Feature matrix is empty after processing.")

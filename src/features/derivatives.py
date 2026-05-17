@@ -535,3 +535,141 @@ def compute_sentiment_features(
         "ls_divergence": float(ls_divergence),
         "sentiment_score": float(sentiment_score),
     }
+
+
+# =============================================================================
+# MTF derived features (1H / 15m only) — appended for the post-lookahead
+# feature expansion. These build on columns produced by the *existing*
+# add_funding_features / add_oi_features / add_cvd_features functions and
+# are wired into FeaturePipeline.build_mtf() for 1h/15m. They do not run
+# on the 4H pipeline. Only shift/rolling/diff ops — no .over("_date").
+# =============================================================================
+
+
+def add_funding_momentum_features(
+    df: pl.DataFrame,
+    zscore_window: int = 72,  # 72 bars × 1H = 3 days
+) -> pl.DataFrame:
+    """Funding-rate momentum: change is more predictive than level.
+
+    Requires ``funding_rate`` (from add_funding_features; zero-filled if
+    no funding data). Added columns: funding_rate_change_1,
+    funding_rate_change_3, funding_rate_zscore_rolling,
+    funding_rate_acceleration.
+    """
+    if "funding_rate" not in df.columns:
+        return df.with_columns([
+            pl.lit(0.0).alias("funding_rate_change_1"),
+            pl.lit(0.0).alias("funding_rate_change_3"),
+            pl.lit(0.0).alias("funding_rate_zscore_rolling"),
+            pl.lit(0.0).alias("funding_rate_acceleration"),
+        ])
+
+    fr = pl.col("funding_rate")
+    df = df.with_columns([
+        (fr - fr.shift(1)).fill_null(0.0).fill_nan(0.0).alias("funding_rate_change_1"),
+        (fr - fr.shift(3)).fill_null(0.0).fill_nan(0.0).alias("funding_rate_change_3"),
+    ])
+    roll_mean = fr.rolling_mean(window_size=zscore_window, min_periods=10)
+    roll_std = fr.rolling_std(window_size=zscore_window, min_periods=10)
+    df = df.with_columns(
+        safe_divide(fr - roll_mean, roll_std).alias("funding_rate_zscore_rolling")
+    )
+    df = df.with_columns(
+        (pl.col("funding_rate_change_1") - pl.col("funding_rate_change_1").shift(1))
+        .fill_null(0.0).fill_nan(0.0)
+        .alias("funding_rate_acceleration")
+    )
+    _log.debug("add_funding_momentum_features: done")
+    return df
+
+
+def add_oi_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Open-interest momentum + price/OI divergence.
+
+    Requires ``oi_value`` (from add_oi_features; zero-filled if no metrics)
+    and ``returns_1`` (from add_price_features). Vectorized columns use a
+    ``_vec`` suffix to avoid colliding with the scalar live-enrichment
+    names (oi_acceleration / oi_price_divergence).
+
+    Added columns: oi_delta_1h, oi_accel_vec, oi_price_div_vec.
+    """
+    if "oi_value" not in df.columns:
+        return df.with_columns([
+            pl.lit(0.0).alias("oi_delta_1h"),
+            pl.lit(0.0).alias("oi_accel_vec"),
+            pl.lit(0).cast(pl.Int8).alias("oi_price_div_vec"),
+        ])
+
+    df = df.with_columns(
+        safe_divide(
+            pl.col("oi_value") - pl.col("oi_value").shift(1),
+            pl.col("oi_value").shift(1),
+        ).alias("oi_delta_1h")
+    )
+    df = df.with_columns(
+        (pl.col("oi_delta_1h") - pl.col("oi_delta_1h").shift(1))
+        .fill_null(0.0).fill_nan(0.0)
+        .alias("oi_accel_vec")
+    )
+
+    # Divergence on returns_1 (log return) vs OI direction:
+    #   +1  price up   & OI down  (weak/unsupported move)
+    #   -1  price down  & OI down  (panic / potential reversal)
+    #    0  price & OI aligned
+    price_ret = pl.col("returns_1") if "returns_1" in df.columns else pl.lit(0.0)
+    price_up = price_ret > 0
+    oi_down = pl.col("oi_delta_1h") < 0
+    df = df.with_columns(
+        pl.when(price_up & oi_down).then(1)
+        .when(~price_up & oi_down).then(-1)
+        .otherwise(0)
+        .cast(pl.Int8)
+        .alias("oi_price_div_vec")
+    )
+    _log.debug("add_oi_derived_features: done")
+    return df
+
+
+def add_cvd_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """CVD slope (volume-normalized) + hidden-flow divergence.
+
+    Requires ``cvd`` (from add_cvd_features), ``volume_sma_20``
+    (from add_volume_features), ``returns_1`` (from add_price_features).
+
+    Added columns: cvd_slope_3bar, cvd_slope_6bar, cvd_divergence.
+    """
+    if "cvd" not in df.columns:
+        return df.with_columns([
+            pl.lit(0.0).alias("cvd_slope_3bar"),
+            pl.lit(0.0).alias("cvd_slope_6bar"),
+            pl.lit(0).cast(pl.Int8).alias("cvd_divergence"),
+        ])
+
+    vol_norm = (
+        pl.col("volume_sma_20")
+        if "volume_sma_20" in df.columns
+        else pl.col("volume")
+    )
+    df = df.with_columns([
+        safe_divide(pl.col("cvd") - pl.col("cvd").shift(3), vol_norm)
+        .alias("cvd_slope_3bar"),
+        safe_divide(pl.col("cvd") - pl.col("cvd").shift(6), vol_norm)
+        .alias("cvd_slope_6bar"),
+    ])
+
+    # Hidden-flow divergence:
+    #   +1  price up   & cvd_slope_3bar < 0  (hidden sellers — bearish)
+    #   -1  price down & cvd_slope_3bar > 0  (hidden buyers — bullish)
+    #    0  otherwise
+    price_ret = pl.col("returns_1") if "returns_1" in df.columns else pl.lit(0.0)
+    price_up = price_ret > 0
+    df = df.with_columns(
+        pl.when(price_up & (pl.col("cvd_slope_3bar") < 0)).then(1)
+        .when(~price_up & (pl.col("cvd_slope_3bar") > 0)).then(-1)
+        .otherwise(0)
+        .cast(pl.Int8)
+        .alias("cvd_divergence")
+    )
+    _log.debug("add_cvd_derived_features: done")
+    return df

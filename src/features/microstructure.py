@@ -213,3 +213,146 @@ def compute_vpin(
     if _math.isnan(vpin) or _math.isinf(vpin):
         return 0.5
     return float(max(0.0, min(1.0, vpin)))
+
+
+# =============================================================================
+# MTF derived features (1H / 15m only) — appended for the post-lookahead
+# feature expansion. Wired into FeaturePipeline.build_mtf() for 1h/15m;
+# never run on the 4H pipeline. Only ewm/rolling/shift/diff ops.
+# =============================================================================
+
+
+def _atr_abs(df: pl.DataFrame) -> pl.Expr:
+    """Absolute ATR proxy. RegimeDetector emits atr_pct (= ATR/price),
+    there is no atr_14 column → reconstruct atr_abs = atr_pct * close.
+    Falls back to 1% of close when atr_pct is unavailable.
+    """
+    if "atr_pct" in df.columns:
+        return (pl.col("atr_pct") * pl.col("close")).clip(lower_bound=1e-10)
+    return (pl.col("close") * 0.01).clip(lower_bound=1e-10)
+
+
+def add_ema_slope_features(df: pl.DataFrame) -> pl.DataFrame:
+    """EMA-difference ratios normalized by ATR (scale-free for LightGBM).
+
+    Required: close (+ atr_pct for normalization). Added columns:
+    ema9, ema21, ema9_slope_normalized, ema21_slope_normalized,
+    ema9_cross_ema21, ema9_cross_ema21_change.
+    """
+    if "ema9" not in df.columns:
+        df = df.with_columns(
+            pl.col("close").ewm_mean(span=9, ignore_nulls=True).alias("ema9")
+        )
+    if "ema21" not in df.columns:
+        df = df.with_columns(
+            pl.col("close").ewm_mean(span=21, ignore_nulls=True).alias("ema21")
+        )
+
+    atr_abs = _atr_abs(df)
+    df = df.with_columns([
+        safe_divide(pl.col("ema9") - pl.col("ema9").shift(3), atr_abs)
+        .alias("ema9_slope_normalized"),
+        safe_divide(pl.col("ema21") - pl.col("ema21").shift(3), atr_abs)
+        .alias("ema21_slope_normalized"),
+        safe_divide(pl.col("ema9") - pl.col("ema21"), atr_abs)
+        .alias("ema9_cross_ema21"),
+    ])
+    df = df.with_columns(
+        (pl.col("ema9_cross_ema21") - pl.col("ema9_cross_ema21").shift(1))
+        .fill_null(0.0).fill_nan(0.0)
+        .alias("ema9_cross_ema21_change")
+    )
+    _log.debug("add_ema_slope_features: done")
+    return df
+
+
+def add_volume_session_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Volume relative to the same-hour historical average (no lookahead).
+
+    Required: open_time, volume. Added columns: volume_vs_session_avg,
+    volume_momentum_3bar.
+
+    ``volume_vs_session_avg`` divides current volume by the trailing
+    20-observation mean of volume at the *same hour of day*, computed
+    from prior bars only (shift(1) before the rolling mean), so it never
+    uses the current or future bars.
+    """
+    df = df.sort("open_time")
+    df = df.with_columns(
+        pl.from_epoch(pl.col("open_time"), time_unit="ms").dt.hour().alias("_hour_vsa")
+    )
+    hist_same_hour = (
+        pl.col("volume").shift(1)
+        .rolling_mean(window_size=20, min_periods=1)
+        .over("_hour_vsa")
+    )
+    df = df.with_columns(
+        safe_divide(pl.col("volume"), hist_same_hour, fill=1.0)
+        .alias("volume_vs_session_avg")
+    )
+    prior_3_mean = pl.mean_horizontal(
+        pl.col("volume").shift(1),
+        pl.col("volume").shift(2),
+        pl.col("volume").shift(3),
+    )
+    df = df.with_columns(
+        safe_divide(pl.col("volume"), prior_3_mean, fill=1.0)
+        .alias("volume_momentum_3bar")
+    )
+    df = df.drop("_hour_vsa")
+    _log.debug("add_volume_session_features: done")
+    return df
+
+
+def _efficiency_ratio(window: int) -> pl.Expr:
+    """Kaufman fractal efficiency over *window* bars, clamped to [0, 1]."""
+    net_move = (pl.col("close") - pl.col("close").shift(window)).abs()
+    path = pl.col("close").diff().abs().rolling_sum(window_size=window)
+    return safe_divide(net_move, path).clip(0.0, 1.0)
+
+
+def add_fractal_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Fractal efficiency ratio: trend (≈1) vs choppy (≈0).
+
+    Required: close. Added columns: efficiency_ratio_10,
+    efficiency_ratio_20.
+    """
+    df = df.with_columns([
+        _efficiency_ratio(10).fill_null(0.0).fill_nan(0.0).alias("efficiency_ratio_10"),
+        _efficiency_ratio(20).fill_null(0.0).fill_nan(0.0).alias("efficiency_ratio_20"),
+    ])
+    _log.debug("add_fractal_features: done")
+    return df
+
+
+def add_candle_structure_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Volatility-normalized candle anatomy.
+
+    Required: open, high, low, close. Added columns: candle_range,
+    candle_body, candle_body_pct, upper_wick_pct, lower_wick_pct,
+    candle_direction.
+    """
+    rng = pl.col("high") - pl.col("low")
+    body = (pl.col("close") - pl.col("open")).abs()
+    hi_body = pl.max_horizontal(pl.col("open"), pl.col("close"))
+    lo_body = pl.min_horizontal(pl.col("open"), pl.col("close"))
+
+    df = df.with_columns([
+        rng.alias("candle_range"),
+        body.alias("candle_body"),
+    ])
+    df = df.with_columns([
+        safe_divide(pl.col("candle_body"), pl.col("candle_range"))
+        .alias("candle_body_pct"),
+        safe_divide(pl.col("high") - hi_body, pl.col("candle_range"))
+        .alias("upper_wick_pct"),
+        safe_divide(lo_body - pl.col("low"), pl.col("candle_range"))
+        .alias("lower_wick_pct"),
+        pl.when(pl.col("close") > pl.col("open")).then(1)
+        .when(pl.col("close") < pl.col("open")).then(-1)
+        .otherwise(0)
+        .cast(pl.Int8)
+        .alias("candle_direction"),
+    ])
+    _log.debug("add_candle_structure_features: done")
+    return df

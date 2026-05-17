@@ -15,13 +15,20 @@ import polars as pl
 
 from src.features.derivatives import (
     add_basis_features,
+    add_cvd_derived_features,
     add_funding_features,
+    add_funding_momentum_features,
+    add_oi_derived_features,
     add_oi_features,
 )
 from src.features.microstructure import (
+    add_candle_structure_features,
     add_cvd_features,
+    add_ema_slope_features,
+    add_fractal_features,
     add_price_features,
     add_volume_features,
+    add_volume_session_features,
 )
 from src.features.regime_detector import RegimeDetector
 from src.logger import get_logger
@@ -145,6 +152,33 @@ FEATURE_GROUPS_MTF: dict[str, list[str]] = {
         "htf_4h_hurst", "htf_4h_atr_pct",
         "price_vs_4h_ema20", "mtf_1h_4h_aligned",
         "mtf_alignment_score", "htf_4h_last_n_bars_dir",
+    ],
+    # Research-backed derived features (1H / 15m only, post-lookahead
+    # expansion). Vectorized OI features use _vec suffix to avoid
+    # colliding with the scalar live-enrichment names.
+    "alpha_v2": [
+        # derivatives — funding momentum
+        "funding_rate_change_1", "funding_rate_change_3",
+        "funding_rate_zscore_rolling", "funding_rate_acceleration",
+        # derivatives — OI derived
+        "oi_delta_1h", "oi_accel_vec", "oi_price_div_vec",
+        # derivatives — CVD derived
+        "cvd_slope_3bar", "cvd_slope_6bar", "cvd_divergence",
+        # microstructure — EMA slopes
+        "ema9", "ema21", "ema9_slope_normalized",
+        "ema21_slope_normalized", "ema9_cross_ema21",
+        "ema9_cross_ema21_change",
+        # microstructure — volume vs session
+        "volume_vs_session_avg", "volume_momentum_3bar",
+        # microstructure — fractal efficiency
+        "efficiency_ratio_10", "efficiency_ratio_20",
+        # microstructure — candle structure
+        "candle_range", "candle_body", "candle_body_pct",
+        "upper_wick_pct", "lower_wick_pct", "candle_direction",
+        # session momentum + VWAP slope
+        "session_open_return", "session_momentum_3bar",
+        "session_return_cumulative", "vwap_slope_3bar",
+        "vwap_slope_6bar", "price_above_vwap",
     ],
 }
 
@@ -310,6 +344,23 @@ class FeaturePipeline:
             df = MondayAsiaEffect().detect(df)
             _log.info(f"Added session features for {self.interval}")
 
+        # Alpha-v2 derived features: 1H / 15m only (research-backed,
+        # post-lookahead expansion). Base columns (funding_rate,
+        # oi_value, cvd, atr_pct, returns_1) are produced upstream by
+        # the build scripts before build_mtf().
+        if self.interval in ("1h", "15m"):
+            from src.features.session_features import SessionMomentum
+
+            df = add_funding_momentum_features(df)
+            df = add_oi_derived_features(df)
+            df = add_cvd_derived_features(df)
+            df = add_ema_slope_features(df)
+            df = add_volume_session_features(df)
+            df = add_fractal_features(df)
+            df = add_candle_structure_features(df)
+            df = SessionMomentum().calculate(df)
+            _log.info(f"Added alpha-v2 features for {self.interval}")
+
         # 1H: add 4H HTF context.
         if self.interval == "1h" and df_htf_4h is not None:
             from src.features.mtf_context import MTFContextBuilder
@@ -340,4 +391,5 @@ class FeaturePipeline:
             names += FEATURE_GROUPS_MTF.get("orb", [])
         if self.interval in ("1h", "15m"):
             names += FEATURE_GROUPS_MTF.get("mtf_context", [])
+            names += FEATURE_GROUPS_MTF.get("alpha_v2", [])
         return names

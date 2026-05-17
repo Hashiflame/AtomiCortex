@@ -395,3 +395,96 @@ class MondayAsiaEffect:
         df = df.drop([c for c in ["_ts"] if c in df.columns])
         _log.debug("MondayAsiaEffect.detect: done")
         return df
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. SessionMomentum  (appended — post-lookahead feature expansion)
+# ═══════════════════════════════════════════════════════════════
+
+
+class SessionMomentum:
+    """Intraday session momentum + VWAP-slope derivatives (1H/15m only).
+
+    Session phases by UTC hour (open bar in parentheses):
+        Asia   00:00–07:59  (opens 00:00)
+        London 08:00–12:59  (opens 08:00)
+        NY     13:00–23:59  (opens 13:00)
+
+    Each bar is keyed to its (date, phase) block. ``first().over(block)``
+    propagates the session-open value forward — it is the *earliest*
+    bar of the block, so later bars only read the past (no lookahead).
+    No ``.over(_date)`` sum/std/mean is used.
+
+    Added columns:
+        session_open_return, session_momentum_3bar,
+        session_return_cumulative, vwap_slope_3bar, vwap_slope_6bar,
+        price_above_vwap
+    """
+
+    def calculate(self, df: pl.DataFrame) -> pl.DataFrame:
+        df = _ensure_ts(df)
+        df = df.sort("open_time")
+
+        hour = pl.col("_ts").dt.hour()
+        phase = (
+            pl.when(hour < 8).then(0)
+            .when(hour < 13).then(1)
+            .otherwise(2)
+        )
+        df = df.with_columns([
+            pl.col("_ts").dt.date().cast(pl.Utf8).alias("_sm_date"),
+            phase.cast(pl.Int8).alias("_sm_phase"),
+        ])
+        df = df.with_columns(
+            (pl.col("_sm_date") + "_" + pl.col("_sm_phase").cast(pl.Utf8))
+            .alias("_sm_block")
+        )
+
+        # Simple per-bar pct return (independent of returns_1 ordering).
+        _ret = safe_divide(
+            pl.col("close") - pl.col("close").shift(1),
+            pl.col("close").shift(1),
+        )
+        df = df.with_columns(_ret.alias("_sm_ret"))
+
+        # Session-open close + return: first bar of the (date, phase) block.
+        session_open_close = pl.col("close").first().over("_sm_block")
+        df = df.with_columns([
+            pl.col("_sm_ret").first().over("_sm_block")
+            .fill_null(0.0).fill_nan(0.0)
+            .alias("session_open_return"),
+            safe_divide(
+                pl.col("close") - session_open_close,
+                session_open_close,
+            ).alias("session_return_cumulative"),
+        ])
+
+        # 3-bar momentum: rolling_sum (sanctioned op; may include up to
+        # 2 prior-session bars right at a session boundary — acceptable).
+        df = df.with_columns(
+            pl.col("_sm_ret").rolling_sum(window_size=3)
+            .fill_null(0.0).fill_nan(0.0)
+            .alias("session_momentum_3bar")
+        )
+
+        # VWAP slope derivatives (session_vwap from SessionVWAP).
+        if "session_vwap" in df.columns:
+            v = pl.col("session_vwap")
+            df = df.with_columns([
+                safe_divide(v - v.shift(3), v.shift(3)).alias("vwap_slope_3bar"),
+                safe_divide(v - v.shift(6), v.shift(6)).alias("vwap_slope_6bar"),
+                (pl.col("close") > v).alias("price_above_vwap"),
+            ])
+        else:
+            df = df.with_columns([
+                pl.lit(0.0).alias("vwap_slope_3bar"),
+                pl.lit(0.0).alias("vwap_slope_6bar"),
+                pl.lit(False).alias("price_above_vwap"),
+            ])
+
+        df = df.drop([
+            c for c in ["_ts", "_sm_date", "_sm_phase", "_sm_block", "_sm_ret"]
+            if c in df.columns
+        ])
+        _log.debug("SessionMomentum.calculate: done")
+        return df
