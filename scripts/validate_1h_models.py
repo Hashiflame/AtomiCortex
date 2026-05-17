@@ -59,6 +59,15 @@ _log = get_logger(__name__)
 
 _CFG = MLStrategyConfig1H()
 
+# CLI override for the confidence threshold (set in main()).
+# None -> use MLStrategyConfig1H().confidence_threshold.
+_CONF_OVERRIDE: float | None = None
+
+
+def _conf_threshold() -> float:
+    """Resolve the active confidence threshold (CLI override or config)."""
+    return _CONF_OVERRIDE if _CONF_OVERRIDE is not None else _CFG.confidence_threshold
+
 # Go/no-go thresholds for 1H
 _SHARPE_THRESHOLD = 0.9
 _WIN_RATE_THRESHOLD = 51.0
@@ -174,7 +183,7 @@ def _run_purged_kfold(
         symbols=[symbol],
         forward_bars=_CFG.forward_bars,
         threshold_atr_multiplier=_CFG.atr_threshold_multiplier,
-        confidence_threshold=_CFG.confidence_threshold,
+        confidence_threshold=_conf_threshold(),
     )
 
     cv = PurgedKFoldCV(n_splits=n_splits, embargo_pct=embargo_pct)
@@ -219,7 +228,7 @@ def _run_walk_forward(
         symbols=[symbol],
         forward_bars=_CFG.forward_bars,
         threshold_atr_multiplier=_CFG.atr_threshold_multiplier,
-        confidence_threshold=_CFG.confidence_threshold,
+        confidence_threshold=_conf_threshold(),
     )
 
     if "open_time" not in df.columns:
@@ -326,7 +335,7 @@ def _compute_oos_metrics(
     # Binary confidence gate: proba = P(UP). 0.5 is the random baseline
     # (ML-017), so max(p, 1-p) is always >= 0.5 — a sub-0.5 threshold
     # never filters. Trade only when the model is confident on one side.
-    conf_threshold = _CFG.confidence_threshold
+    conf_threshold = _conf_threshold()
 
     if proba.ndim == 1:
         up_mask = proba >= conf_threshold
@@ -595,6 +604,15 @@ def _parse_args() -> argparse.Namespace:
         help="Directory with trained models",
     )
     p.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Override confidence threshold from config. "
+            "Use suggested value from previous run."
+        ),
+    )
+    p.add_argument(
         "--n-experiments",
         default=_N_EXPERIMENTS_DEFAULT,
         type=int,
@@ -617,12 +635,21 @@ def main() -> None:
 
     n_experiments = args.n_experiments
 
+    global _CONF_OVERRIDE
+    _CONF_OVERRIDE = args.confidence_threshold
+    conf_src = (
+        f"{_CONF_OVERRIDE:.2f} (CLI override)"
+        if _CONF_OVERRIDE is not None
+        else f"{_CFG.confidence_threshold:.2f} (config)"
+    )
+
     print(f"\n{'='*60}")
     print(f"  AtomiCortex — 1H Model Validation")
     print(f"{'='*60}")
     print(f"  Symbol        : {symbol}")
     print(f"  Datasets      : {dataset_base}")
     print(f"  Models        : {models_dir}")
+    print(f"  Confidence    : {conf_src}")
     print(f"  N experiments : {n_experiments}")
     print(f"{'='*60}\n")
 

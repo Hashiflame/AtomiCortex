@@ -38,7 +38,7 @@ class MLStrategyConfig15M:
     warmup_bars: int = 200  # 200 bars × 15m = 50 hours
 
     # Signal thresholds — higher than 1H (compensate noise)
-    confidence_threshold: float = 0.67  # 1H uses 0.63, 4H uses 0.65
+    confidence_threshold: float = 0.58  # was 0.67; recalibrate after retrain
 
     # Target construction
     forward_bars: int = 4               # 4 × 15min = 1 hour ahead

@@ -28,7 +28,7 @@ class MLStrategyConfig1H:
     warmup_bars: int = 100  # 4H uses 300
 
     # Signal thresholds
-    confidence_threshold: float = 0.63  # 4H uses 0.65
+    confidence_threshold: float = 0.55  # was 0.63; recalibrate after retrain
 
     # Target construction
     forward_bars: int = 2              # predict 2H ahead
