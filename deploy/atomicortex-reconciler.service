@@ -1,0 +1,33 @@
+[Unit]
+Description=AtomiCortex Signal Reconciler (oneshot)
+Documentation=https://github.com/Hashiflame/AtomiCortex
+After=network-online.target
+Wants=network-online.target
+# Ledger-correction only; safe alongside the live bots (idempotent,
+# only UPDATEs result='open' rows). Triggered by the .timer.
+
+[Service]
+Type=oneshot
+User=hashiflame
+Group=hashiflame
+WorkingDirectory=/home/hashiflame/AtomiCortex
+Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
+    scripts/run_reconciler.py --all --trading-mode live --log-level INFO
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data
+
+LimitNOFILE=4096
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atomicortex-reconciler
+
+[Install]
+WantedBy=multi-user.target

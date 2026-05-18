@@ -146,8 +146,11 @@ def _resolve_stat_dbs(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, Dat
     return [("4h", context.bot_data["db"])]
 
 
-def _fmt_strategy_block(label: str, icon: str, s: dict) -> str:
-    """One strategy section for /stats."""
+def _fmt_strategy_block(
+    label: str, icon: str, s: dict, adv: dict | None = None,
+) -> str:
+    """One strategy section for /stats. ``adv`` adds StatsEngine
+    metrics (EV / Sharpe / Max DD) when available."""
     closed = s["closed_signals"]
     if closed > 0:
         wr = (
@@ -160,15 +163,22 @@ def _fmt_strategy_block(label: str, icon: str, s: dict) -> str:
     else:
         wr = "— (нет закрытых сделок)"
         pf = "—"
-    return (
+    block = (
         f"{icon} {label} Стратегия:\n"
         f"Сигналов:      {s['total_signals']} "
         f"({s['open_signals']} открытых)\n"
         f"Win Rate:      {wr}\n"
         f"P&L:           {s['total_pnl_pct']:+.1f}%\n"
         f"Profit Factor: {pf}\n"
-        f"Avg confidence: {s['avg_confidence']:.0%}\n"
     )
+    if adv:
+        block += (
+            f"Expected Value: {adv.get('expected_value', 0.0):+.1f}% / сигнал\n"
+            f"Max Drawdown:  {adv.get('max_drawdown', 0.0):.1f}%\n"
+            f"Sharpe:        {adv.get('sharpe_ratio', 0.0):.2f}\n"
+        )
+    block += f"Avg confidence: {s['avg_confidence']:.0%}\n"
+    return block
 
 
 @require_role("free")
@@ -178,6 +188,19 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ICONS = {"4h": "🤖", "15m": "🔵", "1h": "🟣"}
     _NAMES = {"4h": "4H", "15m": "15m ORB", "1h": "1H"}
 
+    # Optional StatsEngine metrics (EV / Sharpe / Max DD / equity).
+    # Fail-soft: only when shared_db_paths are known (not in the
+    # minimal {"db": db} unit-test context).
+    adv_by_tf: dict[str, dict] = {}
+    eng = None
+    db_paths = context.bot_data.get("shared_db_paths")
+    if db_paths:
+        try:
+            from src.analytics.stats_engine import StatsEngine
+            eng = StatsEngine(db_paths)
+        except Exception:
+            eng = None
+
     parts: list[dict] = []
     blocks: list[str] = []
     for tf, db in dbs:
@@ -186,9 +209,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             continue
         parts.append(st)
+        adv = None
+        if eng is not None:
+            try:
+                adv = eng.compute_performance(timeframe=tf, period_days=30)
+            except Exception:
+                adv = None
+            adv_by_tf[tf] = adv or {}
         blocks.append(
             _fmt_strategy_block(_NAMES.get(tf, tf.upper()),
-                                _ICONS.get(tf, "•"), st)
+                                _ICONS.get(tf, "•"), st, adv)
         )
 
     total = Database.merge_stats(parts) if parts else {
@@ -204,6 +234,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     start = today.fromordinal(today.toordinal() - 30)
     period = f"{start.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')}"
 
+    equity_line = ""
+    tracked_line = ""
+    if eng is not None:
+        try:
+            allp = eng.compute_performance(timeframe="all", period_days=30)
+            equity = 10_000.0 * (1.0 + allp.get("total_pnl_pct", 0.0) / 100.0)
+            equity_line = f"Equity:          ${equity:,.0f}\n"
+            if allp.get("days_tracked"):
+                tracked_line = f"Tracked:         {allp['days_tracked']} дней\n"
+        except Exception:
+            pass
+
     msg = (
         f"📊 AtomiCortex — Статистика (30 дней)\n"
         f"{'═' * 38}\n"
@@ -212,6 +254,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Всего сигналов:  {total['total_signals']}\n"
         f"Общий Win Rate:  {total_wr}\n"
         f"Общий P&L:       {total['total_pnl_pct']:+.1f}%\n"
+        f"{equity_line}{tracked_line}"
         f"{'═' * 38}\n"
         f"⏰ Период: {period}"
     )

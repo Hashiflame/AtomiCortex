@@ -1,0 +1,13 @@
+[Unit]
+Description=Run AtomiCortex Signal Reconciler every 15 minutes
+Documentation=https://github.com/Hashiflame/AtomiCortex
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=atomicortex-reconciler.service
+
+[Install]
+WantedBy=timers.target

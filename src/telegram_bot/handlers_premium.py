@@ -187,6 +187,36 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chg = (val / base - 1.0) * 100.0
             lines.append(f"{day}: ${val:,.0f}  ({chg:+.1f}%)")
 
+    # Risk-adjusted metrics + monthly breakdown via StatsEngine
+    # (fail-soft; only when shared_db_paths are known).
+    db_paths = context.bot_data.get("shared_db_paths")
+    if db_paths:
+        try:
+            from src.analytics.stats_engine import StatsEngine
+            eng = StatsEngine(db_paths)
+            perf = eng.compute_performance(timeframe="all", period_days=30)
+            pf = perf.get("profit_factor")
+            lines[1:1] = [
+                "",
+                "Risk-adjusted (30д, all):",
+                f"  Sharpe:  {perf.get('sharpe_ratio', 0.0):.2f}   "
+                f"Sortino: {perf.get('sortino_ratio', 0.0):.2f}",
+                f"  Calmar:  {perf.get('calmar_ratio', 0.0):.2f}   "
+                f"PF: {'∞' if pf is None else format(pf, '.2f')}",
+                f"  Max DD:  {perf.get('max_drawdown', 0.0):.1f}%   "
+                f"EV: {perf.get('expected_value', 0.0):+.2f}%/сигнал",
+            ]
+            monthly = eng.compute_monthly(timeframe="all")
+            if monthly:
+                lines += ["", "Monthly breakdown:"]
+                for m in monthly[-6:]:
+                    lines.append(
+                        f"  {m['month']}: {m['pnl_pct']:+.1f}% | "
+                        f"{m['wins']}W/{m['losses']}L | WR {m['wr']:.0%}"
+                    )
+        except Exception as exc:
+            _log.debug("performance metrics skipped: {e}", e=exc)
+
     lines.append("═" * 38)
     await update.effective_chat.send_message("\n".join(lines))
 
