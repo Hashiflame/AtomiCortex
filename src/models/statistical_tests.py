@@ -108,6 +108,47 @@ def calculate_dsr(
     return dsr
 
 
+def _sharpe_proxies(
+    cv_results: list[EvaluationResult],
+    wf_result: "WalkForwardMLResult",
+) -> list[float]:
+    """Build the WR×PF Sharpe proxy list — identical to the proxy path
+    in :func:`run_all_tests`, factored out for DSR sensitivity analysis."""
+    proxies: list[float] = []
+    for r in cv_results:
+        wr_frac = r.win_rate / 100.0
+        pf = r.profit_factor if r.profit_factor < 100 else 1.0
+        proxies.append((wr_frac - 0.5) * pf * 10)
+    for w in wf_result.windows:
+        wr_frac = w.win_rate / 100.0
+        pf = w.profit_factor if w.profit_factor < 100 else 1.0
+        proxies.append((wr_frac - 0.5) * pf * 10)
+    return proxies
+
+
+def dsr_sensitivity(
+    cv_results: list[EvaluationResult],
+    wf_result: "WalkForwardMLResult",
+    n_experiments_range: list[int] | None = None,
+) -> dict[int, float]:
+    """Compute DSR for several assumed N experiments (trials).
+
+    DSR deflates the observed Sharpe by the expected max Sharpe from
+    ``N`` independent trials, so it is sensitive to how many configs
+    were *actually* searched. This shows that sensitivity instead of
+    hiding behind a single optimistic N.
+
+    Returns ``{N: DSR}`` using the same WR×PF proxy as ``run_all_tests``.
+    """
+    if n_experiments_range is None:
+        n_experiments_range = [20, 50, 100, 200, 500]
+    proxies = _sharpe_proxies(cv_results, wf_result)
+    return {
+        n: round(calculate_dsr(proxies, n_trials=n), 4)
+        for n in n_experiments_range
+    }
+
+
 # ---------------------------------------------------------------------------
 # Probability of Backtest Overfitting
 # ---------------------------------------------------------------------------

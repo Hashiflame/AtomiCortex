@@ -9,7 +9,7 @@ Go/No-go thresholds for 1H:
   OOS Sharpe Ratio  >= 0.9
   Win Rate          >= 51%
   Profit Factor     >= 1.25
-  OOS trades        >= 800
+  OOS trades        WR-CI half-width <= 5% (statistical power)
   Walk-forward      >= 55% profitable windows
   Fee check         >= 4x round_trip_fees
   DSR               >= 0.95
@@ -23,10 +23,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import pickle
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,7 @@ from src.models.statistical_tests import (
     calculate_dsr,
     calculate_pbo,
     calculate_t_stat,
+    dsr_sensitivity,
     run_all_tests,
 )
 from src.execution.walk_forward import PurgedKFoldCV, WalkForwardValidator
@@ -72,7 +74,12 @@ def _conf_threshold() -> float:
 _SHARPE_THRESHOLD = 0.9
 _WIN_RATE_THRESHOLD = 51.0
 _PROFIT_FACTOR_THRESHOLD = 1.25
-_MIN_TRADES = {"trend": 800, "high_vol": 400}  # high_vol is rarer (~24% of bars)
+# Replaced by CI criterion (is_trade_count_sufficient). Kept for reference:
+#   _MIN_TRADES = {"trend": 800, "high_vol": 400}
+# Arbitrary fixed floors over-penalised genuinely rare regimes. The gate
+# now checks statistical *precision* of the win-rate estimate instead.
+_CI_HALF_WIDTH_MAX = 0.05   # max acceptable ±half-width on WR (95% CI)
+_TRADES_FLOOR = 50          # absolute minimum regardless of CI
 _WF_PROFITABLE_THRESHOLD = 55.0  # % of walk-forward windows
 _FEE_MULTIPLIER_THRESHOLD = 3.5
 _ROUND_TRIP_FEES_BPS = 7.0  # ~0.07% (maker + taker on Binance Futures)
@@ -88,13 +95,13 @@ _WF_TEST_MONTHS = 4
 _WF_STEP_MONTHS = 2
 
 # N experiments estimate for DSR.
-# How to count N:
-#   N = n_wf_windows × n_regimes × n_tuning_attempts
-#   Example without tuning: 10 × 2 × 1 = 20
-#   With Optuna (50 trials): 10 × 2 × 50 = 1000
-#   If you tested multiple forward_bars / ATR multipliers, multiply further.
-# If you ran tune_models.py — use --n-experiments 200+ on CLI.
-_N_EXPERIMENTS_DEFAULT = 20  # conservative default (no Optuna tuning)
+# Honest estimate: this project tested ~100+ configurations
+# (forward_bars 2/4/6, atr_threshold 0.35/0.4/0.5, pt/sl 1.5-1.0 / 2.0-1.0,
+#  confidence thresholds 0.55/0.58/0.60/0.63/0.67, several LightGBM param
+#  iterations, single vs MULTI symbol, 2 regimes × 16 WF windows).
+# N=20 was optimistic and inflated DSR to 1.00. Use --n-experiments to
+# override; see the DSR-sensitivity table in the report.
+_N_EXPERIMENTS_DEFAULT = 100
 
 
 @dataclass
@@ -118,21 +125,55 @@ class ValidationResult:
     dsr: float = 0.0
     pbo: float = 1.0
     t_stat: float = 0.0
+    dsr_by_n: dict[int, float] = field(default_factory=dict)
 
     def passes(self) -> bool:
         """Check if ALL go/no-go criteria pass (including stat tests)."""
-        min_trades = _MIN_TRADES.get(self.regime, 800)
+        trades_ok, _ = is_trade_count_sufficient(
+            self.n_trades, self.win_rate / 100.0
+        )
         return (
             self.oos_sharpe >= _SHARPE_THRESHOLD
             and self.win_rate >= _WIN_RATE_THRESHOLD
             and self.profit_factor >= _PROFIT_FACTOR_THRESHOLD
-            and self.n_trades >= min_trades
+            and trades_ok
             and self.wf_profitable_pct >= _WF_PROFITABLE_THRESHOLD
             and self.fee_multiplier >= _FEE_MULTIPLIER_THRESHOLD
             and self.dsr >= _DSR_THRESHOLD
             and self.pbo <= _PBO_THRESHOLD
             and self.t_stat >= _TSTAT_THRESHOLD
         )
+
+
+def is_trade_count_sufficient(
+    n_trades: int,
+    win_rate: float,
+    min_ci_half_width: float = _CI_HALF_WIDTH_MAX,
+    min_trades_floor: int = _TRADES_FLOOR,
+) -> tuple[bool, str]:
+    """Statistical-power check for trade count.
+
+    Instead of an arbitrary fixed threshold (old 800/400), checks
+    whether ``n_trades`` gives enough precision to estimate ``win_rate``:
+
+        CI half-width = 1.96 · √(p·(1-p)/n)   (95% confidence)
+
+    Passes if n_trades >= floor AND CI half-width <= min_ci_half_width.
+    For 5% CI: n>=384 at WR=0.5, n>=288 at WR=0.75 (rarer regimes that
+    are also more accurate need fewer trades — which is correct).
+
+    Returns ``(passed, reason)``.
+    """
+    if n_trades < min_trades_floor:
+        return False, f"{n_trades} < floor {min_trades_floor}"
+    if win_rate <= 0 or win_rate >= 1:
+        return False, f"invalid win_rate {win_rate}"
+
+    ci_half = 1.96 * math.sqrt(win_rate * (1 - win_rate) / n_trades)
+    if ci_half <= min_ci_half_width:
+        return True, f"CI ±{ci_half:.1%} <= {min_ci_half_width:.0%} (power ok)"
+    need = int(1.96 ** 2 * win_rate * (1 - win_rate) / min_ci_half_width ** 2)
+    return False, f"CI ±{ci_half:.1%} > {min_ci_half_width:.0%} (need ~{need})"
 
 
 def _check(value: float, threshold: float, higher_better: bool = True) -> str:
@@ -523,10 +564,12 @@ def validate_model(
         dsr = stat_result.dsr
         pbo = stat_result.pbo
         t_stat = stat_result.t_stat
+        dsr_by_n = dsr_sensitivity(cv_results, wf_result)
     else:
         dsr = 0.0
         pbo = 1.0
         t_stat = 0.0
+        dsr_by_n = {}
         _log.warning("  Insufficient data for statistical tests")
 
     return ValidationResult(
@@ -547,6 +590,7 @@ def validate_model(
         dsr=dsr,
         pbo=pbo,
         t_stat=t_stat,
+        dsr_by_n=dsr_by_n,
     )
 
 
@@ -579,10 +623,12 @@ def print_validation_report(results: dict[str, ValidationResult | None]) -> None
             f"{_check(result.profit_factor, _PROFIT_FACTOR_THRESHOLD)} "
             f"(>= {_PROFIT_FACTOR_THRESHOLD})"
         )
-        min_trades = _MIN_TRADES.get(result.regime, 800)
+        trades_ok, trades_reason = is_trade_count_sufficient(
+            result.n_trades, result.win_rate / 100.0
+        )
         print(
             f"    OOS trades:     {result.n_trades:>6}  "
-            f"{_check(result.n_trades, min_trades)} (>= {min_trades})"
+            f"{'✓' if trades_ok else '✗'} {trades_reason}"
         )
         print(
             f"    Signal coverage:{result.signal_coverage:>5.1f}%  "
@@ -620,6 +666,15 @@ def print_validation_report(results: dict[str, ValidationResult | None]) -> None
             f"    t-stat:         {result.t_stat:>5.1f}  "
             f"{_check(result.t_stat, _TSTAT_THRESHOLD)} (>= {_TSTAT_THRESHOLD})"
         )
+
+        if result.dsr_by_n:
+            print(f"    DSR sensitivity (how many configs were tested?):")
+            for n, d in sorted(result.dsr_by_n.items()):
+                mark = "  ← current assumption" if n == _N_EXPERIMENTS_DEFAULT else ""
+                print(f"      N={n:<4} DSR={d:.2f}{mark}")
+            print(f"      Honest estimate for this project: N >= 100")
+            print(f"      Use --n-experiments to set honest N "
+                  f"(informational — does not change VERDICT).")
 
         verdict = "✅ GO" if result.passes() else "❌ NO-GO"
         print(f"    VERDICT: {verdict}")
@@ -661,7 +716,8 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "Number of strategy configurations tested (for DSR). "
-            "Default=20 (no tuning). Use 200+ if Optuna was run."
+            f"Default={_N_EXPERIMENTS_DEFAULT} (honest project estimate). "
+            "See DSR-sensitivity table in the report."
         ),
     )
     p.add_argument(
