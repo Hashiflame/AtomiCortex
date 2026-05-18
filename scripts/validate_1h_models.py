@@ -301,19 +301,61 @@ def _compute_oos_metrics(
     model_path: Path,
     dataset_path: Path,
     symbol: str,
+    oos_start: str | None = None,
 ) -> dict:
-    """Compute OOS metrics using the final trained model."""
+    """Compute OOS metrics using the final trained model.
+
+    OOS window selection:
+      * ``oos_start`` given (YYYY-MM-DD) → OOS = rows with
+        ``open_time >= oos_start``. This is an honest OOS *only* if the
+        model was retrained excluding that period.
+      * ``oos_start`` is None → legacy behavior: last 20% of the
+        dataset. For a MULTI model validated on a single symbol this is
+        IN-SAMPLE (the symbol's full history, tail included, was in
+        train) — a warning is emitted.
+    """
+    from datetime import datetime as _dt2, timezone as _tz2
+
     with open(model_path, "rb") as f:
         bundle = pickle.load(f)
     booster = bundle["booster"]
     feature_columns = bundle.get("feature_columns", [])
+    model_symbols = bundle.get("symbols", []) or []
+    is_multi = (
+        any(str(s).upper() == "MULTI" for s in model_symbols)
+        or len({str(s).upper() for s in model_symbols}) > 1
+    )
 
     df = pl.read_parquet(dataset_path, hive_partitioning=False)
     n = len(df)
 
-    # OOS split: last 20%
-    oos_n = max(int(n * 0.2), 100)
-    oos_df = df.tail(oos_n)
+    if oos_start is not None:
+        oos_ms = int(
+            _dt2.strptime(oos_start, "%Y-%m-%d")
+            .replace(tzinfo=_tz2.utc)
+            .timestamp()
+            * 1000
+        )
+        oos_df = df.filter(pl.col("open_time") >= oos_ms)
+        _log.info(
+            f"  OOS window: open_time >= {oos_start} "
+            f"({len(oos_df):,} of {n:,} rows)"
+        )
+        if len(oos_df) < 100:
+            _log.warning(
+                f"  OOS slice has only {len(oos_df)} rows — "
+                f"--oos-start may be past the dataset end"
+            )
+    else:
+        # Legacy OOS split: last 20%
+        oos_n = max(int(n * 0.2), 100)
+        oos_df = df.tail(oos_n)
+        if is_multi:
+            print(
+                f"\n  WARNING: MULTI model validated on in-sample "
+                f"{symbol} data.\n"
+                f"           Use --oos-start for honest OOS evaluation.\n"
+            )
 
     # Prepare features
     feature_cols_in_df = [
@@ -436,6 +478,7 @@ def validate_model(
     model_path: Path,
     dataset_path: Path,
     symbol: str,
+    oos_start: str | None = None,
 ) -> ValidationResult | None:
     """Validate a single model: OOS metrics + WF + CV + DSR/PBO/t-stat."""
     if not model_path.exists():
@@ -452,7 +495,7 @@ def validate_model(
 
     # 1. OOS metrics from the final trained model
     _log.info(f"  Computing OOS metrics...")
-    oos = _compute_oos_metrics(model_path, dataset_path, symbol)
+    oos = _compute_oos_metrics(model_path, dataset_path, symbol, oos_start)
 
     # 2. Purged K-Fold CV (produces EvaluationResult list for DSR/PBO)
     _log.info(f"  Running Purged K-Fold CV (5 folds)...")
@@ -621,6 +664,16 @@ def _parse_args() -> argparse.Namespace:
             "Default=20 (no tuning). Use 200+ if Optuna was run."
         ),
     )
+    p.add_argument(
+        "--oos-start",
+        type=str,
+        default=None,
+        help=(
+            "Start of true OOS period (YYYY-MM-DD), excluded from "
+            "training. Default: None (use last 20%% of dataset — "
+            "IN-SAMPLE for a MULTI model on a single symbol)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -634,6 +687,7 @@ def main() -> None:
     models_dir = Path(args.models_dir)
 
     n_experiments = args.n_experiments
+    oos_start = args.oos_start
 
     global _CONF_OVERRIDE
     _CONF_OVERRIDE = args.confidence_threshold
@@ -651,6 +705,10 @@ def main() -> None:
     print(f"  Models        : {models_dir}")
     print(f"  Confidence    : {conf_src}")
     print(f"  N experiments : {n_experiments}")
+    print(
+        f"  OOS window    : "
+        f"{f'>= {oos_start} (true OOS)' if oos_start else 'last 20% (in-sample for MULTI)'}"
+    )
     print(f"{'='*60}\n")
 
     results: dict[str, ValidationResult | None] = {}
@@ -663,7 +721,9 @@ def main() -> None:
         model_path = models_dir / f"{regime}_model_1h.pkl"
         dataset_path = dataset_base / f"dataset_{regime}.parquet"
 
-        result = validate_model(regime, model_path, dataset_path, symbol)
+        result = validate_model(
+            regime, model_path, dataset_path, symbol, oos_start
+        )
         results[regime] = result
 
     print_validation_report(results)
