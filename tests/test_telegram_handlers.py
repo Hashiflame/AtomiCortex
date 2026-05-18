@@ -509,3 +509,60 @@ class TestBotWiring:
             assert app is not None
             assert bot.broadcaster is not None
             assert bot.database is not None
+
+
+class TestStatsNoneSafety:
+    """Regression: /stats must not crash on NULL cached metrics
+    (root cause of the production outage — f"{None:.1f}")."""
+
+    @pytest.mark.asyncio
+    async def test_cmd_stats_survives_null_cache_metrics(self, db, tmp_path):
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+        from scripts.migrate_db_v3 import migrate
+        from src.execution.signal_bridge import SignalBridge
+        from src.telegram_bot.database import Database
+        from src.telegram_bot.handlers_free import cmd_stats
+
+        sdb = str(tmp_path / "atomicortex.db")
+        SignalBridge(sdb)
+        migrate(sdb)
+        now = datetime.now(timezone.utc)
+        conn = sqlite3.connect(sdb)
+        conn.execute(
+            "INSERT INTO signals_log (symbol,direction,entry_price,"
+            "stop_loss,take_profit,confidence,regime,timeframe,"
+            "created_at,closed_at,pnl_pct,result) VALUES "
+            "('BTCUSDT-PERP.BINANCE','short',100,101,98,0.7,'trend_up',"
+            "'4h',?,?,1.5,'win')",
+            ((now - timedelta(days=3)).isoformat(),
+             (now - timedelta(days=3)).isoformat()),
+        )
+        # Fresh cache rows with NULL numeric metrics → forces the
+        # None-formatting path that previously crashed.
+        for tf in ("all", "4h"):
+            conn.execute(
+                "INSERT INTO performance_cache "
+                "(timeframe,period_days,symbol,win_rate,profit_factor,"
+                "expected_value,total_pnl_pct,max_drawdown,sharpe_ratio,"
+                "sortino_ratio,calmar_ratio,updated_at) "
+                "VALUES (?,30,'all',NULL,NULL,NULL,NULL,NULL,NULL,"
+                "NULL,NULL,?)",
+                (tf, now.isoformat()),
+            )
+        conn.commit()
+        conn.close()
+
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+        update = _make_update()
+        ctx = _make_context(db, shared_db_paths=[sdb])
+        await cmd_stats(update, ctx)
+
+        update.effective_chat.send_message.assert_awaited_once()
+        msg = update.effective_chat.send_message.call_args[0][0]
+        # Rendered the real report (not the failure fallback) and
+        # placeholders appear instead of a TypeError.
+        assert "Статистика" in msg
+        assert "временно недоступна" not in msg
+        assert "— (мало данных)" in msg  # NULL sharpe

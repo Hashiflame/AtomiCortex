@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from src.logger import get_logger
 from src.telegram_bot.database import Database
 from src.telegram_bot.keyboards import (
     get_keyboard_for_role,
@@ -14,6 +15,25 @@ from src.telegram_bot.keyboards import (
     get_subscribe_keyboard,
 )
 from src.telegram_bot.roles import require_role, _ensure_user
+
+_log = get_logger(__name__)
+
+
+def _num(value, spec: str, none: str = "—") -> str:
+    """Format a number, or a placeholder when it is None/NULL.
+
+    Cached ``performance_cache`` rows can carry SQL NULLs (sharpe etc.),
+    and ``dict.get(k, default)`` returns ``None`` — not the default —
+    when the key exists with a None value. Formatting that with a
+    numeric spec (``f"{None:.1f}"``) is the TypeError that took /stats
+    down. This makes every numeric render None-safe.
+    """
+    if value is None:
+        return none
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return none
 
 
 @require_role("free")
@@ -181,8 +201,8 @@ def _fmt_strategy_block(
     )
     if adv:
         block += (
-            f"Expected Value: {adv.get('expected_value', 0.0):+.1f}% / сигнал\n"
-            f"Max Drawdown:  {adv.get('max_drawdown', 0.0):.1f}%\n"
+            f"Expected Value: {_num(adv.get('expected_value'), '+.1f')}% / сигнал\n"
+            f"Max Drawdown:  {_num(adv.get('max_drawdown'), '.1f')}%\n"
             f"Sharpe:        {fmt_metric(adv.get('sharpe_ratio'))}\n"
         )
     block += f"Avg confidence: {s['avg_confidence']:.0%}\n"
@@ -191,82 +211,102 @@ def _fmt_strategy_block(
 
 @require_role("free")
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Public statistics — per-strategy (4H / 15m / 1H) + combined."""
-    dbs = _resolve_stat_dbs(context)
-    _ICONS = {"4h": "🤖", "15m": "🔵", "1h": "🟣"}
-    _NAMES = {"4h": "4H", "15m": "15m ORB", "1h": "1H"}
+    """Public statistics — per-strategy (4H / 15m / 1H) + combined.
 
-    # Optional StatsEngine metrics (EV / Sharpe / Max DD / equity).
-    # Fail-soft: only when shared_db_paths are known (not in the
-    # minimal {"db": db} unit-test context).
-    adv_by_tf: dict[str, dict] = {}
-    eng = None
-    db_paths = context.bot_data.get("shared_db_paths")
-    if db_paths:
-        try:
-            from src.analytics.stats_engine import StatsEngine
-            eng = StatsEngine(db_paths)
-        except Exception:
-            eng = None
+    Hard rule: this handler must never crash. Every computation path is
+    individually fail-soft; the whole body is additionally wrapped so a
+    surprise (None formatting, cache schema drift, DB error) degrades to
+    a friendly message instead of a silent dead command.
+    """
+    try:
+        dbs = _resolve_stat_dbs(context)
+        _ICONS = {"4h": "🤖", "15m": "🔵", "1h": "🟣"}
+        _NAMES = {"4h": "4H", "15m": "15m ORB", "1h": "1H"}
 
-    parts: list[dict] = []
-    blocks: list[str] = []
-    for tf, db in dbs:
-        try:
-            st = db.get_trading_stats(days=30)
-        except Exception:
-            continue
-        parts.append(st)
-        adv = None
+        # Optional StatsEngine metrics (EV / Sharpe / Max DD / equity).
+        # Fail-soft: only when shared_db_paths are known (not in the
+        # minimal {"db": db} unit-test context).
+        adv_by_tf: dict[str, dict] = {}
+        eng = None
+        db_paths = context.bot_data.get("shared_db_paths")
+        if db_paths:
+            try:
+                from src.analytics.stats_engine import StatsEngine
+                eng = StatsEngine(db_paths)
+            except Exception:
+                eng = None
+
+        parts: list[dict] = []
+        blocks: list[str] = []
+        for tf, db in dbs:
+            try:
+                st = db.get_trading_stats(days=30)
+            except Exception:
+                continue
+            if not st:
+                continue
+            parts.append(st)
+            adv = None
+            if eng is not None:
+                try:
+                    adv = eng.compute_performance(timeframe=tf, period_days=30)
+                except Exception:
+                    adv = None
+                adv_by_tf[tf] = adv or {}
+            blocks.append(
+                _fmt_strategy_block(_NAMES.get(tf, tf.upper()),
+                                    _ICONS.get(tf, "•"), st, adv)
+            )
+
+        total = Database.merge_stats(parts) if parts else {
+            "total_signals": 0, "win_rate": 0.0, "total_pnl_pct": 0.0,
+            "closed_signals": 0,
+        }
+        if total.get("closed_signals", 0) > 0:
+            total_wr = _num(total.get("win_rate"), ".0%")
+        else:
+            total_wr = "— (нет закрытых сделок)"
+
+        today = datetime.now(timezone.utc)
+        start = today.fromordinal(today.toordinal() - 30)
+        period = f"{start.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')}"
+
+        equity_line = ""
+        tracked_line = ""
         if eng is not None:
             try:
-                adv = eng.compute_performance(timeframe=tf, period_days=30)
+                allp = eng.compute_performance(timeframe="all", period_days=30)
+                pnl = allp.get("total_pnl_pct") or 0.0
+                equity = 10_000.0 * (1.0 + pnl / 100.0)
+                equity_line = f"Equity:          ${equity:,.0f}\n"
+                if allp.get("days_tracked"):
+                    tracked_line = (
+                        f"Tracked:         {allp['days_tracked']} дней\n"
+                    )
             except Exception:
-                adv = None
-            adv_by_tf[tf] = adv or {}
-        blocks.append(
-            _fmt_strategy_block(_NAMES.get(tf, tf.upper()),
-                                _ICONS.get(tf, "•"), st, adv)
+                pass
+
+        msg = (
+            f"📊 AtomiCortex — Статистика (30 дней)\n"
+            f"{'═' * 38}\n"
+            + "\n".join(blocks)
+            + f"\n📈 Итого:\n"
+            f"Всего сигналов:  {total.get('total_signals', 0)}\n"
+            f"Общий Win Rate:  {total_wr}\n"
+            f"Общий P&L:       {_num(total.get('total_pnl_pct'), '+.1f')}%\n"
+            f"{equity_line}{tracked_line}"
+            f"{'═' * 38}\n"
+            f"⏰ Период: {period}"
         )
-
-    total = Database.merge_stats(parts) if parts else {
-        "total_signals": 0, "win_rate": 0.0, "total_pnl_pct": 0.0,
-        "closed_signals": 0,
-    }
-    if total["closed_signals"] > 0:
-        total_wr = f"{total['win_rate']:.0%}"
-    else:
-        total_wr = "— (нет закрытых сделок)"
-
-    today = datetime.now(timezone.utc)
-    start = today.fromordinal(today.toordinal() - 30)
-    period = f"{start.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')}"
-
-    equity_line = ""
-    tracked_line = ""
-    if eng is not None:
+        await update.effective_chat.send_message(msg)
+    except Exception as exc:
+        _log.error("cmd_stats failed: {e}", e=exc, exc_info=True)
         try:
-            allp = eng.compute_performance(timeframe="all", period_days=30)
-            equity = 10_000.0 * (1.0 + allp.get("total_pnl_pct", 0.0) / 100.0)
-            equity_line = f"Equity:          ${equity:,.0f}\n"
-            if allp.get("days_tracked"):
-                tracked_line = f"Tracked:         {allp['days_tracked']} дней\n"
+            await update.effective_chat.send_message(
+                "📊 Статистика временно недоступна. Попробуйте позже."
+            )
         except Exception:
             pass
-
-    msg = (
-        f"📊 AtomiCortex — Статистика (30 дней)\n"
-        f"{'═' * 38}\n"
-        + "\n".join(blocks)
-        + f"\n📈 Итого:\n"
-        f"Всего сигналов:  {total['total_signals']}\n"
-        f"Общий Win Rate:  {total_wr}\n"
-        f"Общий P&L:       {total['total_pnl_pct']:+.1f}%\n"
-        f"{equity_line}{tracked_line}"
-        f"{'═' * 38}\n"
-        f"⏰ Период: {period}"
-    )
-    await update.effective_chat.send_message(msg)
 
 
 @require_role("free")
