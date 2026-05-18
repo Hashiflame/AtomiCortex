@@ -36,6 +36,10 @@ from src.configs.strategy_1h import MLStrategyConfig1H
 from src.logger import get_logger, setup_logging
 from src.models.lgbm_trainer import LGBMTrainer, ModelConfig, EvaluationResult
 from src.models.ml_validator import MLValidator, WalkForwardMLResult
+from src.models.temporal_split import (
+    compute_default_oos_start_ms,
+    temporal_split_multi,
+)
 
 _log = get_logger(__name__)
 
@@ -56,11 +60,28 @@ _REGIMES = ["trend", "high_vol"]
 # Training
 # ---------------------------------------------------------------------------
 
+def _resolve_oos_start_ms(
+    df: "pl.DataFrame", oos_start_date: str | None
+) -> int:
+    """Explicit ``--oos-start-date`` (YYYY-MM-DD, UTC) or, by default,
+    the last 20% of the dataset's *time* range."""
+    if oos_start_date:
+        from datetime import datetime, timezone
+        return int(
+            datetime.strptime(oos_start_date, "%Y-%m-%d")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+            * 1000
+        )
+    return compute_default_oos_start_ms(df)
+
+
 def train_regime_model(
     regime: str,
     dataset_path: Path,
     models_dir: Path,
     symbol: str,
+    oos_start_date: str | None = None,
 ) -> tuple[EvaluationResult | None, Path | None]:
     """Train a single regime model from pre-built dataset.
 
@@ -96,18 +117,20 @@ def train_regime_model(
         min_child_samples=30,  # 1H ≈ 8k train rows
     )
 
-    # Split: walk-forward style (80% train / 20% test, temporal)
-    # Apply embargo gap between train and test to prevent leakage
-    n = len(df)
-    train_n = int(n * 0.8)
-    embargo = min(_EMBARGO_BARS, n - train_n)  # don't exceed test size
-    test_start = train_n + embargo
-    train_df = df.head(train_n)
-    test_df = df.slice(test_start, n - test_start)
+    # Temporal split, per-symbol (ML-018 fix). The MULTI dataset is a
+    # per-symbol concatenation, so a positional head()/slice() split
+    # leaked entire symbols (incl. BTC 2025 OOS) into train.
+    oos_start_ms = _resolve_oos_start_ms(df, oos_start_date)
+    train_df, test_df = temporal_split_multi(
+        df, oos_start_ms, embargo_bars=_EMBARGO_BARS
+    )
 
+    from datetime import datetime as _dt, timezone as _tz
+    _oos_iso = _dt.fromtimestamp(oos_start_ms / 1000, tz=_tz.utc).date()
     _log.info(
-        f"  Split: train={train_n:,}, embargo={embargo}, "
-        f"test={len(test_df):,}"
+        f"  Temporal split @ {_oos_iso} (UTC): "
+        f"train={len(train_df):,}, test={len(test_df):,}, "
+        f"embargo={_EMBARGO_BARS} bars/symbol"
     )
 
     try:
@@ -333,6 +356,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip walk-forward validation",
     )
+    p.add_argument(
+        "--oos-start-date",
+        default=None,
+        help="OOS start date YYYY-MM-DD (UTC). "
+        "Default: last 20%% of time range",
+    )
     return p.parse_args()
 
 
@@ -355,6 +384,7 @@ def main() -> None:
     print(f"  Dataset dir : {dataset_base}")
     print(f"  Models dir  : {models_dir}")
     print(f"  Tune        : {args.tune}")
+    print(f"  OOS start   : {args.oos_start_date or 'last 20% of time range'}")
     print(f"  Walk-forward: train={_WF_TRAIN_MONTHS}m, test={_WF_TEST_MONTHS}m, "
           f"step={_WF_STEP_MONTHS}m")
     print(f"{'='*60}\n")
@@ -374,6 +404,7 @@ def main() -> None:
             dataset_path=dataset_path,
             models_dir=models_dir,
             symbol=symbol,
+            oos_start_date=args.oos_start_date,
         )
 
         # Walk-forward validation
