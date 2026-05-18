@@ -389,7 +389,15 @@ def print_dataset_summary(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build 15m ML dataset")
-    p.add_argument("--symbol", default="BTCUSDT", help="Binance symbol")
+    p.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help=(
+            "Binance symbol, or several comma-separated "
+            "(e.g. BTCUSDT,ETHUSDT,SOLUSDT). Multiple symbols are "
+            "each built independently then concatenated."
+        ),
+    )
     p.add_argument("--start", default="2023-01-01", help="Start date YYYY-MM-DD")
     p.add_argument("--end", default="2025-12-31", help="End date YYYY-MM-DD")
     p.add_argument(
@@ -413,33 +421,30 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> None:
-    setup_logging()
-    args = _parse_args()
-    t0 = time.monotonic()
+def _build_symbol_df(
+    symbol: str,
+    args: argparse.Namespace,
+    start: datetime,
+    end: datetime,
+) -> tuple[pl.DataFrame, int]:
+    """Load + feature + triple-barrier target for ONE symbol.
 
-    symbol = args.symbol.upper()
-    start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    Features (rolling microstructure, regime detection, ORB, MTF) and
+    the triple-barrier target are computed strictly per-symbol, so a
+    later ``pl.concat`` of several symbols cannot leak across the
+    boundary. The session-trap filter is also applied per-symbol.
 
-    print(f"\n{'='*60}")
-    print(f"  AtomiCortex — 15m Dataset Builder")
-    print(f"{'='*60}")
-    print(f"  Symbol   : {symbol}")
-    print(f"  Range    : {args.start} → {args.end}")
-    print(f"  Data dir : {args.data_dir}")
-    print(f"  Raw dir  : {args.raw_dir}")
-    print(f"  Output   : {args.output_dir}")
-    print(f"{'='*60}\n")
-
+    Returns ``(df, n_trap_excluded)`` — an empty frame (and 0) when
+    klines are missing, so the caller can skip the symbol.
+    """
     # 1. Load 15m klines — try multiple locations
-    _log.info("Loading 15m klines...")
+    _log.info(f"[{symbol}] Loading 15m klines...")
     df_15m = _load_klines(args.raw_dir, symbol, "15m")
     if df_15m.is_empty():
         df_15m = _load_klines(args.data_dir, symbol, "15m")
     if df_15m.is_empty():
-        print("ERROR: No 15m klines data found. Run download_mtf_data.py first.")
-        sys.exit(1)
+        _log.error(f"[{symbol}] No 15m klines data found — skipping")
+        return pl.DataFrame(), 0
 
     # Filter by date range
     start_ms = int(start.timestamp() * 1000)
@@ -447,47 +452,46 @@ def main() -> None:
     df_15m = df_15m.filter(
         (pl.col("open_time") >= start_ms) & (pl.col("open_time") <= end_ms)
     )
-    _log.info(f"After date filter: {len(df_15m):,} 15m bars")
+    _log.info(f"[{symbol}] After date filter: {len(df_15m):,} 15m bars")
 
     # 2. Load 1H klines for HTF context
-    _log.info("Loading 1H klines for HTF context...")
+    _log.info(f"[{symbol}] Loading 1H klines for HTF context...")
     df_1h = _load_klines(args.data_dir, symbol, "1h")
     if df_1h.is_empty():
         df_1h = _load_klines(args.raw_dir, symbol, "1h")
     if df_1h.is_empty():
-        _log.warning("No 1H data — 1H HTF context features will be absent")
+        _log.warning(f"[{symbol}] No 1H data — 1H HTF context absent")
         df_1h = pl.DataFrame()
 
     # 3. Load 4H klines for HTF context
-    _log.info("Loading 4H klines for HTF context...")
+    _log.info(f"[{symbol}] Loading 4H klines for HTF context...")
     df_4h = _load_klines(args.data_dir, symbol, "4h")
     if df_4h.is_empty():
         df_4h = _load_klines(args.raw_dir, symbol, "4h")
     if df_4h.is_empty():
-        _log.warning("No 4H data — 4H HTF context features will be absent")
+        _log.warning(f"[{symbol}] No 4H data — 4H HTF context absent")
         df_4h = pl.DataFrame()
 
     # 3b. Load derivatives (funding + OI) via DataStore
-    _log.info("Loading funding + metrics (derivatives)...")
+    _log.info(f"[{symbol}] Loading funding + metrics (derivatives)...")
     funding_df, metrics_df = _load_derivatives(
         args.data_dir, args.raw_dir, symbol, start, end
     )
 
     # 4. Build feature matrix
-    _log.info("Building feature matrix...")
+    _log.info(f"[{symbol}] Building feature matrix...")
     df = build_feature_matrix(
         df_15m, df_1h, df_4h, symbol,
         funding_df=funding_df, metrics_df=metrics_df,
     )
-
     if df.is_empty():
-        print("ERROR: Feature matrix is empty after processing.")
-        sys.exit(1)
+        _log.error(f"[{symbol}] Feature matrix empty — skipping")
+        return pl.DataFrame(), 0
 
     # 5. Create target — triple-barrier (AFML Ch.3, replaces the old
     #    fixed-horizon target). BEFORE session trap filter — preserve
     #    data for ATR. future_return = realized barrier-touch return.
-    _log.info("Creating target variable (triple-barrier)...")
+    _log.info(f"[{symbol}] Creating target variable (triple-barrier)...")
     from src.features.triple_barrier import (
         apply_triple_barrier,
         label_statistics,
@@ -500,7 +504,7 @@ def main() -> None:
         max_holding_bars=_CFG.tb_max_holding_bars,  # 15m: 8 bars = 2 hours
     )
     st = label_statistics(df)
-    print("\nTriple-Barrier Label Statistics:")
+    print(f"\n[{symbol}] Triple-Barrier Label Statistics:")
     print(f"  Total bars:   {st['total']:>8,}")
     print(f"  Long (+1):    {st['long']:>8,} ({st['long_pct']:.1f}%)")
     print(f"  Short (-1):   {st['short']:>8,} ({st['short_pct']:.1f}%)")
@@ -508,33 +512,35 @@ def main() -> None:
           f"← excluded")
     print(f"  Coverage:     {st['coverage']:>7.1f}% (actionable labels)")
     if st["coverage"] < 20.0:
-        _log.warning("Coverage < 20% — barriers too far (pt/sl too large)")
+        _log.warning(f"[{symbol}] Coverage < 20% — barriers too far")
     elif st["coverage"] > 70.0:
-        _log.warning("Coverage > 70% — barriers too close (noise as signal)")
+        _log.warning(f"[{symbol}] Coverage > 70% — barriers too close")
 
     # Drop vertical (0) labels; rename label → target for compatibility.
     df = df.filter(pl.col("label") != 0).rename({"label": "target"})
 
     # 6. Session trap filter (AFTER target — don't lose ATR data)
-    _log.info("Applying session trap filter...")
+    _log.info(f"[{symbol}] Applying session trap filter...")
     df, n_trap_excluded = filter_session_trap(df)
 
-    # 7. Count feature columns (before split)
-    from src.models.dataset_builder import DatasetBuilder, _EXCLUDE_COLUMNS
-    feature_cols = [
-        col for col in df.columns
-        if col not in _EXCLUDE_COLUMNS
-        and (df[col].dtype.is_float() or df[col].dtype.is_integer())
-    ]
-    n_features = len(feature_cols)
-    _log.info(f"Feature columns: {n_features}")
+    # Tag the symbol. Consumed by LGBMTrainer → symbol_encoded; the raw
+    # 'symbol' column is in _EXCLUDE_COLUMNS so it never becomes a feature.
+    df = df.with_columns(pl.lit(symbol).alias("symbol"))
 
-    # 8. Split by regime
-    _log.info("Splitting by regime...")
+    return df, n_trap_excluded
+
+
+def _save_split(
+    df: pl.DataFrame,
+    symbol_label: str,
+    output_root: Path,
+    n_features: int,
+    n_trap_excluded: int,
+) -> None:
+    """Regime-split a feature+target frame and write trend/orb."""
     df_trend, df_orb = split_by_regime(df)
 
-    # 9. Save datasets
-    output_dir = args.output_dir / f"symbol={symbol}" / "interval=15m"
+    output_dir = output_root / f"symbol={symbol_label}" / "interval=15m"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     trend_path = output_dir / "dataset_trend.parquet"
@@ -543,14 +549,80 @@ def main() -> None:
     df_trend.write_parquet(trend_path, compression="zstd", compression_level=3)
     df_orb.write_parquet(orb_path, compression="zstd", compression_level=3)
 
-    _log.info(f"Saved: {trend_path} ({trend_path.stat().st_size / 1024:.1f} KB)")
-    _log.info(f"Saved: {orb_path} ({orb_path.stat().st_size / 1024:.1f} KB)")
+    _log.info(f"[{symbol_label}] Saved: {trend_path} "
+              f"({trend_path.stat().st_size / 1024:.1f} KB)")
+    _log.info(f"[{symbol_label}] Saved: {orb_path} "
+              f"({orb_path.stat().st_size / 1024:.1f} KB)")
 
-    # 10. Print summary
+    print(f"\n  ── {symbol_label} ──")
     print_dataset_summary(df_trend, df_orb, df, n_features, n_trap_excluded)
 
+
+def main() -> None:
+    setup_logging()
+    args = _parse_args()
+    t0 = time.monotonic()
+
+    symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+    start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    print(f"\n{'='*60}")
+    print(f"  AtomiCortex — 15m Dataset Builder")
+    print(f"{'='*60}")
+    print(f"  Symbol(s): {', '.join(symbols)}")
+    print(f"  Range    : {args.start} → {args.end}")
+    print(f"  Data dir : {args.data_dir}")
+    print(f"  Raw dir  : {args.raw_dir}")
+    print(f"  Output   : {args.output_dir}")
+    print(f"{'='*60}\n")
+
+    from src.models.dataset_builder import _EXCLUDE_COLUMNS
+
+    # Build each symbol independently (no cross-symbol leakage).
+    per_symbol: list[tuple[pl.DataFrame, int]] = []
+    for symbol in symbols:
+        print(f"\n{'─'*60}")
+        print(f"  Processing: {symbol}")
+        print(f"{'─'*60}")
+        df, n_trap = _build_symbol_df(symbol, args, start, end)
+        if df.is_empty():
+            continue
+        per_symbol.append((df, n_trap))
+
+    if not per_symbol:
+        print("ERROR: No data produced for any requested symbol.")
+        sys.exit(1)
+
+    # Feature-column count (schema identical across symbols).
+    ref = per_symbol[0][0]
+    feature_cols = [
+        col for col in ref.columns
+        if col not in _EXCLUDE_COLUMNS
+        and (ref[col].dtype.is_float() or ref[col].dtype.is_integer())
+    ]
+    n_features = len(feature_cols)
+    _log.info(f"Feature columns: {n_features}")
+
+    # Per-symbol datasets (backward-compatible paths).
+    for df, n_trap in per_symbol:
+        _save_split(df, df["symbol"][0], args.output_dir, n_features, n_trap)
+
+    # Combined MULTI dataset — concat the per-symbol *built* frames
+    # (features + target already computed per-symbol → no boundary leak).
+    if len(per_symbol) > 1:
+        combined = pl.concat([d for d, _ in per_symbol], how="diagonal")
+        trap_total = sum(n for _, n in per_symbol)
+        _log.info(
+            f"Combined MULTI: {len(combined):,} rows across "
+            f"{len(per_symbol)} symbols"
+        )
+        _save_split(
+            combined, "MULTI", args.output_dir, n_features, trap_total
+        )
+
     elapsed = time.monotonic() - t0
-    print(f"  Completed in {elapsed:.1f}s\n")
+    print(f"\n  Completed in {elapsed:.1f}s\n")
 
 
 if __name__ == "__main__":
