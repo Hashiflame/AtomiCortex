@@ -382,6 +382,124 @@ class FeaturePipeline:
 
         return df
 
+    @staticmethod
+    def _ensure_taker_buy_volume(df: pl.DataFrame) -> pl.DataFrame:
+        """Ensure a ``taker_buy_volume`` column exists (mirrors build scripts).
+
+        Uses ``taker_buy_base_vol`` when present, otherwise a 50% proxy —
+        identical fallback to ``build_15m_dataset._ensure_taker_buy_volume``
+        so live inference matches training.
+        """
+        if "taker_buy_volume" in df.columns:
+            return df
+        if "taker_buy_base_vol" in df.columns:
+            return df.rename({"taker_buy_base_vol": "taker_buy_volume"})
+        return df.with_columns((pl.col("volume") * 0.5).alias("taker_buy_volume"))
+
+    def build_from_buffer(
+        self,
+        df: pl.DataFrame,
+        *,
+        df_htf_4h: pl.DataFrame | None = None,
+        df_htf_1h: pl.DataFrame | None = None,
+        funding_df: pl.DataFrame | None = None,
+        metrics_df: pl.DataFrame | None = None,
+        single_row: bool = True,
+    ) -> pl.DataFrame:
+        """Build features from in-memory OHLCV buffers (live inference).
+
+        Replicates the offline ``build_feature_matrix()`` sequence used by
+        ``scripts/build_{15m,1h}_dataset.py`` **exactly** — same transforms,
+        same order, same regime detector per interval — but:
+
+        * reads nothing from DataStore (caller supplies every frame);
+        * does NOT drop the head warmup rows (offline slices the first
+          ``_WARMUP_ROWS`` to remove rolling-NaN; live we keep the buffer
+          and instead return only the final, fully-warmed row);
+        * leaves the existing :meth:`build` / :meth:`build_mtf` untouched
+          (pure additive, backward compatible).
+
+        The caller is responsible for passing a buffer long enough that
+        the last row's rolling features are valid (>= ``_WARMUP_ROWS`` +
+        the longest lookback; the 15m/1h strategies use ``warmup_bars``).
+
+        Parameters
+        ----------
+        df:
+            Primary-interval OHLCV buffer (oldest→newest). ``self.interval``
+            selects the regime detector and MTF chain ('15m' or '1h').
+        df_htf_4h:
+            4H OHLCV buffer — required for ``htf_4h_*`` / ``mtf`` features
+            on both 1h and 15m. When ``None`` those columns stay at their
+            ``build_mtf`` defaults (train/serve skew — caller must supply).
+        df_htf_1h:
+            1H OHLCV buffer — required for 15m's ``htf_1h_*`` features.
+        funding_df, metrics_df:
+            Optional derivative frames; ``add_*`` zero-fill when empty
+            (fail-soft, same as offline).
+        single_row:
+            When True (default) return only the last row (the current
+            bar's feature vector). When False return the full enriched
+            frame (used by tests to compare against the offline build).
+        """
+        from src.features.regime_detector import (
+            RegimeDetector1H,
+            RegimeDetector15M,
+        )
+
+        if self.interval not in ("15m", "1h"):
+            raise ValueError(
+                f"build_from_buffer supports '15m'/'1h', got '{self.interval}'"
+            )
+
+        empty = pl.DataFrame()
+
+        # 1-2. taker_buy_volume + microstructure (CVD, volume, price).
+        df = self._ensure_taker_buy_volume(df)
+        df = add_cvd_features(df)
+        df = add_volume_features(df)
+        df = add_price_features(df)
+
+        # 2b. Derivatives — base columns for MTF momentum features.
+        df = add_funding_features(df, funding_df if funding_df is not None else empty)
+        df = add_oi_features(df, metrics_df if metrics_df is not None else empty)
+
+        # 3. Regime detection (interval-tuned, same call as build scripts).
+        if self.interval == "15m":
+            detector: RegimeDetector = RegimeDetector15M()
+        else:
+            detector = RegimeDetector1H()
+        df = detector.detect_all(df, min_bars=detector.hurst_window)
+
+        # 4a. 1H HTF prep (15m only) — microstructure + regime + session.
+        htf_1h = None
+        if df_htf_1h is not None and not df_htf_1h.is_empty():
+            h1 = self._ensure_taker_buy_volume(df_htf_1h)
+            h1 = add_cvd_features(h1)
+            h1 = add_volume_features(h1)
+            h1 = add_price_features(h1)
+            det_1h = RegimeDetector1H()
+            h1 = det_1h.detect_all(h1, min_bars=det_1h.hurst_window)
+            from src.features.session_features import SessionEncoder, SessionVWAP
+            h1 = SessionEncoder().encode(h1)
+            h1 = SessionVWAP().calculate(h1)
+            htf_1h = h1
+
+        # 4b. 4H HTF prep — regime detection only (same as build scripts).
+        htf_4h = None
+        if df_htf_4h is not None and not df_htf_4h.is_empty():
+            h4 = self._ensure_taker_buy_volume(df_htf_4h)
+            h4 = RegimeDetector().detect_all(h4)
+            htf_4h = h4
+
+        # 5. MTF features (session + ORB + 1H/4H HTF context).
+        df = self.build_mtf(df, df_htf_4h=htf_4h, df_htf_1h=htf_1h)
+
+        # 6. No warmup slice — return the final warmed row for inference.
+        if single_row:
+            return df.tail(1)
+        return df
+
     def get_feature_names(self) -> list[str]:
         """Return all feature column names (excludes raw OHLCV and timestamps)."""
         names = [feat for group in FEATURE_GROUPS.values() for feat in group]

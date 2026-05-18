@@ -455,6 +455,29 @@ class TestLiveTraderConfig:
         trader = LiveTrader(cfg)
         assert len(trader._config.symbols) == 2
 
+    def test_strategy_factory_defaults_none(self) -> None:
+        """Backward compat: strategy_factory defaults to None so the
+        4H path in build_node is taken (running bot unaffected)."""
+        cfg = LiveTraderConfig()
+        assert cfg.strategy_factory is None
+
+    def test_strategy_factory_is_settable(self) -> None:
+        """Phase 5 hook: a factory (cfg, symbol) -> Strategy can be
+        injected for the isolated 15m / 1H launchers."""
+        sentinel = object()
+        seen: list[tuple] = []
+
+        def _factory(cfg: LiveTraderConfig, symbol: str):
+            seen.append((cfg, symbol))
+            return sentinel
+
+        cfg = LiveTraderConfig(strategy_factory=_factory)
+        trader = LiveTrader(cfg)
+        assert trader._config.strategy_factory is _factory
+        # Factory is plain callable with the documented signature.
+        assert trader._config.strategy_factory(cfg, "BTCUSDT-PERP") is sentinel
+        assert seen == [(cfg, "BTCUSDT-PERP")]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # IDEMPOTENT ORDER IDs

@@ -235,3 +235,84 @@ class TestRegimeDetectorSubclasses:
         assert hasattr(det, "_classify")
         assert hasattr(det, "detect")
         assert hasattr(det, "detect_all")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. build_from_buffer — live inference parity with offline build
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestBuildFromBuffer:
+    """build_from_buffer must reproduce the offline 15m feature matrix
+    (scripts/build_15m_dataset.build_feature_matrix) for the current bar.
+    """
+
+    def _frames(self):
+        # Buffers long enough that offline's .slice(_WARMUP=200) keeps rows
+        # and the last row's rolling features are fully warmed.
+        df_15m = _klines(500, _BAR_MS_15M)
+        df_1h = _klines(300, _BAR_MS_1H)
+        df_4h = _klines(150, _BAR_MS_4H)
+        return df_15m, df_1h, df_4h, _funding(500), _metrics(500)
+
+    def test_build_from_buffer_matches_offline_for_15m(self) -> None:
+        from scripts.build_15m_dataset import build_feature_matrix
+
+        df_15m, df_1h, df_4h, funding, metrics = self._frames()
+
+        offline = build_feature_matrix(
+            df_15m.clone(), df_1h.clone(), df_4h.clone(), "BTCUSDT",
+            funding_df=funding, metrics_df=metrics,
+        )
+        pipe = FeaturePipeline(None, "BTCUSDT", "15m")  # type: ignore[arg-type]
+        buffered = pipe.build_from_buffer(
+            df_15m.clone(),
+            df_htf_4h=df_4h.clone(),
+            df_htf_1h=df_1h.clone(),
+            funding_df=funding,
+            metrics_df=metrics,
+            single_row=False,
+        )
+
+        assert not offline.is_empty(), "offline build returned no rows"
+        # Compare the last (current) bar across every model feature column.
+        names = [
+            c for c in pipe.get_feature_names()
+            if c in offline.columns and c in buffered.columns
+        ]
+        assert len(names) > 100, f"expected MTF+ORB feature set, got {len(names)}"
+
+        off_last = offline.select(names).tail(1)
+        buf_last = buffered.select(names).tail(1)
+        for col in names:
+            o = off_last[col][0]
+            b = buf_last[col][0]
+            if o is None or b is None:
+                assert o == b, f"{col}: null mismatch ({o!r} vs {b!r})"
+                continue
+            if isinstance(o, float):
+                import math
+                if math.isnan(o) or math.isnan(b):
+                    assert math.isnan(o) and math.isnan(b), f"{col}: {o} vs {b}"
+                else:
+                    assert abs(o - b) <= 1e-6 + 1e-6 * abs(o), (
+                        f"{col}: offline={o} buffer={b}"
+                    )
+            else:
+                assert o == b, f"{col}: offline={o!r} buffer={b!r}"
+
+    def test_build_from_buffer_returns_single_row(self) -> None:
+        df_15m, df_1h, df_4h, funding, metrics = self._frames()
+        pipe = FeaturePipeline(None, "BTCUSDT", "15m")  # type: ignore[arg-type]
+        out = pipe.build_from_buffer(
+            df_15m, df_htf_4h=df_4h, df_htf_1h=df_1h,
+            funding_df=funding, metrics_df=metrics,
+        )  # single_row=True (default)
+        assert out.height == 1, f"expected 1 row, got {out.height}"
+        # The single row is the most recent bar in the buffer.
+        assert out["open_time"][0] == df_15m["open_time"][-1]
+
+    def test_build_from_buffer_rejects_4h(self) -> None:
+        pipe = FeaturePipeline(None, "BTCUSDT", "4h")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="15m'/'1h'"):
+            pipe.build_from_buffer(_klines(50, _BAR_MS_4H))

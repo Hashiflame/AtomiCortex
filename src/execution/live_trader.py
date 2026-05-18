@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from nautilus_trader.trading.strategy import Strategy
 
 from nautilus_trader.adapters.binance import (
     BinanceAccountType,
@@ -59,6 +62,20 @@ class LiveTraderConfig:
     max_open_positions: int = 3
     models_dir: str = "./data/features/models"
     features_dir: str = "./data/features/ml_features"
+
+    # Strategy injection hook (Phase 5 — multi-timeframe isolation).
+    #
+    # When None (default) ``build_node`` builds the 4H ``MLStrategyConfig``
+    # + ``MLTradingStrategy`` exactly as before — the running 4H bot is
+    # byte-for-byte unaffected.
+    #
+    # When set, it is called once per symbol as
+    # ``strategy_factory(cfg, symbol) -> Strategy`` and must return a
+    # fully-constructed Nautilus ``Strategy`` (with its own
+    # ``StrategyConfig``, bar_type, signal_db_path, heartbeat_key, …).
+    # The 15m / 1H launchers supply this so LiveTrader stays generic and
+    # no per-timeframe branching leaks into the shared 4H path.
+    strategy_factory: Callable[["LiveTraderConfig", str], "Strategy"] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,22 +188,32 @@ class LiveTrader:
 
         # Add strategy instances manually (after build)
         for symbol in cfg.symbols:
-            instrument_id = f"{symbol}.BINANCE"
-            bar_type = f"{instrument_id}-4-HOUR-LAST-EXTERNAL"
-            strat_config = MLStrategyConfig(
-                instrument_id=instrument_id,
-                bar_type=bar_type,
-                confidence_threshold=cfg.confidence_threshold,
-                models_dir=cfg.models_dir,
-                features_dir=cfg.features_dir,
-                risk_per_trade=cfg.risk_per_trade,
-                max_leverage=cfg.max_leverage,
-                max_open_positions=cfg.max_open_positions,
-                initial_equity=cfg.initial_equity,
-                dry_run=cfg.dry_run,
-                trading_mode=cfg.trading_mode,
-            )
-            strategy = MLTradingStrategy(config=strat_config)
+            if cfg.strategy_factory is not None:
+                # Injected path (15m / 1H launchers). LiveTrader stays
+                # generic; the factory owns config + bar_type + isolation.
+                strategy = cfg.strategy_factory(cfg, symbol)
+                _log.info(
+                    f"Strategy via factory | {type(strategy).__name__} "
+                    f"| symbol={symbol}"
+                )
+            else:
+                # Default 4H path — unchanged (running bot unaffected).
+                instrument_id = f"{symbol}.BINANCE"
+                bar_type = f"{instrument_id}-4-HOUR-LAST-EXTERNAL"
+                strat_config = MLStrategyConfig(
+                    instrument_id=instrument_id,
+                    bar_type=bar_type,
+                    confidence_threshold=cfg.confidence_threshold,
+                    models_dir=cfg.models_dir,
+                    features_dir=cfg.features_dir,
+                    risk_per_trade=cfg.risk_per_trade,
+                    max_leverage=cfg.max_leverage,
+                    max_open_positions=cfg.max_open_positions,
+                    initial_equity=cfg.initial_equity,
+                    dry_run=cfg.dry_run,
+                    trading_mode=cfg.trading_mode,
+                )
+                strategy = MLTradingStrategy(config=strat_config)
             node.trader.add_strategy(strategy)
 
         self._node = node

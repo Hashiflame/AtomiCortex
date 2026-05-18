@@ -1,0 +1,50 @@
+[Unit]
+Description=AtomiCortex External Watchdog 15m (ISOLATED)
+Documentation=https://github.com/Hashiflame/AtomiCortex
+After=network-online.target redis.service
+Wants=network-online.target
+# Independent of the 4H watchdog. Monitors only bot_15m_heartbeat and
+# emergency-closes ONLY BTCUSDT (--symbol) so a dead 15m bot can never
+# flatten the 4H book.
+
+[Service]
+Type=simple
+User=hashiflame
+Group=hashiflame
+WorkingDirectory=/home/hashiflame/AtomiCortex
+Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
+    scripts/run_watchdog.py \
+    --service-name 15m \
+    --heartbeat-key bot_15m_heartbeat \
+    --symbol BTCUSDT \
+    --redis-host localhost \
+    --trading-mode testnet \
+    --check-interval 15 \
+    --max-silence 60 \
+    --log-level INFO
+
+# Restart policy — always (watchdog must stay up)
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs
+
+# Resource limits (watchdog is lightweight)
+LimitNOFILE=4096
+MemoryMax=512M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atomicortex-watchdog-15m
+
+[Install]
+WantedBy=multi-user.target

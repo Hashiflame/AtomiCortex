@@ -67,6 +67,14 @@ class WatchdogConfig:
     binance_api_secret: str = ""
     trading_mode: str = "testnet"      # testnet / live
     heartbeat_key: str = "atomicortex:heartbeat"
+    # Phase 5 isolation: scope this watchdog instance to ONE service.
+    # ``symbol`` empty  → legacy behaviour: emergency-close ALL positions
+    #                     (the running 4H watchdog is unchanged).
+    # ``symbol`` set    → only close / cancel that symbol's positions, so
+    #                     a dead 15m bot never touches the 4H bot's book.
+    # ``service_name``  → label for logs / alerts only.
+    symbol: str = ""
+    service_name: str = "4h"
     check_interval: int = 15           # seconds
     max_silence_seconds: int = 60
     telegram_token: str = ""
@@ -95,9 +103,19 @@ class Watchdog:
         self._base_url: str = urls["base"]
         self._urls = urls
 
+        # Normalised symbol scope ("" = all, legacy). Strips venue / -PERP
+        # so "BTCUSDT-PERP.BINANCE" and "BTCUSDT" both match Binance's
+        # positionRisk "symbol" field ("BTCUSDT").
+        self._scope_symbol: str = ""
+        if config.symbol:
+            s = config.symbol.split(".")[0]
+            self._scope_symbol = s.split("-")[0].upper()
+
         _log.info(
-            "Watchdog created | mode={mode} | silence_limit={sl}s | "
-            "check_interval={ci}s",
+            "Watchdog created | service={svc} | scope={scope} | "
+            "mode={mode} | silence_limit={sl}s | check_interval={ci}s",
+            svc=config.service_name,
+            scope=self._scope_symbol or "ALL",
             mode=config.trading_mode,
             sl=config.max_silence_seconds,
             ci=config.check_interval,
@@ -175,6 +193,15 @@ class Watchdog:
                         continue
 
                     symbol = pos.get("symbol", "UNKNOWN")
+
+                    # Phase 5: isolated watchdog only closes its own
+                    # symbol — a dead 15m bot must not flatten the 4H book.
+                    if self._scope_symbol and symbol.upper() != self._scope_symbol:
+                        _log.info(
+                            "Skip {sym} — out of scope ({scope})",
+                            sym=symbol, scope=self._scope_symbol,
+                        )
+                        continue
                     side = "SELL" if amt > 0 else "BUY"
                     qty = str(abs(amt))
 
@@ -209,6 +236,10 @@ class Watchdog:
                 symbols_with_positions = {
                     pos.get("symbol") for pos in positions
                     if abs(float(pos.get("positionAmt", 0))) > 1e-10
+                    and (
+                        not self._scope_symbol
+                        or str(pos.get("symbol", "")).upper() == self._scope_symbol
+                    )
                 }
                 for symbol in symbols_with_positions:
                     cancel_result = await self._signed_delete(

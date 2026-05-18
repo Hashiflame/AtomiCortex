@@ -1,0 +1,48 @@
+[Unit]
+Description=AtomiCortex Trading Bot 15m (ISOLATED)
+Documentation=https://github.com/Hashiflame/AtomiCortex
+After=network-online.target redis.service
+Wants=network-online.target
+# Deliberately NOT After/Requires atomicortex-bot.service — full isolation
+# from the 4H bot. Either bot can restart without affecting the other.
+
+[Service]
+Type=simple
+User=hashiflame
+Group=hashiflame
+WorkingDirectory=/home/hashiflame/AtomiCortex
+Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+Environment=MPLCONFIGDIR=/home/hashiflame/AtomiCortex/data/.matplotlib
+Environment=MPLBACKEND=Agg
+Environment=TMPDIR=/home/hashiflame/AtomiCortex/data/tmp
+ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
+    scripts/run_paper_15m.py \
+    --symbol BTCUSDT-PERP \
+    --capital 10000 \
+    --trading-mode testnet \
+    --log-level INFO
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Security hardening (same profile as the 4H bot)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data /home/hashiflame/AtomiCortex/mlruns
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=4G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atomicortex-bot-15m
+
+[Install]
+WantedBy=multi-user.target

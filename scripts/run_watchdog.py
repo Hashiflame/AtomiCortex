@@ -63,6 +63,24 @@ def parse_args() -> argparse.Namespace:
         help="Max silence before emergency close (default: 60s)",
     )
     parser.add_argument(
+        "--heartbeat-key",
+        default="atomicortex:heartbeat",
+        help="Redis heartbeat key to monitor "
+        "(default: atomicortex:heartbeat — the 4H bot). "
+        "Use bot_15m_heartbeat for the isolated 15m watchdog.",
+    )
+    parser.add_argument(
+        "--symbol",
+        default="",
+        help="Scope emergency close to ONE symbol (e.g. BTCUSDT). "
+        "Empty (default) = legacy global close-all (4H watchdog).",
+    )
+    parser.add_argument(
+        "--service-name",
+        default="4h",
+        help="Label for logs/alerts (e.g. 4h / 15m). Default: 4h.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -90,6 +108,9 @@ async def _main(args: argparse.Namespace) -> None:
             else settings.binance_mainnet_api_secret
         ),
         trading_mode=args.trading_mode,
+        heartbeat_key=args.heartbeat_key,
+        symbol=args.symbol,
+        service_name=args.service_name,
         check_interval=args.check_interval,
         max_silence_seconds=args.max_silence,
         telegram_token=settings.telegram_bot_token,
@@ -101,6 +122,9 @@ async def _main(args: argparse.Namespace) -> None:
     log.info("=" * 60)
     log.info("  AtomiCortex External Watchdog")
     log.info("=" * 60)
+    log.info(f"  Service:        {args.service_name}")
+    log.info(f"  Heartbeat key:  {args.heartbeat_key}")
+    log.info(f"  Scope symbol:   {args.symbol or 'ALL (legacy)'}")
     log.info(f"  Redis:          {args.redis_host}:{args.redis_port}")
     log.info(f"  Trading Mode:   {args.trading_mode}")
     log.info(f"  Check Interval: {args.check_interval}s")
