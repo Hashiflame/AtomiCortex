@@ -68,9 +68,10 @@ def test_profit_factor_correct(tmp_path):
 
 def test_sharpe_ratio_formula(tmp_path):
     db = _mk_db(tmp_path)
-    pnls = [1.0, -0.5, 2.0]
+    # ≥10 closed signals so the min-sample guard does not null the ratio.
+    pnls = [1.0, -0.5, 2.0, 0.7, -1.2, 1.5, -0.3, 2.2, 0.4, -0.8, 1.1]
     for i, x in enumerate(pnls):
-        d = _NOW - timedelta(days=10 - i)
+        d = _NOW - timedelta(days=20 - i)
         _add(db, result="win" if x > 0 else "loss", pnl=x,
              created=d, closed=d)
     daily = [x / 100.0 for x in pnls]
@@ -78,14 +79,15 @@ def test_sharpe_ratio_formula(tmp_path):
     var = sum((r - mean) ** 2 for r in daily) / (len(daily) - 1)
     expected = mean / math.sqrt(var) * math.sqrt(252)
     p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
+    assert p["sharpe_ratio"] is not None
     assert abs(p["sharpe_ratio"] - round(expected, 4)) < 1e-3
 
 
 def test_sortino_only_downside(tmp_path):
     db = _mk_db(tmp_path)
-    pnls = [2.0, -1.0, 3.0, -0.5]
+    pnls = [2.0, -1.0, 3.0, -0.5, 1.2, -0.8, 2.5, -0.4, 1.7, -1.1, 0.9]
     for i, x in enumerate(pnls):
-        d = _NOW - timedelta(days=10 - i)
+        d = _NOW - timedelta(days=20 - i)
         _add(db, result="win" if x > 0 else "loss", pnl=x, created=d, closed=d)
     daily = [x / 100.0 for x in pnls]
     mean = sum(daily) / len(daily)
@@ -94,8 +96,36 @@ def test_sortino_only_downside(tmp_path):
     dvar = sum((r - dmean) ** 2 for r in downs) / (len(downs) - 1)
     expected = mean / math.sqrt(dvar) * math.sqrt(252)
     p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
+    assert p["sortino_ratio"] is not None
     assert abs(p["sortino_ratio"] - round(expected, 4)) < 1e-3
     assert p["sortino_ratio"] != p["sharpe_ratio"]
+
+
+def test_sortino_falls_back_to_sharpe_when_no_downside(tmp_path):
+    """Bug 1: zero losing days ⇒ Sortino == Sharpe (not 0.0)."""
+    db = _mk_db(tmp_path)
+    for i in range(11):  # all winners, distinct days, ≥10 sample
+        d = _NOW - timedelta(days=20 - i)
+        _add(db, result="win", pnl=1.0 + 0.1 * i, created=d, closed=d)
+    p = StatsEngine([db]).compute_performance(period_days=60, use_cache=False)
+    assert p["sharpe_ratio"] is not None
+    assert p["sortino_ratio"] == p["sharpe_ratio"]
+    assert p["sortino_ratio"] != 0.0
+
+
+def test_low_sample_ratios_are_none(tmp_path):
+    """Bug 2: < 10 closed signals ⇒ Sharpe/Sortino/Calmar = None."""
+    db = _mk_db(tmp_path)
+    for i in range(5):
+        d = _NOW - timedelta(days=8 - i)
+        _add(db, result="win", pnl=1.0, created=d, closed=d)
+    p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
+    assert p["closed_signals"] == 5
+    assert p["sharpe_ratio"] is None
+    assert p["sortino_ratio"] is None
+    assert p["calmar_ratio"] is None
+    # Non-ratio metrics still computed.
+    assert p["win_rate"] == 1.0 and p["total_signals"] == 5
 
 
 def test_max_drawdown_correct(tmp_path):
@@ -124,8 +154,9 @@ def test_empty_signals_returns_zeros(tmp_path):
     db = _mk_db(tmp_path)
     p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
     assert p["total_signals"] == 0
-    assert p["win_rate"] == 0.0 and p["sharpe_ratio"] == 0.0
-    assert p["total_pnl_pct"] == 0.0
+    assert p["win_rate"] == 0.0 and p["total_pnl_pct"] == 0.0
+    # 0 closed < min sample ⇒ ratios are None, not 0.0.
+    assert p["sharpe_ratio"] is None and p["sortino_ratio"] is None
 
 
 def test_performance_cache_written(tmp_path):

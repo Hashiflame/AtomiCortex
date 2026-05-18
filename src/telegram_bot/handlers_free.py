@@ -146,6 +146,14 @@ def _resolve_stat_dbs(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, Dat
     return [("4h", context.bot_data["db"])]
 
 
+def fmt_metric(value: float | None, spec: str = ".2f") -> str:
+    """Render a risk ratio, or a low-sample placeholder when the
+    StatsEngine returned ``None`` (< 10 closed signals)."""
+    if value is None:
+        return "— (мало данных)"
+    return format(value, spec)
+
+
 def _fmt_strategy_block(
     label: str, icon: str, s: dict, adv: dict | None = None,
 ) -> str:
@@ -175,7 +183,7 @@ def _fmt_strategy_block(
         block += (
             f"Expected Value: {adv.get('expected_value', 0.0):+.1f}% / сигнал\n"
             f"Max Drawdown:  {adv.get('max_drawdown', 0.0):.1f}%\n"
-            f"Sharpe:        {adv.get('sharpe_ratio', 0.0):.2f}\n"
+            f"Sharpe:        {fmt_metric(adv.get('sharpe_ratio'))}\n"
         )
     block += f"Avg confidence: {s['avg_confidence']:.0%}\n"
     return block

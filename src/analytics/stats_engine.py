@@ -27,6 +27,8 @@ _log = get_logger(__name__)
 
 _ANNUALIZE = 252
 _CACHE_TTL_SEC = 3600
+# Minimum closed signals before risk ratios are statistically meaningful.
+_MIN_RATIO_SAMPLE = 10
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -174,9 +176,14 @@ class StatsEngine:
             sd = _std(daily)
             if sd > 0:
                 sharpe = mean_d / sd * math.sqrt(_ANNUALIZE)
+            # Bug 1 fix: no losing days (or zero downside deviation) is
+            # *good* — Sortino is undefined there, not zero. Fall back to
+            # Sharpe rather than reporting 0.0.
             downside = [r for r in daily if r < 0]
             dsd = _std(downside)
-            if dsd > 0:
+            if len(downside) == 0 or dsd == 0:
+                sortino = sharpe
+            else:
                 sortino = mean_d / dsd * math.sqrt(_ANNUALIZE)
 
         # Equity / drawdown.
@@ -194,6 +201,12 @@ class StatsEngine:
             (sum(daily) / len(daily)) * _ANNUALIZE * 100.0 if daily else 0.0
         )
         calmar = ann_return / abs(max_dd) if max_dd != 0 else 0.0
+
+        # Bug 2 fix: ratios on a tiny sample are statistical noise
+        # (a 2-trade "Sharpe 40" is meaningless). Below the minimum
+        # sample they are reported as None → JSON null / "мало данных".
+        if len(closed) < _MIN_RATIO_SAMPLE:
+            sharpe = sortino = calmar = None
 
         rrs = [
             float(s["rr_ratio"]) for s in closed
@@ -232,9 +245,9 @@ class StatsEngine:
             "expected_value": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,
             "total_pnl_pct": round(total_pnl, 4),
             "max_drawdown": round(max_dd, 4),
-            "sharpe_ratio": round(sharpe, 4),
-            "sortino_ratio": round(sortino, 4),
-            "calmar_ratio": round(calmar, 4),
+            "sharpe_ratio": None if sharpe is None else round(sharpe, 4),
+            "sortino_ratio": None if sortino is None else round(sortino, 4),
+            "calmar_ratio": None if calmar is None else round(calmar, 4),
             "avg_rr_ratio": round(sum(rrs) / len(rrs), 4) if rrs else 0.0,
             "total_signals": len(sigs),
             "open_signals": open_n,
