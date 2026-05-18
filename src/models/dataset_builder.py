@@ -44,6 +44,7 @@ _EXCLUDE_COLUMNS: set[str] = {
     # Leak columns (target-derived)
     "future_return",
     "target",
+    "label",  # triple-barrier intermediate (renamed → target)
     # Raw derivatives that are replaced by engineered features
     "quote_volume",
     "trade_count",

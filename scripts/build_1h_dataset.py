@@ -207,70 +207,6 @@ def build_feature_matrix(
 
 
 # ---------------------------------------------------------------------------
-# Target construction
-# ---------------------------------------------------------------------------
-
-def create_target_1h(
-    df: pl.DataFrame,
-    forward_bars: int = 2,
-    atr_threshold_multiplier: float = 0.4,
-) -> pl.DataFrame:
-    """Create ternary target for 1H timeframe.
-
-    Target:
-      +1 if forward_return >  atr_pct * multiplier  (UP)
-      -1 if forward_return < -atr_pct * multiplier  (DOWN)
-       0 if |forward_return| <= threshold            (FLAT — excluded from training)
-
-    Parameters
-    ----------
-    forward_bars : int
-        Number of bars ahead for return calculation (2 = 2 hours).
-    atr_threshold_multiplier : float
-        Multiplied by atr_pct to get the dynamic threshold.
-    """
-    if "close" not in df.columns or "atr_pct" not in df.columns:
-        raise ValueError("DataFrame must contain 'close' and 'atr_pct' columns")
-
-    # Future return: (close[t+N] - close[t]) / close[t]
-    future_close = df["close"].shift(-forward_bars)
-    future_return = (future_close - df["close"]) / df["close"]
-
-    # Dynamic ATR-based threshold
-    atr_threshold = df["atr_pct"] * atr_threshold_multiplier
-
-    # Ternary target
-    target = (
-        pl.when(future_return > atr_threshold)
-        .then(pl.lit(1))
-        .when(future_return < -atr_threshold)
-        .then(pl.lit(-1))
-        .otherwise(pl.lit(0))
-    )
-
-    df = df.with_columns([
-        future_return.alias("future_return"),
-        target.alias("target"),
-    ])
-
-    # Drop last forward_bars rows (no target — future unknown)
-    df = df.head(len(df) - forward_bars)
-
-    n_total = len(df)
-    n_up = int(df["target"].eq(1).sum())
-    n_down = int(df["target"].eq(-1).sum())
-    n_flat = int(df["target"].eq(0).sum())
-    _log.info(
-        f"Target created: {n_total:,} rows | "
-        f"UP={n_up} ({100*n_up/n_total:.1f}%) | "
-        f"DOWN={n_down} ({100*n_down/n_total:.1f}%) | "
-        f"FLAT={n_flat} ({100*n_flat/n_total:.1f}%)"
-    )
-
-    return df
-
-
-# ---------------------------------------------------------------------------
 # Regime split
 # ---------------------------------------------------------------------------
 
@@ -453,13 +389,36 @@ def main() -> None:
         print("ERROR: Feature matrix is empty after processing.")
         sys.exit(1)
 
-    # 4. Create target
-    _log.info("Creating target variable...")
-    df = create_target_1h(
-        df,
-        forward_bars=_CFG.forward_bars,
-        atr_threshold_multiplier=_CFG.atr_threshold_multiplier,
+    # 4. Create target — triple-barrier (AFML Ch.3, replaces the old
+    #    fixed-horizon sign(return) target). future_return is the
+    #    realized barrier-touch return (consistent with the label).
+    _log.info("Creating target variable (triple-barrier)...")
+    from src.features.triple_barrier import (
+        apply_triple_barrier,
+        label_statistics,
     )
+
+    df = apply_triple_barrier(
+        df,
+        pt_multiplier=_CFG.tb_pt_multiplier,
+        sl_multiplier=_CFG.tb_sl_multiplier,
+        max_holding_bars=_CFG.tb_max_holding_bars,  # 1H: 6 bars = 6 hours
+    )
+    st = label_statistics(df)
+    print("\nTriple-Barrier Label Statistics:")
+    print(f"  Total bars:   {st['total']:>8,}")
+    print(f"  Long (+1):    {st['long']:>8,} ({st['long_pct']:.1f}%)")
+    print(f"  Short (-1):   {st['short']:>8,} ({st['short_pct']:.1f}%)")
+    print(f"  Vertical (0): {st['vertical']:>8,} ({st['vertical_pct']:.1f}%) "
+          f"← excluded")
+    print(f"  Coverage:     {st['coverage']:>7.1f}% (actionable labels)")
+    if st["coverage"] < 20.0:
+        _log.warning("Coverage < 20% — barriers too far (pt/sl too large)")
+    elif st["coverage"] > 70.0:
+        _log.warning("Coverage > 70% — barriers too close (noise as signal)")
+
+    # Drop vertical (0) labels; rename label → target for compatibility.
+    df = df.filter(pl.col("label") != 0).rename({"label": "target"})
 
     # 5. Count feature columns (before split)
     from src.models.dataset_builder import DatasetBuilder, _EXCLUDE_COLUMNS

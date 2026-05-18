@@ -59,12 +59,18 @@ def _make_15m_ohlcv(n: int = 500, seed: int = 42) -> pl.DataFrame:
 def _make_df_with_target(
     n: int = 500,
     seed: int = 42,
-    forward_bars: int = 4,
-    atr_threshold_multiplier: float = 0.35,
+    pt_multiplier: float = 2.0,
+    sl_multiplier: float = 1.0,
+    max_holding_bars: int = 8,
     add_orb_features: bool = True,
     add_session_trap: bool = True,
 ) -> pl.DataFrame:
-    """Create a DataFrame with atr_pct, regime, target, and optional ORB columns."""
+    """Create a DataFrame with atr_pct, regime, target, and optional ORB columns.
+
+    Target is built with triple-barrier (AFML Ch.3), mirroring
+    build_15m_dataset.main(): drop vertical (0) labels, rename
+    label → target. Defaults match MLStrategyConfig15M.tb_* (2.0/1.0/8).
+    """
     df = _make_15m_ohlcv(n, seed)
 
     # Add atr_pct (simple TR-based)
@@ -150,9 +156,15 @@ def _make_df_with_target(
         pl.lit(0).cast(pl.Int32).alias("htf_4h_trend_dir"),
     ])
 
-    # Create target
-    from scripts.build_15m_dataset import create_target_15m
-    df = create_target_15m(df, forward_bars, atr_threshold_multiplier)
+    # Create target — triple-barrier, same as build_15m_dataset.main()
+    from src.features.triple_barrier import apply_triple_barrier
+    df = apply_triple_barrier(
+        df,
+        pt_multiplier=pt_multiplier,
+        sl_multiplier=sl_multiplier,
+        max_holding_bars=max_holding_bars,
+    )
+    df = df.filter(pl.col("label") != 0).rename({"label": "target"})
 
     return df
 
@@ -163,42 +175,13 @@ def _make_df_with_target(
 
 
 class TestTargetConstruction:
-    """Tests for target variable construction."""
+    """Tests for target variable construction.
 
-    def test_target_forward_4_bars_not_2(self):
-        """15m uses 4 bars forward (1 hour), not 2 bars like 1H."""
-        n = 200
-        df = _make_15m_ohlcv(n, seed=99)
-        tr = df["high"] - df["low"]
-        df = df.with_columns((tr / df["close"]).alias("atr_pct"))
-
-        from scripts.build_15m_dataset import create_target_15m
-        result = create_target_15m(df, forward_bars=4)
-
-        # Should have n - 4 rows (not n - 2)
-        assert len(result) == n - 4, (
-            f"Expected {n - 4} rows for forward_bars=4, got {len(result)}"
-        )
-
-    def test_target_no_lookahead(self):
-        """CRITICAL: future_return must use shift(-4), not current bar data."""
-        n = 100
-        df = _make_15m_ohlcv(n, seed=99)
-        tr = df["high"] - df["low"]
-        df = df.with_columns((tr / df["close"]).alias("atr_pct"))
-
-        from scripts.build_15m_dataset import create_target_15m
-        result = create_target_15m(df, forward_bars=4, atr_threshold_multiplier=0.35)
-
-        # Verify: future_return at row i should use close[i+4]
-        close = df["close"].to_numpy()
-        for i in range(min(20, len(result))):
-            expected_return = (close[i + 4] - close[i]) / close[i]
-            actual_return = result["future_return"][i]
-            assert abs(actual_return - expected_return) < 1e-10, (
-                f"Row {i}: expected {expected_return}, got {actual_return} — "
-                f"possible lookahead bias!"
-            )
+    Triple-barrier mechanics (no-lookahead, last-bars-drop, label
+    domain, 15m preset 2.0/1.0/8) are covered in
+    tests/test_triple_barrier.py. Here we only assert config wiring
+    and dataset-builder integration (vertical labels dropped).
+    """
 
     def test_atr_threshold_0_35_not_0_4(self):
         """15m uses ATR threshold multiplier 0.35, not 0.4 like 1H."""
@@ -219,16 +202,6 @@ class TestTargetConstruction:
         # No FLAT targets in either dataset
         assert (df_trend["target"] == 0).sum() == 0, "FLAT rows found in trend dataset"
         assert (df_orb["target"] == 0).sum() == 0, "FLAT rows found in orb dataset"
-
-    def test_forward_return_uses_shift_not_current(self):
-        """future_return[i] != 0 for most bars — it's NOT (close-close)/close."""
-        df = _make_df_with_target(n=300)
-        # If shift was wrong, most returns would be exactly 0
-        n_nonzero = (df["future_return"].abs() > 1e-12).sum()
-        assert n_nonzero > len(df) * 0.5, (
-            f"Only {n_nonzero}/{len(df)} non-zero returns — "
-            f"shift might not be applied correctly"
-        )
 
 
 class TestSessionTrap:
@@ -510,21 +483,5 @@ class TestDatasetIO:
         assert max_ts > min_ts
 
 
-class TestLastBarsExclusion:
-    """Test that the last forward_bars rows are properly excluded."""
-
-    def test_last_rows_dropped(self):
-        """Last `forward_bars` rows must be dropped (no valid target)."""
-        n = 200
-        forward_bars = 4
-        df = _make_15m_ohlcv(n, seed=42)
-        tr = df["high"] - df["low"]
-        df = df.with_columns((tr / df["close"]).alias("atr_pct"))
-
-        from scripts.build_15m_dataset import create_target_15m
-        result = create_target_15m(df, forward_bars=forward_bars)
-
-        assert len(result) == n - forward_bars, (
-            f"Expected {n - forward_bars} rows, got {len(result)} — "
-            f"last {forward_bars} rows should be dropped"
-        )
+# Last-bars exclusion is covered by
+# tests/test_triple_barrier.py::test_last_rows_are_dropped.

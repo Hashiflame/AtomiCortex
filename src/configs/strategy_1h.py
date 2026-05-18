@@ -30,9 +30,16 @@ class MLStrategyConfig1H:
     # Signal thresholds
     confidence_threshold: float = 0.55  # was 0.63; recalibrate after retrain
 
-    # Target construction
+    # Target construction — fixed-horizon (legacy; still used by the 4H
+    # DatasetBuilder path / mlflow param logging)
     forward_bars: int = 2              # predict 2H ahead
     atr_threshold_multiplier: float = 0.4  # 4H uses 0.5
+
+    # Target construction — triple-barrier (AFML Ch.3, active for 1H).
+    # tb_ prefix disambiguates from position-mgmt max_hold_bars.
+    tb_pt_multiplier: float = 1.5      # profit-taking barrier = 1.5×ATR
+    tb_sl_multiplier: float = 1.0      # stop-loss barrier   = 1.0×ATR
+    tb_max_holding_bars: int = 6       # vertical barrier (6 hours)
 
     # Position management
     max_hold_bars: int = 6             # max 6 hours

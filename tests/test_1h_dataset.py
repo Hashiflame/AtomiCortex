@@ -57,10 +57,16 @@ def _make_1h_ohlcv(n: int = 500, seed: int = 42) -> pl.DataFrame:
 def _make_df_with_target(
     n: int = 300,
     seed: int = 42,
-    forward_bars: int = 2,
-    atr_threshold_multiplier: float = 0.4,
+    pt_multiplier: float = 1.5,
+    sl_multiplier: float = 1.0,
+    max_holding_bars: int = 6,
 ) -> pl.DataFrame:
-    """Create a DataFrame with atr_pct, regime, and target columns."""
+    """Create a DataFrame with atr_pct, regime, and target columns.
+
+    Target is built with triple-barrier (AFML Ch.3), mirroring
+    build_1h_dataset.main(): drop vertical (0) labels, rename
+    label → target. Defaults match MLStrategyConfig1H.tb_* (1.5/1.0/6).
+    """
     df = _make_1h_ohlcv(n, seed)
 
     # Add atr_pct (simple TR-based)
@@ -74,9 +80,15 @@ def _make_df_with_target(
     regime_arr = rng.choice(regimes, n, p=[0.3, 0.2, 0.2, 0.2, 0.1])
     df = df.with_columns(pl.Series("regime", regime_arr, dtype=pl.Utf8))
 
-    # Create target
-    from scripts.build_1h_dataset import create_target_1h
-    df = create_target_1h(df, forward_bars, atr_threshold_multiplier)
+    # Create target — triple-barrier, same as build_1h_dataset.main()
+    from src.features.triple_barrier import apply_triple_barrier
+    df = apply_triple_barrier(
+        df,
+        pt_multiplier=pt_multiplier,
+        sl_multiplier=sl_multiplier,
+        max_holding_bars=max_holding_bars,
+    )
+    df = df.filter(pl.col("label") != 0).rename({"label": "target"})
 
     return df
 
@@ -87,51 +99,16 @@ def _make_df_with_target(
 
 
 class TestTargetConstruction:
-    """Tests for target variable construction."""
+    """Tests for target variable construction.
 
-    def test_target_construction_correct(self):
-        """Target is +1 when forward return > threshold, -1 when < -threshold, 0 otherwise."""
-        df = _make_df_with_target(n=300)
-
-        assert "target" in df.columns
-        assert "future_return" in df.columns
-
-        # Target values must be in {-1, 0, 1}
-        unique_targets = set(df["target"].unique().to_list())
-        assert unique_targets.issubset({-1, 0, 1})
-
-    def test_target_no_lookahead(self):
-        """CRITICAL: future_return must use shift(-N), not current bar data."""
-        n = 100
-        df = _make_1h_ohlcv(n, seed=99)
-        tr = df["high"] - df["low"]
-        df = df.with_columns((tr / df["close"]).alias("atr_pct"))
-
-        from scripts.build_1h_dataset import create_target_1h
-        result = create_target_1h(df, forward_bars=2, atr_threshold_multiplier=0.4)
-
-        # Verify: future_return at row i should use close[i+2]
-        close = df["close"].to_numpy()
-        for i in range(min(20, len(result))):
-            expected_return = (close[i + 2] - close[i]) / close[i]
-            actual_return = result["future_return"][i]
-            assert abs(actual_return - expected_return) < 1e-10, (
-                f"Row {i}: expected {expected_return}, got {actual_return} — "
-                f"possible lookahead bias!"
-            )
-
-    def test_forward_return_uses_shift_not_current(self):
-        """future_return[i] != 0 for most bars — it's NOT (close-close)/close."""
-        df = _make_df_with_target(n=200)
-        # If shift was wrong, most returns would be exactly 0
-        n_nonzero = (df["future_return"].abs() > 1e-12).sum()
-        assert n_nonzero > len(df) * 0.5, (
-            f"Only {n_nonzero}/{len(df)} non-zero returns — "
-            f"shift might not be applied correctly"
-        )
+    Triple-barrier mechanics (no-lookahead, last-bars-drop, label
+    domain, ATR scaling) are covered in tests/test_triple_barrier.py.
+    Here we only assert dataset-builder integration (vertical labels
+    dropped → no FLAT rows reach the regime datasets).
+    """
 
     def test_flat_bars_excluded(self):
-        """FLAT (target=0) bars should be excluded from regime datasets."""
+        """Vertical (target=0) bars must be excluded from regime datasets."""
         df = _make_df_with_target(n=300)
 
         from scripts.build_1h_dataset import split_by_regime
@@ -347,21 +324,5 @@ class TestClassBalance:
         assert n_down > 0, "No DOWN samples in trend dataset"
 
 
-class TestLastBarsExclusion:
-    """Test that the last forward_bars rows are properly excluded."""
-
-    def test_last_rows_dropped(self):
-        """Last `forward_bars` rows must be dropped (no valid target)."""
-        n = 100
-        forward_bars = 2
-        df = _make_1h_ohlcv(n, seed=42)
-        tr = df["high"] - df["low"]
-        df = df.with_columns((tr / df["close"]).alias("atr_pct"))
-
-        from scripts.build_1h_dataset import create_target_1h
-        result = create_target_1h(df, forward_bars=forward_bars)
-
-        assert len(result) == n - forward_bars, (
-            f"Expected {n - forward_bars} rows, got {len(result)} — "
-            f"last {forward_bars} rows should be dropped"
-        )
+# Last-bars exclusion is covered by
+# tests/test_triple_barrier.py::test_last_rows_are_dropped.
