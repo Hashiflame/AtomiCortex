@@ -105,13 +105,26 @@ def test_no_lookahead_in_label():
     )
 
 
-def test_atr_scaling_correct():
-    # On an upper hit the realized future_return == pt × atr_pct.
+def test_future_return_is_real_close_not_barrier_constant():
+    # Upper barrier = 100×(1+1.5×0.02)=103; bar1 closes at 105 → hit.
+    # future_return must be the REAL close return (105-100)/100 = 0.05,
+    # NOT the barrier constant pt×atr_pct = 0.03. Emitting the constant
+    # is the multi-symbol P&L tautology (Cause D) — guard against it.
     df = _df([100.0, 105.0, 100.0, 100.0, 100.0, 100.0], atr=0.02)
     out = apply_triple_barrier(df, pt_multiplier=1.5, sl_multiplier=1.0,
                                max_holding_bars=3)
     assert out["label"][0] == 1
-    assert out["future_return"][0] == pytest.approx(1.5 * 0.02, rel=1e-9)
+    assert out["future_return"][0] == pytest.approx(0.05, rel=1e-9)
+    # And it must exceed the barrier threshold it breached.
+    assert out["future_return"][0] > 1.5 * 0.02
+
+    # Sanity: future_return is NOT a fixed function of atr_pct — two
+    # upper hits with different overshoot give different returns.
+    df2 = _df([100.0, 110.0, 100.0, 100.0, 100.0, 100.0], atr=0.02)
+    out2 = apply_triple_barrier(df2, pt_multiplier=1.5, sl_multiplier=1.0,
+                                max_holding_bars=3)
+    assert out2["future_return"][0] == pytest.approx(0.10, rel=1e-9)
+    assert out2["future_return"][0] != out["future_return"][0]
 
 
 def test_min_atr_protection():

@@ -14,15 +14,24 @@ Barriers are volatility-scaled:
   lower = entry × (1 - sl_multiplier × atr_pct)
   vertical = entry_bar + max_holding_bars
 
-This module also emits ``future_return`` — the *realized* return at the
-exit bar — so the validator / DSR / PBO P&L stays consistent with the
-label (the touched barrier is the trade outcome, not an arbitrary
-fixed horizon):
+This module also emits ``future_return`` — the *realized* close-to-close
+return at the bar the trade actually exits — so the validator / DSR /
+PBO P&L reflects real price paths (the touched barrier is the trade
+outcome, not an arbitrary fixed horizon):
 
-  label=+1 → future_return = +pt_multiplier × atr_pct   (exit at upper)
-  label=-1 → future_return = -sl_multiplier × atr_pct   (exit at lower)
+  label=+1 → future_return = (close[t+k] - close[t]) / close[t]
+             where t+k is the bar the upper barrier is first breached
+  label=-1 → future_return = (close[t+k] - close[t]) / close[t]
+             where t+k is the bar the lower barrier is first breached
   label= 0 → future_return = (close[t+max_holding] - close[t]) / close[t]
-             (real return at the vertical barrier, diagnostics only)
+             (real return at the vertical barrier)
+
+NB: ``future_return`` is the *real close at the exit bar*, NOT the
+barrier constant ±pt/sl × atr_pct. Emitting the constant would make
+future_return a deterministic function of (label, atr_pct) — every
+validator P&L metric would degenerate into a pure function of
+label-classification accuracy with no price-path risk, inflating
+PF/Sharpe (see git history: multi-symbol leakage audit).
 
 ``future_return`` is NOT a feature (it lives in _EXCLUDE_COLUMNS) — it
 is consumed solely for P&L in the validators.
@@ -109,9 +118,18 @@ def apply_triple_barrier(
         up = (~hit) & (fut >= upper)
         dn = (~hit) & (~up) & (fut <= lower)
         lab[up] = 1.0
-        fr[up] = pt_multiplier * atr_v[up]      # (upper - entry) / entry
         lab[dn] = -1.0
-        fr[dn] = -sl_multiplier * atr_v[dn]     # (lower - entry) / entry
+        # Realized return at the *touch bar* (real close, not the
+        # barrier constant). Using ±pt/sl×atr_pct here makes
+        # future_return a deterministic function of (label, atr_pct):
+        # sign(future_return) ≡ sign(label) and |pnl| is fixed, so any
+        # validator P&L (WR/PF/Sharpe) collapses to a pure function of
+        # label-classification accuracy with zero price-path risk
+        # (tautology → PF/Sharpe explode). The real close at the bar
+        # the barrier was first breached restores genuine overshoot
+        # variance. Strictly causal: only close[t+k], k ≤ holding.
+        fr[up] = (fut[up] - entry[up]) / entry[up]
+        fr[dn] = (fut[dn] - entry[dn]) / entry[dn]
         hit |= up | dn
 
     # Vertical barrier: realized return at close[t + max_holding_bars].
