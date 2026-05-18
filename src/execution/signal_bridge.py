@@ -38,11 +38,24 @@ class SignalBridge:
         Path to the shared SQLite database (same file both processes use).
     """
 
-    def __init__(self, db_path: str = "data/atomicortex.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/atomicortex.db",
+        default_timeframe: str = "4h",
+    ) -> None:
+        # ``default_timeframe`` tags every signal from this bridge unless
+        # a per-call override is given. The 4H bot uses the '4h' default
+        # (its inherited _open_position calls log_signal with no tf), so
+        # it is unchanged; the 15m strategy constructs its bridge with
+        # default_timeframe='15m'.
         self._db_path = str(db_path)
+        self._default_timeframe = default_timeframe
         self._lock = threading.Lock()
         self._init_tables()
-        _log.info("SignalBridge initialised | db={p}", p=self._db_path)
+        _log.info(
+            "SignalBridge initialised | db={p} | tf={tf}",
+            p=self._db_path, tf=self._default_timeframe,
+        )
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -78,6 +91,7 @@ class SignalBridge:
                     take_profit REAL,
                     confidence  REAL,
                     regime      TEXT,
+                    timeframe   TEXT DEFAULT '4h',
                     atr         REAL,
                     funding_rate REAL,
                     position_size REAL,
@@ -114,6 +128,19 @@ class SignalBridge:
                     ON bot_events(created_at);
             """)
             conn.commit()
+
+            # Idempotent migration for DBs created before the timeframe
+            # column existed (e.g. the running 4H atomicortex.db). The
+            # duplicate-column error is expected and swallowed; no data
+            # is rewritten — fully backward compatible.
+            try:
+                conn.execute(
+                    "ALTER TABLE signals_log "
+                    "ADD COLUMN timeframe TEXT DEFAULT '4h'"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already present
         except Exception as exc:
             _log.error("SignalBridge table init failed: {err}", err=str(exc))
         finally:
@@ -137,8 +164,15 @@ class SignalBridge:
         position_size: float = 0.0,
         notional: float = 0.0,
         leverage: float = 0.0,
+        timeframe: str | None = None,
     ) -> int:
-        """Write a new open signal to signals_log. Returns signal_id."""
+        """Write a new open signal to signals_log. Returns signal_id.
+
+        ``timeframe`` overrides the bridge default for this call; when
+        ``None`` the constructor's ``default_timeframe`` is used ('4h'
+        for the unchanged 4H bot, '15m' for the 15m strategy's bridge).
+        """
+        tf = timeframe if timeframe is not None else self._default_timeframe
         with self._lock:
             try:
                 conn = self._connect()
@@ -148,14 +182,14 @@ class SignalBridge:
                         """INSERT INTO signals_log (
                             symbol, direction, entry_price,
                             stop_loss, take_profit, confidence,
-                            regime, atr, funding_rate,
+                            regime, timeframe, atr, funding_rate,
                             position_size, notional, leverage,
                             created_at, result
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
                         (
                             symbol, direction, entry_price,
                             stop_loss, take_profit, confidence,
-                            regime, atr, funding_rate,
+                            regime, tf, atr, funding_rate,
                             position_size, notional, leverage,
                             now,
                         ),

@@ -98,6 +98,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "\n═══ PREMIUM ═══",
             "/signal — последний активный сигнал",
             "/history — последние 10 сигналов",
+            "/performance — отчёт по доходности (4H+15m)",
             "/regime — текущий режим рынка",
             "/funding — экстремальный funding",
             "/risk <капитал> — калькулятор позиции",
@@ -124,25 +125,97 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message("\n".join(lines))
 
 
+def _resolve_stat_dbs(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, Database]]:
+    """(timeframe_label, Database) for every isolated trading DB.
+
+    Backward compatible: prefers ``shared_db_paths`` (multi-timeframe),
+    falls back to the single shared DB, then to the legacy ``db`` —
+    so tests passing only ``{"db": db}`` still work.
+    """
+    paths = context.bot_data.get("shared_db_paths")
+    if paths:
+        out: list[tuple[str, Database]] = []
+        for p in paths:
+            name = str(p)
+            tf = "15m" if "_15m" in name else "1h" if "_1h" in name else "4h"
+            out.append((tf, Database(p)))
+        return out
+    shared = context.bot_data.get("shared_db")
+    if isinstance(shared, Database):
+        return [("4h", shared)]
+    return [("4h", context.bot_data["db"])]
+
+
+def _fmt_strategy_block(label: str, icon: str, s: dict) -> str:
+    """One strategy section for /stats."""
+    closed = s["closed_signals"]
+    if closed > 0:
+        wr = (
+            f"{s['win_rate']:.0%} ({s['win_count']}W / {s['loss_count']}L)"
+        )
+        pf = (
+            "∞" if s["profit_factor"] == float("inf")
+            else f"{s['profit_factor']:.1f}"
+        )
+    else:
+        wr = "— (нет закрытых сделок)"
+        pf = "—"
+    return (
+        f"{icon} {label} Стратегия:\n"
+        f"Сигналов:      {s['total_signals']} "
+        f"({s['open_signals']} открытых)\n"
+        f"Win Rate:      {wr}\n"
+        f"P&L:           {s['total_pnl_pct']:+.1f}%\n"
+        f"Profit Factor: {pf}\n"
+        f"Avg confidence: {s['avg_confidence']:.0%}\n"
+    )
+
+
 @require_role("free")
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Public statistics."""
-    db: Database = context.bot_data["db"]
-    stats = db.get_stats()
-    signals = db.get_signals_history(limit=1)
-    regime = signals[0].get("regime", "N/A").upper() if signals else "N/A"
+    """Public statistics — per-strategy (4H / 15m / 1H) + combined."""
+    dbs = _resolve_stat_dbs(context)
+    _ICONS = {"4h": "🤖", "15m": "🔵", "1h": "🟣"}
+    _NAMES = {"4h": "4H", "15m": "15m ORB", "1h": "1H"}
 
-    await update.effective_chat.send_message(
-        f"📊 AtomiCortex — Статистика\n"
-        f"{'═' * 30}\n"
-        f"Win Rate (30д): {stats['win_rate_30d']:.1%}\n"
-        f"Всего сигналов: {stats['total_trades']}\n"
-        f"  ✅ Win: {stats['wins']}  ❌ Loss: {stats['losses']}  "
-        f"🔵 Open: {stats['open']}\n"
-        f"Общий P&L: {stats['total_pnl_pct']:+.2f}%\n"
-        f"Режим рынка: {regime}\n"
-        f"{'═' * 30}"
+    parts: list[dict] = []
+    blocks: list[str] = []
+    for tf, db in dbs:
+        try:
+            st = db.get_trading_stats(days=30)
+        except Exception:
+            continue
+        parts.append(st)
+        blocks.append(
+            _fmt_strategy_block(_NAMES.get(tf, tf.upper()),
+                                _ICONS.get(tf, "•"), st)
+        )
+
+    total = Database.merge_stats(parts) if parts else {
+        "total_signals": 0, "win_rate": 0.0, "total_pnl_pct": 0.0,
+        "closed_signals": 0,
+    }
+    if total["closed_signals"] > 0:
+        total_wr = f"{total['win_rate']:.0%}"
+    else:
+        total_wr = "— (нет закрытых сделок)"
+
+    today = datetime.now(timezone.utc)
+    start = today.fromordinal(today.toordinal() - 30)
+    period = f"{start.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')}"
+
+    msg = (
+        f"📊 AtomiCortex — Статистика (30 дней)\n"
+        f"{'═' * 38}\n"
+        + "\n".join(blocks)
+        + f"\n📈 Итого:\n"
+        f"Всего сигналов:  {total['total_signals']}\n"
+        f"Общий Win Rate:  {total_wr}\n"
+        f"Общий P&L:       {total['total_pnl_pct']:+.1f}%\n"
+        f"{'═' * 38}\n"
+        f"⏰ Период: {period}"
     )
+    await update.effective_chat.send_message(msg)
 
 
 @require_role("free")

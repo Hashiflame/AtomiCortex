@@ -53,7 +53,10 @@ class Broadcaster:
         d_upper = direction.upper() if isinstance(direction, str) else (
             "LONG" if direction == 1 else "SHORT"
         )
-        emoji = "🟢" if d_upper == "LONG" else "🔴"
+        timeframe = str(signal_data.get("timeframe") or "4h")
+        is_15m = timeframe == "15m"
+        # 15m gets a distinct blue marker; 4H/1H keep directional 🟢/🔴.
+        emoji = "🔵" if is_15m else ("🟢" if d_upper == "LONG" else "🔴")
         symbol = signal_data.get("symbol", "N/A")
         entry = signal_data.get("entry_price", 0)
         sl = signal_data.get("stop_loss", 0)
@@ -86,6 +89,11 @@ class Broadcaster:
             f"🤖 Режим:   {regime.upper()}\n"
             f"📊 Conf:    {conf:.0%}\n"
         )
+        if timeframe != "4h":
+            full_msg += f"⏱ Таймфрейм: {timeframe}\n"
+        # ORB signals tag their regime as e.g. "orb:trend_up" (15m strat).
+        if "orb" in str(regime).lower():
+            full_msg += "🎯 ORB стратегия\n"
         if funding:
             full_msg += f"💸 Funding: {funding:+.3%}\n"
         if pos_size:
@@ -124,9 +132,11 @@ class Broadcaster:
         pnl = signal_data.get("pnl_pct", 0) or 0
         close_price = signal_data.get("close_price", 0)
 
+        timeframe = str(signal_data.get("timeframe") or "4h")
         result_emoji = "✅" if result == "win" else "❌"
+        tf_tag = f" [{timeframe}]" if timeframe != "4h" else ""
         msg = (
-            f"{result_emoji} ЗАКРЫТ {d_upper} {symbol}\n"
+            f"{result_emoji} ЗАКРЫТ {d_upper} {symbol}{tf_tag}\n"
             f"{'═' * 30}\n"
             f"P&L: {pnl:+.2f}%\n"
         )

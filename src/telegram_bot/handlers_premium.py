@@ -104,6 +104,94 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @require_role("premium")
+async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Performance report: open positions, last 10 closed, equity curve.
+
+    Aggregates every isolated trading DB (4H + 15m + 1H) — reuses the
+    same backward-compatible DB resolution as /stats.
+    """
+    from src.telegram_bot.handlers_free import _resolve_stat_dbs
+
+    dbs = _resolve_stat_dbs(context)
+
+    open_rows: list[tuple[str, dict]] = []
+    closed_rows: list[tuple[str, dict]] = []
+    for tf, db in dbs:
+        try:
+            for s in db.get_open_signals():
+                open_rows.append((tf, s))
+            for s in db.get_signals_history(limit=50):
+                if s.get("result") in ("win", "loss", "breakeven"):
+                    closed_rows.append((tf, s))
+        except Exception:
+            continue
+
+    # Newest closed first.
+    closed_rows.sort(
+        key=lambda r: str(r[1].get("closed_at") or r[1].get("created_at") or ""),
+        reverse=True,
+    )
+
+    lines = [
+        "📈 Performance Report",
+        "═" * 38,
+        "Период: последние 30 дней",
+        "",
+        f"Открытые позиции ({len(open_rows)}):",
+    ]
+    if open_rows:
+        for tf, s in open_rows[:10]:
+            d = (s.get("direction", "") or "").upper()
+            ico = "🟢" if d == "LONG" else "🔴"
+            sym = (s.get("symbol", "?") or "?").split("-")[0]
+            lines.append(
+                f"{ico} {d:<5} {sym} {tf:<3} | Вход: "
+                f"${s.get('entry_price', 0):,.0f} | "
+                f"Conf: {s.get('confidence', 0):.0%}"
+            )
+    else:
+        lines.append("  — нет открытых позиций")
+
+    lines += ["", "Последние 10 закрытых:"]
+    if closed_rows:
+        for tf, s in closed_rows[:10]:
+            res = s.get("result", "")
+            mark = "✅" if res == "win" else "❌" if res == "loss" else "➖"
+            d = (s.get("direction", "") or "").upper()
+            sym = (s.get("symbol", "?") or "?").split("-")[0]
+            pnl = s.get("pnl_pct") or 0.0
+            day = str(s.get("closed_at") or s.get("created_at") or "")[:10]
+            lines.append(
+                f"{mark} {d:<5} {sym} {tf:<3} | {pnl:+.1f}% | {day}"
+            )
+    else:
+        lines.append("  — нет закрытых сделок")
+
+    # Text equity curve: compound closed PnL on a $10k base, oldest→newest.
+    chrono = sorted(
+        closed_rows,
+        key=lambda r: str(r[1].get("closed_at") or r[1].get("created_at") or ""),
+    )
+    if chrono:
+        base = 10_000.0
+        eq = base
+        pts: list[tuple[str, float]] = []
+        for _, s in chrono:
+            eq *= 1.0 + (float(s.get("pnl_pct") or 0.0) / 100.0)
+            pts.append((str(s.get("closed_at") or s.get("created_at"))[:10], eq))
+        # Sample ≤4 points: first, ~1/3, ~2/3, last.
+        idx = sorted({0, len(pts) // 3, 2 * len(pts) // 3, len(pts) - 1})
+        lines += ["", "Equity curve:"]
+        for i in idx:
+            day, val = pts[i]
+            chg = (val / base - 1.0) * 100.0
+            lines.append(f"{day}: ${val:,.0f}  ({chg:+.1f}%)")
+
+    lines.append("═" * 38)
+    await update.effective_chat.send_message("\n".join(lines))
+
+
+@require_role("premium")
 async def cmd_regime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Current market regime — primary source: bot_metrics (live trading
     process upserts every ~24h via SignalBridge.update_metrics).  Falls

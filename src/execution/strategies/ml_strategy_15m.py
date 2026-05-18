@@ -169,7 +169,12 @@ class MLTradingStrategy15M(MLTradingStrategy):
             from src.execution.signal_bridge import SignalBridge
             project_root = Path(__file__).resolve().parents[3]
             db_path = str(project_root / self._config.signal_db_path)
-            self._signal_bridge = SignalBridge(db_path=db_path)
+            # default_timeframe='15m' tags every signal written via the
+            # inherited _open_position (parent code untouched) so the
+            # Telegram broadcaster / stats can distinguish 15m from 4H.
+            self._signal_bridge = SignalBridge(
+                db_path=db_path, default_timeframe="15m"
+            )
             self.log.info(f"SignalBridge initialised | db={db_path}")
         except Exception as exc:
             self.log.warning(f"SignalBridge init failed (non-fatal): {exc}")

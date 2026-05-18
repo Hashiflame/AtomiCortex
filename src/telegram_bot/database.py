@@ -81,6 +81,7 @@ class Database:
                     take_profit REAL,
                     confidence  REAL,
                     regime      TEXT,
+                    timeframe   TEXT DEFAULT '4h',
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     closed_at   TIMESTAMP,
                     pnl_pct     REAL,
@@ -126,6 +127,19 @@ class Database:
                     ON payments(payload);
             """)
             conn.commit()
+
+            # Idempotent migration: older DBs (incl. atomicortex*.db written
+            # by SignalBridge) predate the `timeframe` column. ADD COLUMN is
+            # a no-op once present; the duplicate-column error is expected
+            # and swallowed. Backward compatible — never drops/rewrites data.
+            try:
+                conn.execute(
+                    "ALTER TABLE signals_log "
+                    "ADD COLUMN timeframe TEXT DEFAULT '4h'"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         except Exception as exc:
             # TG-013: Raise instead of silent failure
             _log.error("FATAL: Failed to init telegram bot DB: {err}", err=str(exc))
@@ -446,6 +460,153 @@ class Database:
             }
         finally:
             conn.close()
+
+    def get_trading_stats(
+        self,
+        symbol: str | None = None,
+        days: int = 30,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate trading statistics from this DB's ``signals_log``.
+
+        Single-DB by design (each strategy isolates its own SQLite —
+        atomicortex.db / atomicortex_15m.db / atomicortex_1h.db). Use
+        :meth:`merge_stats` to combine results across DBs.
+
+        Robust to schema variants: the ``timeframe`` column is only
+        filtered when it exists (older SignalBridge DBs lack it); when
+        absent every row is treated as ``'4h'``.
+
+        Returns a dict with the keys documented in the task spec, plus
+        ``gross_win_pct`` / ``gross_loss_pct`` so :meth:`merge_stats`
+        can recompute an aggregate profit factor exactly.
+        """
+        conn = self._connect()
+        try:
+            cols = {
+                r[1] for r in conn.execute(
+                    "PRAGMA table_info(signals_log)"
+                ).fetchall()
+            }
+            has_tf = "timeframe" in cols
+            has_conf = "confidence" in cols
+
+            where = [f"created_at >= datetime('now', '-{int(days)} days')"]
+            params: list[Any] = []
+            if symbol:
+                where.append("symbol LIKE ?")
+                params.append(f"%{symbol}%")
+            if timeframe is not None:
+                if has_tf:
+                    where.append("COALESCE(timeframe, '4h') = ?")
+                    params.append(timeframe)
+                elif timeframe != "4h":
+                    # No tf column ⇒ all rows are '4h'; a request for any
+                    # other tf matches nothing.
+                    where.append("1 = 0")
+            where_sql = " AND ".join(where)
+
+            conf_expr = "AVG(confidence)" if has_conf else "0.0"
+            row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*)                                          AS total,
+                    SUM(CASE WHEN result = 'open'  THEN 1 ELSE 0 END) AS open_cnt,
+                    SUM(CASE WHEN result = 'win'   THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN result = 'loss'  THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN result != 'open' THEN pnl_pct ELSE 0 END) AS total_pnl,
+                    AVG(CASE WHEN result != 'open' THEN pnl_pct END)  AS avg_pnl,
+                    MAX(CASE WHEN result != 'open' THEN pnl_pct END)  AS best,
+                    MIN(CASE WHEN result != 'open' THEN pnl_pct END)  AS worst,
+                    SUM(CASE WHEN result = 'win'  THEN pnl_pct ELSE 0 END) AS gross_win,
+                    SUM(CASE WHEN result = 'loss' THEN pnl_pct ELSE 0 END) AS gross_loss,
+                    {conf_expr}                                       AS avg_conf
+                FROM signals_log
+                WHERE {where_sql}
+                """,
+                params,
+            ).fetchone()
+        finally:
+            conn.close()
+
+        d = dict(row) if row else {}
+        total = int(d.get("total") or 0)
+        open_cnt = int(d.get("open_cnt") or 0)
+        wins = int(d.get("wins") or 0)
+        losses = int(d.get("losses") or 0)
+        closed = total - open_cnt
+        gross_win = float(d.get("gross_win") or 0.0)
+        gross_loss = float(d.get("gross_loss") or 0.0)  # negative-ish
+        decided = wins + losses
+        return {
+            "total_signals": total,
+            "open_signals": open_cnt,
+            "closed_signals": closed,
+            "win_count": wins,
+            "loss_count": losses,
+            "win_rate": (wins / decided) if decided > 0 else 0.0,
+            "total_pnl_pct": float(d.get("total_pnl") or 0.0),
+            "avg_pnl_pct": float(d.get("avg_pnl") or 0.0),
+            "best_trade_pct": float(d.get("best") or 0.0),
+            "worst_trade_pct": float(d.get("worst") or 0.0),
+            "profit_factor": (
+                gross_win / abs(gross_loss) if gross_loss != 0 else
+                (float("inf") if gross_win > 0 else 0.0)
+            ),
+            "avg_confidence": float(d.get("avg_conf") or 0.0),
+            "gross_win_pct": gross_win,
+            "gross_loss_pct": gross_loss,
+            "period_days": int(days),
+        }
+
+    @staticmethod
+    def merge_stats(parts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Combine per-DB :meth:`get_trading_stats` dicts into a total.
+
+        Counts and PnL sums add; win-rate and profit factor are
+        recomputed from the merged gross sums (not averaged) so the
+        aggregate is exact.
+        """
+        agg = {
+            "total_signals": 0, "open_signals": 0, "closed_signals": 0,
+            "win_count": 0, "loss_count": 0, "total_pnl_pct": 0.0,
+            "best_trade_pct": 0.0, "worst_trade_pct": 0.0,
+            "gross_win_pct": 0.0, "gross_loss_pct": 0.0,
+            "period_days": 0,
+        }
+        conf_weighted = 0.0
+        conf_w = 0
+        for p in parts:
+            for k in (
+                "total_signals", "open_signals", "closed_signals",
+                "win_count", "loss_count", "total_pnl_pct",
+                "gross_win_pct", "gross_loss_pct",
+            ):
+                agg[k] += p.get(k, 0)
+            agg["best_trade_pct"] = max(
+                agg["best_trade_pct"], p.get("best_trade_pct", 0.0)
+            )
+            agg["worst_trade_pct"] = min(
+                agg["worst_trade_pct"], p.get("worst_trade_pct", 0.0)
+            )
+            agg["period_days"] = max(agg["period_days"], p.get("period_days", 0))
+            n = p.get("win_count", 0) + p.get("loss_count", 0)
+            conf_weighted += p.get("avg_confidence", 0.0) * max(n, 0)
+            conf_w += max(n, 0)
+
+        decided = agg["win_count"] + agg["loss_count"]
+        gl = agg["gross_loss_pct"]
+        agg["win_rate"] = (agg["win_count"] / decided) if decided > 0 else 0.0
+        agg["avg_pnl_pct"] = (
+            agg["total_pnl_pct"] / agg["closed_signals"]
+            if agg["closed_signals"] > 0 else 0.0
+        )
+        agg["profit_factor"] = (
+            agg["gross_win_pct"] / abs(gl) if gl != 0 else
+            (float("inf") if agg["gross_win_pct"] > 0 else 0.0)
+        )
+        agg["avg_confidence"] = conf_weighted / conf_w if conf_w > 0 else 0.0
+        return agg
 
     # ------------------------------------------------------------------
     # Events

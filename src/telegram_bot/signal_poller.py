@@ -87,6 +87,31 @@ class SignalPoller:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @staticmethod
+    def _tf_for_db(db_path: str) -> str:
+        """Derive the timeframe from the isolated DB filename.
+
+        Authoritative: each strategy writes to its own DB file, so the
+        path is the source of truth regardless of whether the row has a
+        ``timeframe`` column (keeps 4H trading code untouched).
+        """
+        name = str(db_path)
+        if "_15m" in name:
+            return "15m"
+        if "_1h" in name:
+            return "1h"
+        return "4h"
+
+    def _tag_timeframe(self, signal_data: dict[str, Any], db_path: str) -> None:
+        """Ensure ``signal_data['timeframe']`` is set.
+
+        Prefers an explicit non-null DB column value; otherwise falls
+        back to the path-derived timeframe.
+        """
+        tf = signal_data.get("timeframe")
+        if not tf:
+            signal_data["timeframe"] = self._tf_for_db(db_path)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -189,6 +214,7 @@ class SignalPoller:
             for row in rows:
                 signal_data = dict(row)
                 self._last_signal_ids[db_path] = signal_data["id"]
+                self._tag_timeframe(signal_data, db_path)
 
                 _log.info(
                     "New signal detected | id={sid} {dir} {sym}",
@@ -229,6 +255,7 @@ class SignalPoller:
 
             for row in rows:
                 signal = dict(row)
+                self._tag_timeframe(signal, db_path)
                 try:
                     await self._broadcaster.broadcast_signal_closed(signal)
                 except Exception as exc:

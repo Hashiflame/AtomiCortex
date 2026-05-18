@@ -59,6 +59,7 @@ from src.telegram_bot.handlers_owner import (
 from src.telegram_bot.handlers_premium import (
     cmd_funding,
     cmd_history,
+    cmd_performance,
     cmd_regime,
     cmd_risk,
     cmd_signal,
@@ -138,6 +139,9 @@ class TelegramBot:
         # Telegram-bot reads signals/metrics from here; user/payment data stays in self._db.
         shared_db_path = self._get_shared_db_path()
         self._app.bot_data["shared_db"] = Database(shared_db_path)
+        # Multi-timeframe: list of every existing isolated trading DB.
+        # Backward compatible — if only the 4H DB exists, list has one entry.
+        self._app.bot_data["shared_db_paths"] = self._get_shared_db_paths()
 
         settings = get_settings()
         self._app.bot_data["prices"] = {
@@ -184,6 +188,7 @@ class TelegramBot:
         # Premium commands
         app.add_handler(CommandHandler("signal", cmd_signal))
         app.add_handler(CommandHandler("history", cmd_history))
+        app.add_handler(CommandHandler("performance", cmd_performance))
         app.add_handler(CommandHandler("regime", cmd_regime))
         app.add_handler(CommandHandler("funding", cmd_funding))
         app.add_handler(CommandHandler("risk", cmd_risk))
@@ -552,16 +557,17 @@ class TelegramBot:
             # Signal poller
             if broadcaster is not None:
                 from src.telegram_bot.signal_poller import SignalPoller
+                db_paths = bot_ref._get_shared_db_paths()
                 poller = SignalPoller(
-                    db_path=shared_db_path,
+                    db_paths=db_paths,
                     broadcaster=broadcaster,
                     poll_interval=30,
                 )
                 bot_ref._signal_poller = poller
                 await poller.start()
                 _log.info(
-                    "SignalPoller started | db={p}",
-                    p=shared_db_path,
+                    "SignalPoller started | dbs={p}",
+                    p=db_paths,
                 )
 
         self._app.post_init = _post_init
@@ -615,6 +621,24 @@ class TelegramBot:
                 return str(p)
         # Default (will be created by SignalBridge on the trading side)
         return str(candidates[0])
+
+    @staticmethod
+    def _get_shared_db_paths() -> list[str]:
+        """All existing isolated trading DBs, 4H first.
+
+        4H base is always included (it is the canonical DB and is
+        created by SignalBridge if missing). The 15m / 1H DBs are
+        appended only when their files exist, so a deployment running
+        just the 4H bot is unaffected (backward compatible).
+        """
+        base = TelegramBot._get_shared_db_path()
+        paths = [base]
+        base_dir = Path(base).parent
+        for sibling in ("atomicortex_15m.db", "atomicortex_1h.db"):
+            p = base_dir / sibling
+            if p.exists() and str(p) not in paths:
+                paths.append(str(p))
+        return paths
 
 
 # ── Utility ──
