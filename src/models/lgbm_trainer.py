@@ -557,7 +557,8 @@ class LGBMTrainer:
             X = np.hstack([X, symbol_encoded])
             all_cols.append("symbol_encoded")
 
-        # Encode target: -1→0, 0→1, 1→2
+        # Encode target: -1→0 (DOWN), +1→1 (UP)
+        # LABEL_TO_CLASS = {-1: 0, +1: 1} — binary classification
         y = df["target"].to_numpy()
         y_encoded = np.array([LABEL_TO_CLASS[int(v)] for v in y], dtype=np.int32)
 

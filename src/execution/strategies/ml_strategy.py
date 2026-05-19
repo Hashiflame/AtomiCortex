@@ -653,6 +653,24 @@ class MLTradingStrategy(Strategy):
 
         Uses the last 50 bars to compute microstructure features,
         then extracts only the features the model was trained on.
+
+        KNOWN ISSUE: Train/serve feature skew
+        -------------------------------------
+        This method hand-rolls 4H features using heuristics:
+          - funding_rate, oi_* = 0.0 (placeholders — no live feed here)
+          - CVD computed from the bar buffer (approximation)
+          - session features not included (4H does not use them)
+
+        The 4H model was trained with ``FeaturePipeline.build()`` which
+        uses real funding / OI from the Binance metrics API. The
+        resulting distribution shift may degrade prediction quality
+        (it is *not* a sign flip — direction mapping is correct).
+
+        TODO: replace with ``build_from_buffer()`` like
+        ``ml_strategy_15m.py`` does. That requires loading
+        funding/metrics in ``on_start()`` and maintaining a live
+        derivatives feed. Risk: this is live trading code — schedule
+        for a maintenance window, not a hot change.
         """
         try:
             import polars as pl
@@ -865,6 +883,22 @@ class MLTradingStrategy(Strategy):
     # Historical bar preloading
     # ------------------------------------------------------------------
 
+    def _bar_period_hours(self) -> float:
+        """Bar period in hours from ``config.interval`` ('4h'→4.0,
+        '1h'→1.0, '15m'→0.25). Defaults to 4.0 on any parse failure
+        (4H is the production timeframe)."""
+        iv = str(getattr(self._config, "interval", "4h")).strip().lower()
+        try:
+            if iv.endswith("h"):
+                return float(iv[:-1])
+            if iv.endswith("m"):
+                return float(iv[:-1]) / 60.0
+            if iv.endswith("d"):
+                return float(iv[:-1]) * 24.0
+        except ValueError:
+            pass
+        return 4.0
+
     def _preload_historical_bars(self) -> None:
         """Preload historical bars from Parquet or Binance API.
 
@@ -891,6 +925,31 @@ class MLTradingStrategy(Strategy):
                 )
         except Exception as e:
             self.log.warning(f"Parquet preload failed: {e}")
+
+        # Freshness guard: the Parquet store can end well before "now"
+        # (e.g. data tooling stopped at 2025-12-31 while the bot runs in
+        # 2026). If the newest preloaded bar is older than 2× the bar
+        # period, the data is stale — discard it so the Binance REST
+        # fallback below runs instead of feeding the model a stale /
+        # discontinuous window. WARNING only — never stops the bot.
+        if bars:
+            bar_period_h = self._bar_period_hours()
+            latest_dt = datetime.fromtimestamp(
+                bars[-1].ts_event / 1e9, tz=timezone.utc
+            )
+            staleness_h = (
+                datetime.now(timezone.utc) - latest_dt
+            ).total_seconds() / 3600.0
+            if staleness_h > bar_period_h * 2:
+                self.log.warning(
+                    f"Preloaded Parquet bars are stale: "
+                    f"latest={latest_dt.isoformat()} "
+                    f"staleness={staleness_h:.1f}h > "
+                    f"{bar_period_h * 2:.1f}h — discarding, "
+                    f"falling back to Binance REST"
+                )
+                bars = []
+                source = "none"
 
         # Attempt 2: Binance REST API
         if len(bars) < 50:
