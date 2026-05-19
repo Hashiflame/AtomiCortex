@@ -86,6 +86,33 @@ class TestFreeHandlers:
         assert "Premium" in msg
 
 
+def _seed_signal(database, **kw):
+    """Insert a signal row with sane defaults into a telegram Database."""
+    import sqlite3
+    from datetime import datetime, timezone
+    d = {
+        "symbol": "BTCUSDT-PERP.BINANCE", "direction": "long",
+        "entry_price": 94000.0, "stop_loss": 92000.0,
+        "take_profit": 97000.0, "confidence": 0.73, "regime": "trend_up",
+        "timeframe": "4h", "result": "open", "pnl_pct": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    d.update(kw)
+    conn = sqlite3.connect(str(database._db_path))
+    try:
+        conn.execute(
+            "INSERT INTO signals_log (symbol,direction,entry_price,"
+            "stop_loss,take_profit,confidence,regime,timeframe,result,"
+            "pnl_pct,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (d["symbol"], d["direction"], d["entry_price"], d["stop_loss"],
+             d["take_profit"], d["confidence"], d["regime"], d["timeframe"],
+             d["result"], d["pnl_pct"], d["created_at"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class TestPremiumHandlers:
     @pytest.mark.asyncio
     async def test_signal_empty(self, db):
@@ -96,21 +123,37 @@ class TestPremiumHandlers:
         ctx = _make_context(db)
         await cmd_signal(update, ctx)
         msg = update.effective_chat.send_message.call_args[0][0]
-        assert "Нет активных" in msg
+        assert "Нет" in msg and "сигнал" in msg.lower()
 
     @pytest.mark.asyncio
     async def test_signal_with_data(self, db):
         from src.telegram_bot.handlers_premium import cmd_signal
         db.create_user(12345, "owner", "Owner")
         db.set_role(12345, "owner")
-        db.log_signal({"symbol": "BTCUSDT", "direction": "long",
-            "entry_price": 94000, "stop_loss": 92000, "take_profit": 97000,
-            "confidence": 0.73, "regime": "trend"})
+        _seed_signal(db, direction="long", regime="trend_up")
         update = _make_update()
         ctx = _make_context(db)
         await cmd_signal(update, ctx)
         msg = update.effective_chat.send_message.call_args[0][0]
+        kw = update.effective_chat.send_message.call_args.kwargs
         assert "LONG" in msg
+        assert kw.get("reply_markup") is not None  # filter keyboard
+
+    @pytest.mark.asyncio
+    async def test_signal_shows_last_signal_when_none_open(self, db):
+        """All signals closed → still show the most recent (closed) one,
+        not '📭 нет сигналов'."""
+        from src.telegram_bot.handlers_premium import cmd_signal
+        db.create_user(12345, "owner", "Owner")
+        db.set_role(12345, "owner")
+        _seed_signal(db, result="loss", pnl_pct=-1.5, direction="short",
+                     regime="trend_down")
+        update = _make_update()
+        ctx = _make_context(db)
+        await cmd_signal(update, ctx)
+        msg = update.effective_chat.send_message.call_args[0][0]
+        assert "SHORT" in msg
+        assert "Нет" not in msg
 
     @pytest.mark.asyncio
     async def test_history_empty(self, db):
@@ -124,53 +167,40 @@ class TestPremiumHandlers:
         assert "пуста" in msg
 
     @pytest.mark.asyncio
-    async def test_regime(self, db):
-        from src.telegram_bot.handlers_premium import cmd_regime
+    async def test_history_returns_paginated_results(self, db):
+        from src.telegram_bot.handlers_premium import cmd_history
         db.create_user(12345, "owner", "Owner")
         db.set_role(12345, "owner")
-        db.log_signal({"symbol": "BTC", "direction": "long", "regime": "trend"})
+        for i in range(13):
+            _seed_signal(db, result="win", pnl_pct=1.0,
+                         entry_price=90000 + i)
         update = _make_update()
         ctx = _make_context(db)
-        await cmd_regime(update, ctx)
+        await cmd_history(update, ctx)
         msg = update.effective_chat.send_message.call_args[0][0]
-        assert "TREND" in msg
+        kw = update.effective_chat.send_message.call_args.kwargs
+        # 13 signals, per_page=10 → page 1/2, 10 rows shown.
+        assert "1/2" in msg and "всего 13" in msg
+        assert msg.count("BTC/USDT") == 10
+        assert kw.get("reply_markup") is not None
 
     @pytest.mark.asyncio
-    async def test_regime_prefers_bot_metrics_over_signals(self, db):
-        """ML/TG: when bot_metrics has a fresher regime than signals_log,
-        /regime must surface the metrics row (it's the live regime)."""
+    async def test_regime_fallback_to_last_signal(self, db):
+        """Regime comes from the most recent signal (bot_metrics is
+        unreliable / often UNKNOWN)."""
         from src.telegram_bot.handlers_premium import cmd_regime
         db.create_user(12345, "owner", "Owner")
         db.set_role(12345, "owner")
-        # Old signal says "range"; live metrics say "trend_up"
-        db.log_signal({"symbol": "BTC", "direction": "long", "regime": "range"})
-        try:
-            import sqlite3
-        except ImportError:
-            import pysqlite3 as sqlite3  # type: ignore[no-redef]
-        conn = sqlite3.connect(str(db._db_path))
-        conn.executescript(
-            "CREATE TABLE IF NOT EXISTS bot_metrics ("
-            " id INTEGER PRIMARY KEY DEFAULT 1, equity REAL, daily_pnl REAL,"
-            " regime TEXT, open_positions INTEGER, updated_at TIMESTAMP);"
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO bot_metrics VALUES (1, ?, ?, ?, ?, ?)",
-            (10_000.0, 0.0, "trend_up", 0, "2026-05-10T13:00:00+00:00"),
-        )
-        conn.commit()
-        conn.close()
+        _seed_signal(db, regime="trend_down", direction="short")
         update = _make_update()
         ctx = _make_context(db)
         await cmd_regime(update, ctx)
         msg = update.effective_chat.send_message.call_args[0][0]
-        assert "TREND_UP" in msg
-        assert "Обновлено" in msg
+        assert "Тренд вниз" in msg
 
     @pytest.mark.asyncio
-    async def test_regime_no_metrics_table(self, db):
-        """Fresh DB without bot_metrics table → fall back gracefully to N/A
-        (and not raise OperationalError)."""
+    async def test_regime_no_signal_is_unknown(self, db):
+        """No signals anywhere → '❓ Неизвестно', never raises."""
         from src.telegram_bot.handlers_premium import cmd_regime
         db.create_user(12345, "owner", "Owner")
         db.set_role(12345, "owner")
@@ -178,7 +208,49 @@ class TestPremiumHandlers:
         ctx = _make_context(db)
         await cmd_regime(update, ctx)
         msg = update.effective_chat.send_message.call_args[0][0]
-        assert "N/A" in msg
+        assert "Неизвестно" in msg
+
+    @pytest.mark.asyncio
+    async def test_signals_filter_by_timeframe(self, db, tmp_path):
+        """signals_tf filter scopes to one timeframe across the
+        isolated DBs."""
+        from src.telegram_bot.database import Database
+        from src.telegram_bot.handlers_premium import render_signals_view
+        p4 = str(tmp_path / "atomicortex.db")
+        p15 = str(tmp_path / "atomicortex_15m.db")
+        d4, d15 = Database(p4), Database(p15)
+        _seed_signal(d4, timeframe="4h", direction="long", regime="trend_up")
+        _seed_signal(d15, timeframe="15m", direction="short",
+                     regime="orb:trend_down")
+        ctx = _make_context(db, shared_db_paths=[p4, p15])
+        t_all, _ = render_signals_view(ctx, "all")
+        t_15, _ = render_signals_view(ctx, "15m")
+        # 15m filter must surface the SHORT/15m signal specifically.
+        assert "SHORT" in t_15 and "15M" in t_15
+        assert "Нет" not in t_all
+
+    @pytest.mark.asyncio
+    async def test_callback_signals_tf_handler(self, db, tmp_path):
+        """The inline 'signals_tf:' callback edits the message via the
+        bot dispatcher without raising."""
+        from src.telegram_bot.database import Database
+        from src.telegram_bot.bot import TelegramBot
+        p4 = str(tmp_path / "atomicortex.db")
+        d4 = Database(p4)
+        _seed_signal(d4, direction="long", regime="trend_up")
+        with patch.dict(os.environ, {"TELEGRAM_ADMIN_ID": "12345"}):
+            tg = TelegramBot(token="fake:token", admin_id=12345,
+                             db_path=tmp_path / "bot.db")
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "signals_tf:4h"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        ctx = _make_context(db, shared_db_paths=[p4])
+        await tg._handle_callback(update, ctx)
+        update.callback_query.edit_message_text.assert_awaited()
+        sent = update.callback_query.edit_message_text.call_args[0][0]
+        assert "LONG" in sent
 
     @pytest.mark.asyncio
     async def test_funding_live_success(self, db):

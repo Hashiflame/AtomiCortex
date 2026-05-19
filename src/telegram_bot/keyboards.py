@@ -15,6 +15,12 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 
+from src.telegram_bot.timeframes import (
+    active_timeframes,
+    get_tf_emoji,
+    get_tf_label,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Button text constants — used for matching in MessageHandler
@@ -229,3 +235,73 @@ def get_stats_admin_buttons() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📅 Месяц", callback_data="stats_period_month"),
         ],
     ])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 7.3 — interactive signal / history keyboards (timeframe-aware)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def signals_filter_keyboard(
+    active_tfs: list[str], selected: str = "all",
+) -> InlineKeyboardMarkup:
+    """Timeframe filter for the /signal view. Active TFs only."""
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    all_label = "✓ 🔵 Все" if selected == "all" else "🔵 Все"
+    row.append(InlineKeyboardButton(all_label, callback_data="signals_tf:all"))
+
+    for tf in active_tfs:
+        check = "✓ " if selected == tf else ""
+        row.append(InlineKeyboardButton(
+            f"{check}{get_tf_emoji(tf)} {get_tf_label(tf)}",
+            callback_data=f"signals_tf:{tf}",
+        ))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    open_label = "✓ 📂 Открытые" if selected == "open" else "📂 Открытые"
+    buttons.append([
+        InlineKeyboardButton(open_label, callback_data="signals_tf:open"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def history_keyboard(
+    page: int, total_pages: int, tf: str = "all",
+) -> InlineKeyboardMarkup:
+    """Pagination + timeframe filter for /history."""
+    total_pages = max(1, total_pages)
+    page = min(max(1, page), total_pages)
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(
+            "◀️ Пред", callback_data=f"history_page:{page - 1}:{tf}"))
+    nav.append(InlineKeyboardButton(
+        f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(
+            "След ▶️", callback_data=f"history_page:{page + 1}:{tf}"))
+
+    all_lbl = "✓ Все" if tf == "all" else "Все"
+    tf_row = [InlineKeyboardButton(
+        all_lbl, callback_data=f"history_tf:all:1")]
+    for active_tf in active_timeframes():
+        check = "✓" if tf == active_tf else ""
+        tf_row.append(InlineKeyboardButton(
+            f"{check}{get_tf_emoji(active_tf)}",
+            callback_data=f"history_tf:{active_tf}:1",
+        ))
+    return InlineKeyboardMarkup([nav, tf_row])
+
+
+def signal_detail_keyboard(signal_id: int) -> InlineKeyboardMarkup:
+    """Actions shown under an individual signal card."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📋 Подробнее", callback_data=f"signal_detail:{signal_id}"),
+        InlineKeyboardButton("🔙 Назад", callback_data="signals_back"),
+    ]])

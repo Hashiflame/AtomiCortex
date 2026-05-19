@@ -382,6 +382,83 @@ class Database:
         finally:
             conn.close()
 
+    def get_recent_signals(
+        self,
+        limit: int = 10,
+        timeframe: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recent signals (newest first), any status by default.
+
+        Single-DB by design — callers merge across the isolated trading
+        DBs (mirrors the /stats pattern). ``timeframe`` is only filtered
+        when the column exists; ``status`` is ``open`` or ``closed``.
+        """
+        conn = self._connect()
+        try:
+            cols = {
+                r[1] for r in conn.execute(
+                    "PRAGMA table_info(signals_log)"
+                ).fetchall()
+            }
+            where: list[str] = []
+            params: list[Any] = []
+            if timeframe and "timeframe" in cols:
+                where.append("COALESCE(timeframe,'4h') = ?")
+                params.append(timeframe)
+            if status == "open":
+                where.append("result = 'open'")
+            elif status == "closed":
+                where.append("result IN ('win','loss','breakeven')")
+            sql = "SELECT * FROM signals_log"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+    def get_signals_paginated(
+        self,
+        page: int,
+        per_page: int,
+        timeframe: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """``(page_rows, total_count)`` for single-DB pagination.
+
+        Multi-DB pagination is done by the caller over merged results;
+        this is the single-DB primitive.
+        """
+        page = max(1, page)
+        conn = self._connect()
+        try:
+            cols = {
+                r[1] for r in conn.execute(
+                    "PRAGMA table_info(signals_log)"
+                ).fetchall()
+            }
+            where = ""
+            params: list[Any] = []
+            if timeframe and "timeframe" in cols:
+                where = " WHERE COALESCE(timeframe,'4h') = ?"
+                params.append(timeframe)
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM signals_log{where}", params
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT * FROM signals_log{where} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (*params, per_page, (page - 1) * per_page),
+            ).fetchall()
+            return [dict(r) for r in rows], int(total)
+        except sqlite3.OperationalError:
+            return [], 0
+        finally:
+            conn.close()
+
     def get_open_signals(self) -> list[dict[str, Any]]:
         """Return signals with result='open'."""
         conn = self._connect()

@@ -63,7 +63,12 @@ from src.telegram_bot.handlers_premium import (
     cmd_regime,
     cmd_risk,
     cmd_signal,
+    find_signal_by_id,
+    render_history_view,
+    render_signals_view,
 )
+from src.telegram_bot.signal_formatter import format_signal_card
+from src.telegram_bot.keyboards import signal_detail_keyboard
 from src.telegram_bot.keyboards import (
     ALL_BUTTON_TEXTS,
     BTN_FUNDING,
@@ -291,6 +296,16 @@ class TelegramBot:
     # Inline callback router
     # ------------------------------------------------------------------
 
+    @staticmethod
+    async def _safe_edit(query: Any, text: str, reply_markup: Any = None) -> None:
+        """edit_message_text that swallows benign Telegram errors
+        (identical content → 'message is not modified', transient net)."""
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+        except Exception as exc:  # noqa: BLE001 — UI edit must never raise
+            if "not modified" not in str(exc).lower():
+                _log.warning("callback edit failed: {e}", e=str(exc))
+
     async def _handle_callback(
         self,
         update: Update,
@@ -366,8 +381,48 @@ class TelegramBot:
             page = int(data.split("_")[-1])
             await self._paginate_users(query, context, page)
 
-        elif data == "users_noop":
-            pass  # no-op for the page indicator
+        elif data == "users_noop" or data == "noop":
+            pass  # no-op for page/indicator buttons
+
+        # ── Interactive signals / history (Phase 7.3) ──
+        elif data.startswith("signals_tf:") or data == "signals_back":
+            selected = (
+                "all" if data == "signals_back"
+                else data.split(":", 1)[1]
+            )
+            text, kb = render_signals_view(context, selected)
+            await self._safe_edit(query, text, kb)
+
+        elif data.startswith("signal_detail:"):
+            try:
+                sid = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            sig = find_signal_by_id(context, sid)
+            if sig is None:
+                await self._safe_edit(
+                    query, "📭 Сигнал не найден.",
+                    signal_detail_keyboard(sid),
+                )
+            else:
+                await self._safe_edit(
+                    query, format_signal_card(sig, mode="full"),
+                    signal_detail_keyboard(sid),
+                )
+
+        elif data.startswith("history_page:"):
+            _, page_s, tf = data.split(":", 2)
+            text, kb = render_history_view(
+                context, page=int(page_s), tf=tf,
+            )
+            await self._safe_edit(query, text, kb)
+
+        elif data.startswith("history_tf:"):
+            _, tf, page_s = data.split(":", 2)
+            text, kb = render_history_view(
+                context, page=int(page_s), tf=tf,
+            )
+            await self._safe_edit(query, text, kb)
 
         # ── Stats admin period ──
         elif data.startswith("stats_period_"):

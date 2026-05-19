@@ -10,12 +10,141 @@ from telegram.ext import ContextTypes
 
 from src.logger import get_logger
 from src.telegram_bot.database import Database
+from src.telegram_bot.handlers_free import _resolve_stat_dbs
+from src.telegram_bot.keyboards import (
+    history_keyboard,
+    signal_detail_keyboard,
+    signals_filter_keyboard,
+)
 from src.telegram_bot.roles import require_role
+from src.telegram_bot.signal_formatter import format_signal_card
+from src.telegram_bot.timeframes import active_timeframes, tf_for_db_path
 
 _log = get_logger(__name__)
 
 # Binance USDT-M Futures public endpoint — no auth needed
 _BINANCE_PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
+
+_REGIME_INFO = {
+    "trend_up":   ("📈", "Тренд вверх", "Momentum стратегия активна"),
+    "trend_down": ("📉", "Тренд вниз", "Momentum стратегия активна"),
+    "high_vol":   ("⚡", "Высокая волатильность", "Defensive mode"),
+    "range":      ("↔️", "Боковик", "Mean-reversion режим"),
+    "orb_breakout": ("🎯", "ORB пробой", "Breakout стратегия (15m)"),
+    "UNKNOWN":    ("❓", "Неизвестно", "Ожидаем первый сигнал"),
+}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Shared multi-DB collectors (mirror the /stats merge pattern). Each
+# isolated trading DB is single-timeframe; rows are tagged + merged +
+# sorted by created_at DESC. Used by handlers AND inline callbacks.
+# ──────────────────────────────────────────────────────────────────────
+
+def _collect_recent(
+    context: ContextTypes.DEFAULT_TYPE,
+    limit: int = 10,
+    timeframe: str | None = None,
+    status: str | None = None,
+) -> list[dict]:
+    rows: list[dict] = []
+    for tf_label, db in _resolve_stat_dbs(context):
+        try:
+            part = db.get_recent_signals(limit=200, status=status)
+        except Exception:
+            continue
+        for s in part:
+            s.setdefault("timeframe", tf_label)
+            if not s.get("timeframe"):
+                s["timeframe"] = tf_label
+            rows.append(s)
+    if timeframe and timeframe not in ("all", "open"):
+        rows = [s for s in rows if s.get("timeframe") == timeframe]
+    rows.sort(key=lambda s: str(s.get("created_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def _collect_paginated(
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int,
+    per_page: int,
+    timeframe: str = "all",
+) -> tuple[list[dict], int]:
+    tf = None if timeframe in ("all", None) else timeframe
+    allrows = _collect_recent(context, limit=10_000, timeframe=tf)
+    total = len(allrows)
+    page = max(1, page)
+    start = (page - 1) * per_page
+    return allrows[start:start + per_page], total
+
+
+def render_signals_view(
+    context: ContextTypes.DEFAULT_TYPE, selected: str = "all",
+) -> tuple[str, object]:
+    """(text, keyboard) for the /signal view with a TF filter."""
+    status = "open" if selected == "open" else None
+    tf = None if selected in ("all", "open") else selected
+    sigs = _collect_recent(context, limit=1, timeframe=tf, status=status)
+    if not sigs:
+        scope = "открытых " if selected == "open" else ""
+        text = (
+            f"📭 Нет {scope}сигналов.\n"
+            "Бот работает и анализирует рынок."
+        )
+    else:
+        text = format_signal_card(
+            sigs[0], mode="open" if selected == "open" else "full"
+        )
+    kb = signals_filter_keyboard(active_timeframes(), selected)
+    return text, kb
+
+
+def render_history_view(
+    context: ContextTypes.DEFAULT_TYPE, page: int = 1, tf: str = "all",
+) -> tuple[str, object]:
+    per_page = 10
+    rows, total = _collect_paginated(context, page, per_page, tf)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(max(1, page), total_pages)
+    if not rows:
+        text = "📭 История пуста."
+    else:
+        head = "📋 История сигналов"
+        if tf != "all":
+            head += f" · {tf.upper()}"
+        lines = [head, "━" * 24]
+        lines += [format_signal_card(s, mode="compact") for s in rows]
+        lines.append(f"\nСтр. {page}/{total_pages} · всего {total}")
+        text = "\n".join(lines)
+    return text, history_keyboard(page, total_pages, tf)
+
+
+def find_signal_by_id(
+    context: ContextTypes.DEFAULT_TYPE, sid: int,
+) -> dict | None:
+    """Locate a signal by id across the merged trading DBs.
+
+    Note: ``id`` is per-DB autoincrement, so a 4H id can collide with a
+    15m id. First match (newest-first order) wins — acceptable for the
+    detail view; a globally-unique id is a future improvement.
+    """
+    for s in _collect_recent(context, limit=10_000):
+        try:
+            if int(s.get("id", -1)) == int(sid):
+                return s
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _latest_regime(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Regime from the most recent signal across shared DBs; the
+    trading bot's bot_metrics is unreliable (often UNKNOWN)."""
+    sigs = _collect_recent(context, limit=1)
+    if sigs and sigs[0].get("regime"):
+        # ORB strat encodes "orb:trend_up" — keep the base regime.
+        return str(sigs[0]["regime"]).split(":")[0]
+    return "UNKNOWN"
 
 
 def _format_age(updated_at: str) -> str:
@@ -39,68 +168,30 @@ def _format_age(updated_at: str) -> str:
 
 @require_role("premium")
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Last active signal with full details."""
-    db: Database = context.bot_data["db"]
-    signals = db.get_open_signals()
-
-    if not signals:
-        await update.effective_chat.send_message("📭 Нет активных сигналов.")
-        return
-
-    s = signals[0]
-    direction = s["direction"].upper() if s["direction"] else "N/A"
-    emoji = "🟢" if direction == "LONG" else "🔴"
-    symbol = s.get("symbol", "N/A")
-    entry = s.get("entry_price", 0)
-    sl = s.get("stop_loss", 0)
-    tp = s.get("take_profit", 0)
-    conf = s.get("confidence", 0)
-    regime = s.get("regime", "N/A")
-
-    sl_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0
-    tp_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    rr = reward / risk if risk > 0 else 0
-
-    await update.effective_chat.send_message(
-        f"{'═' * 30}\n"
-        f"{emoji} {direction} {symbol} PERP\n"
-        f"{'═' * 30}\n"
-        f"Цена входа: ${entry:,.2f}\n"
-        f"Стоп: ${sl:,.2f} (-{sl_pct:.1f}%)\n"
-        f"Тейк: ${tp:,.2f} (+{tp_pct:.1f}%)\n"
-        f"R:R: 1:{rr:.1f}\n"
-        f"Режим: {regime.upper()}\n"
-        f"Уверенность: {conf:.0%}\n"
-        f"{'═' * 30}"
-    )
+    """Most recent signal (any status) across all trading DBs, with an
+    inline timeframe filter. Never crashes — degrades to a message."""
+    try:
+        text, kb = render_signals_view(context, selected="all")
+        await update.effective_chat.send_message(text, reply_markup=kb)
+    except Exception as exc:
+        _log.error("cmd_signal failed: {e}", e=exc, exc_info=True)
+        await update.effective_chat.send_message(
+            "📭 Сигналы временно недоступны. Попробуйте позже."
+        )
 
 
 @require_role("premium")
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Last 10 signals with results."""
-    db: Database = context.bot_data["db"]
-    signals = db.get_signals_history(limit=10)
-
-    if not signals:
-        await update.effective_chat.send_message("📭 История сигналов пуста.")
-        return
-
-    lines = ["📋 Последние сигналы:\n"]
-    for s in signals:
-        result_emoji = {"win": "✅", "loss": "❌", "open": "🔵"}.get(
-            s.get("result", ""), "⚪"
+    """Paginated signal history (page 1, all timeframes) with inline
+    pagination + timeframe filter."""
+    try:
+        text, kb = render_history_view(context, page=1, tf="all")
+        await update.effective_chat.send_message(text, reply_markup=kb)
+    except Exception as exc:
+        _log.error("cmd_history failed: {e}", e=exc, exc_info=True)
+        await update.effective_chat.send_message(
+            "📭 История временно недоступна. Попробуйте позже."
         )
-        d = "L" if s.get("direction", "").lower() == "long" else "S"
-        pnl = s.get("pnl_pct")
-        pnl_str = f" ({pnl:+.2f}%)" if pnl is not None else ""
-        lines.append(
-            f"{result_emoji} {d} {s.get('symbol', '?')} "
-            f"@ ${s.get('entry_price', 0):,.0f}{pnl_str}"
-        )
-
-    await update.effective_chat.send_message("\n".join(lines))
 
 
 @require_role("premium")
@@ -224,32 +315,23 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @require_role("premium")
 async def cmd_regime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Current market regime — primary source: bot_metrics (live trading
-    process upserts every ~24h via SignalBridge.update_metrics).  Falls
-    back to the most recent signal's regime if metrics are absent (e.g.
-    fresh DB before the trading bot has produced anything)."""
-    db: Database = context.bot_data["db"]
-
-    metrics = db.get_latest_metrics()
-    regime = "N/A"
-    age_line = ""
-
-    if metrics and metrics.get("regime"):
-        regime = str(metrics["regime"]).upper()
-        if metrics.get("updated_at"):
-            age_line = f"Обновлено: {_format_age(metrics['updated_at'])}\n"
-    else:
-        signals = db.get_signals_history(limit=1)
-        if signals and signals[0].get("regime"):
-            regime = str(signals[0]["regime"]).upper()
-
-    await update.effective_chat.send_message(
-        f"📊 Режим рынка\n"
-        f"{'═' * 30}\n"
-        f"Режим:  {regime}\n"
-        f"{age_line}"
-        f"{'═' * 30}"
-    )
+    """Current market regime, derived from the most recent signal across
+    the trading DBs (bot_metrics.regime is unreliable — often UNKNOWN)."""
+    try:
+        regime = _latest_regime(context)
+        emoji, label, desc = _REGIME_INFO.get(regime, _REGIME_INFO["UNKNOWN"])
+        await update.effective_chat.send_message(
+            f"🌡 Текущий режим рынка\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{emoji} {label}\n"
+            f"ℹ️ {desc}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+    except Exception as exc:
+        _log.error("cmd_regime failed: {e}", e=exc, exc_info=True)
+        await update.effective_chat.send_message(
+            "🌡 Режим временно недоступен. Попробуйте позже."
+        )
 
 
 @require_role("premium")
