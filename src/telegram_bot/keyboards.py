@@ -286,22 +286,28 @@ def history_keyboard(
         nav.append(InlineKeyboardButton(
             "След ▶️", callback_data=f"history_page:{page + 1}:{tf}"))
 
-    all_lbl = "✓ Все" if tf == "all" else "Все"
-    tf_row = [InlineKeyboardButton(
-        all_lbl, callback_data=f"history_tf:all:1")]
+    # Timeframe filter row — labelled (emoji + TF), checkmark on active.
+    def _lbl(sel: str, text: str) -> InlineKeyboardButton:
+        mark = "✓ " if tf == sel else ""
+        return InlineKeyboardButton(
+            f"{mark}{text}", callback_data=f"history_tf:{sel}:1")
+
+    tf_row = [_lbl("all", "Все")]
     for active_tf in active_timeframes():
-        check = "✓" if tf == active_tf else ""
-        tf_row.append(InlineKeyboardButton(
-            f"{check}{get_tf_emoji(active_tf)}",
-            callback_data=f"history_tf:{active_tf}:1",
-        ))
-    return InlineKeyboardMarkup([nav, tf_row])
+        tf_row.append(_lbl(
+            active_tf, f"{get_tf_emoji(active_tf)} {get_tf_label(active_tf)}"))
+
+    # Result filter row — wins / losses.
+    res_row = [_lbl("wins", "✅ Wins"), _lbl("losses", "❌ Losses")]
+
+    return InlineKeyboardMarkup([nav, tf_row, res_row])
 
 
 def signal_detail_keyboard(signal_id: int) -> InlineKeyboardMarkup:
     """Actions shown under an individual signal card."""
     return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Обновить", callback_data="signal_refresh"),
         InlineKeyboardButton(
-            "📋 Подробнее", callback_data=f"signal_detail:{signal_id}"),
+            "📋 Детали", callback_data=f"signal_detail:{signal_id}"),
         InlineKeyboardButton("🔙 Назад", callback_data="signals_back"),
     ]])

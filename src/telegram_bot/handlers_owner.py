@@ -266,6 +266,15 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         signals_today, regime, stats, open_signals,
     )
 
+    # Trading-bot activity (per-timeframe; latest-signal proxy).
+    try:
+        from src.telegram_bot.handlers_free import format_bot_status
+        status_block = format_bot_status(context)
+        if status_block:
+            msg += f"\n\n{status_block}"
+    except Exception:
+        pass
+
     await update.effective_chat.send_message(
         msg, reply_markup=get_health_buttons(),
     )

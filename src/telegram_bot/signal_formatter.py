@@ -8,9 +8,23 @@ testable and reusable by handlers, broadcaster and callbacks.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from src.telegram_bot.timeframes import get_tf_emoji, get_tf_label
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    """Parse an ISO timestamp (tz-aware or naive) → aware UTC, or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 _REGIME_LABELS = {
     "trend_up": "Тренд ↗",
@@ -76,16 +90,20 @@ def format_signal_card(signal: dict, mode: str = "full") -> str:
     else:
         regime_label = _REGIME_LABELS.get(str(regime), str(regime))
 
+    created_dt = _parse_dt(signal.get("created_at"))
+    closed_dt = _parse_dt(signal.get("closed_at"))
+
     if mode == "compact":
         r_emoji = _RESULT_EMOJI.get(result, "❓")
-        if result == "open":
-            tail = "..."
-        else:
-            tail = f"{pnl:+.1f}%"
-        return (
+        line = (
             f"{r_emoji} {dir_emoji} {dir_label} {symbol} "
-            f"{tf_emoji} {get_tf_label(tf)} {tail}"
+            f"{tf_emoji}{get_tf_label(tf)}"
         )
+        if result != "open":
+            line += f"  {pnl:+.1f}%"
+        if created_dt:
+            line += f"  ·  {created_dt.strftime('%d.%m %H:%M')}"
+        return line
 
     header_status = ""
     if mode == "open":
@@ -98,6 +116,10 @@ def format_signal_card(signal: dict, mode: str = "full") -> str:
         f"{dir_emoji} {dir_label}  •  {symbol}  •  "
         f"{tf_emoji} {get_tf_label(tf)}{header_status}",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if created_dt:
+        lines.append(f"🕐 {created_dt.strftime('%d.%m.%Y %H:%M UTC')}")
+    lines += [
         f"💰 Вход:    ${entry:,.0f}",
         f"🎯 Тейк:    ${tp:,.0f}  ({tp_pct:+.1f}%)",
         f"🛑 Стоп:    ${sl:,.0f}  ({sl_pct:+.1f}%)",
@@ -106,6 +128,11 @@ def format_signal_card(signal: dict, mode: str = "full") -> str:
         f"🤖 Режим:   {regime_label}",
     ]
     if result in ("win", "loss", "breakeven"):
-        lines.append(f"💵 P&L:     {pnl:+.2f}%")
+        if created_dt and closed_dt:
+            secs = max(0, int((closed_dt - created_dt).total_seconds()))
+            lines.append(f"⏱ Длит.:   {secs // 3600}ч {secs % 3600 // 60}мин")
+        lines.append(
+            f"💹 P&L:     {pnl:+.2f}%  {_RESULT_EMOJI.get(result, '')}"
+        )
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)

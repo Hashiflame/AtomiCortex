@@ -426,11 +426,13 @@ class Database:
         page: int,
         per_page: int,
         timeframe: str | None = None,
+        result_filter: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """``(page_rows, total_count)`` for single-DB pagination.
 
         Multi-DB pagination is done by the caller over merged results;
-        this is the single-DB primitive.
+        this is the single-DB primitive. ``result_filter`` ∈
+        ``{None, "wins", "losses", "open"}`` (wins→result='win', etc.).
         """
         page = max(1, page)
         conn = self._connect()
@@ -440,11 +442,22 @@ class Database:
                     "PRAGMA table_info(signals_log)"
                 ).fetchall()
             }
-            where = ""
+            where_parts: list[str] = ["1=1"]
             params: list[Any] = []
-            if timeframe and "timeframe" in cols:
-                where = " WHERE COALESCE(timeframe,'4h') = ?"
+            if (
+                timeframe
+                and timeframe not in ("all", "wins", "losses")
+                and "timeframe" in cols
+            ):
+                where_parts.append("COALESCE(timeframe,'4h') = ?")
                 params.append(timeframe)
+            if result_filter == "wins":
+                where_parts.append("result = 'win'")
+            elif result_filter == "losses":
+                where_parts.append("result = 'loss'")
+            elif result_filter == "open":
+                where_parts.append("result = 'open'")
+            where = " WHERE " + " AND ".join(where_parts)
             total = conn.execute(
                 f"SELECT COUNT(*) FROM signals_log{where}", params
             ).fetchone()[0]

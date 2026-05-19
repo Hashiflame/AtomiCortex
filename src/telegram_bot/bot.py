@@ -385,9 +385,12 @@ class TelegramBot:
             pass  # no-op for page/indicator buttons
 
         # ── Interactive signals / history (Phase 7.3) ──
-        elif data.startswith("signals_tf:") or data == "signals_back":
+        elif (
+            data.startswith("signals_tf:")
+            or data in ("signals_back", "signal_refresh")
+        ):
             selected = (
-                "all" if data == "signals_back"
+                "all" if data in ("signals_back", "signal_refresh")
                 else data.split(":", 1)[1]
             )
             text, kb = render_signals_view(context, selected)
@@ -411,16 +414,16 @@ class TelegramBot:
                 )
 
         elif data.startswith("history_page:"):
-            _, page_s, tf = data.split(":", 2)
+            _, page_s, sel = data.split(":", 2)
             text, kb = render_history_view(
-                context, page=int(page_s), tf=tf,
+                context, page=int(page_s), sel=sel,
             )
             await self._safe_edit(query, text, kb)
 
         elif data.startswith("history_tf:"):
-            _, tf, page_s = data.split(":", 2)
+            _, sel, page_s = data.split(":", 2)
             text, kb = render_history_view(
-                context, page=int(page_s), tf=tf,
+                context, page=int(page_s), sel=sel,
             )
             await self._safe_edit(query, text, kb)
 

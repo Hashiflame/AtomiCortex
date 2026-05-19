@@ -166,6 +166,50 @@ def _resolve_stat_dbs(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, Dat
     return [("4h", context.bot_data["db"])]
 
 
+_BAR_MIN = {"4h": 240, "1h": 60, "15m": 15, "1d": 1440}
+_TF_DISPLAY = {"4h": "🟢 4H бот", "15m": "🔵 15m бот",
+               "1h": "🟡 1H бот", "1d": "⚪ 1D бот"}
+
+
+def format_bot_status(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """🔧 Статус block: per-timeframe activity, using the latest signal's
+    created_at as a 'last bar' proxy (bot_metrics is unreliable).
+
+    Active if the last signal is younger than 3× the bar period.
+    Returns '' when no trading DBs are resolvable.
+    """
+    lines: list[str] = []
+    now = datetime.now(timezone.utc)
+    for tf, db in _resolve_stat_dbs(context):
+        try:
+            recent = db.get_recent_signals(limit=1)
+        except Exception:
+            continue
+        name = _TF_DISPLAY.get(tf, f"{tf} бот")
+        if not recent or not recent[0].get("created_at"):
+            lines.append(f"{name}: ⚪ нет данных")
+            continue
+        try:
+            dt = datetime.fromisoformat(
+                str(recent[0]["created_at"]).replace("Z", "+00:00")
+            )
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc)
+            age_min = (now - dt).total_seconds() / 60.0
+            fresh = age_min <= 3 * _BAR_MIN.get(tf, 240)
+            status = "активен" if fresh else "⚠️ нет свежих баров"
+            lines.append(
+                f"{name}: {status} "
+                f"(посл. сигнал {dt.strftime('%d.%m %H:%M')})"
+            )
+        except (ValueError, TypeError):
+            lines.append(f"{name}: ⚪ нет данных")
+    if not lines:
+        return ""
+    return "🔧 Статус:\n" + "\n".join(lines) + "\n"
+
+
 def fmt_metric(value: float | None, spec: str = ".2f") -> str:
     """Render a risk ratio, or a low-sample placeholder when the
     StatsEngine returned ``None`` (< 10 closed signals)."""
@@ -286,6 +330,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
 
+        try:
+            status_block = format_bot_status(context)
+        except Exception:
+            status_block = ""
+
         msg = (
             f"📊 AtomiCortex — Статистика (30 дней)\n"
             f"{'═' * 38}\n"
@@ -295,7 +344,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Общий Win Rate:  {total_wr}\n"
             f"Общий P&L:       {_num(total.get('total_pnl_pct'), '+.1f')}%\n"
             f"{equity_line}{tracked_line}"
-            f"{'═' * 38}\n"
+            + (f"\n{status_block}" if status_block else "")
+            + f"{'═' * 38}\n"
             f"⏰ Период: {period}"
         )
         await update.effective_chat.send_message(msg)

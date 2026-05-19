@@ -41,11 +41,30 @@ _REGIME_INFO = {
 # sorted by created_at DESC. Used by handlers AND inline callbacks.
 # ──────────────────────────────────────────────────────────────────────
 
+_RESULT_FILTER_MAP = {"wins": "win", "losses": "loss", "open": "open"}
+
+
+def _resolve_selector(sel: str | None) -> tuple[str | None, str | None]:
+    """History/signal selector → (timeframe, result_filter).
+
+    ``all`` → (None, None); a timeframe → (tf, None);
+    ``wins``/``losses``/``open`` → (None, result_filter).
+    """
+    if not sel or sel == "all":
+        return None, None
+    if sel in active_timeframes():
+        return sel, None
+    if sel in _RESULT_FILTER_MAP:
+        return None, sel
+    return None, None
+
+
 def _collect_recent(
     context: ContextTypes.DEFAULT_TYPE,
     limit: int = 10,
     timeframe: str | None = None,
     status: str | None = None,
+    result_filter: str | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
     for tf_label, db in _resolve_stat_dbs(context):
@@ -60,6 +79,9 @@ def _collect_recent(
             rows.append(s)
     if timeframe and timeframe not in ("all", "open"):
         rows = [s for s in rows if s.get("timeframe") == timeframe]
+    if result_filter in _RESULT_FILTER_MAP:
+        want = _RESULT_FILTER_MAP[result_filter]
+        rows = [s for s in rows if (s.get("result") or "open") == want]
     rows.sort(key=lambda s: str(s.get("created_at") or ""), reverse=True)
     return rows[:limit]
 
@@ -68,10 +90,12 @@ def _collect_paginated(
     context: ContextTypes.DEFAULT_TYPE,
     page: int,
     per_page: int,
-    timeframe: str = "all",
+    selector: str = "all",
 ) -> tuple[list[dict], int]:
-    tf = None if timeframe in ("all", None) else timeframe
-    allrows = _collect_recent(context, limit=10_000, timeframe=tf)
+    tf, result_filter = _resolve_selector(selector)
+    allrows = _collect_recent(
+        context, limit=10_000, timeframe=tf, result_filter=result_filter,
+    )
     total = len(allrows)
     page = max(1, page)
     start = (page - 1) * per_page
@@ -99,24 +123,29 @@ def render_signals_view(
     return text, kb
 
 
+_SELECTOR_LABEL = {
+    "wins": "✅ Wins", "losses": "❌ Losses", "open": "📂 Открытые",
+}
+
+
 def render_history_view(
-    context: ContextTypes.DEFAULT_TYPE, page: int = 1, tf: str = "all",
+    context: ContextTypes.DEFAULT_TYPE, page: int = 1, sel: str = "all",
 ) -> tuple[str, object]:
     per_page = 10
-    rows, total = _collect_paginated(context, page, per_page, tf)
+    rows, total = _collect_paginated(context, page, per_page, sel)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = min(max(1, page), total_pages)
     if not rows:
         text = "📭 История пуста."
     else:
         head = "📋 История сигналов"
-        if tf != "all":
-            head += f" · {tf.upper()}"
+        if sel != "all":
+            head += f" · {_SELECTOR_LABEL.get(sel, sel.upper())}"
         lines = [head, "━" * 24]
         lines += [format_signal_card(s, mode="compact") for s in rows]
         lines.append(f"\nСтр. {page}/{total_pages} · всего {total}")
         text = "\n".join(lines)
-    return text, history_keyboard(page, total_pages, tf)
+    return text, history_keyboard(page, total_pages, sel)
 
 
 def find_signal_by_id(
@@ -137,13 +166,19 @@ def find_signal_by_id(
     return None
 
 
+def _latest_signal(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    """Most recent signal across all shared DBs (any status), or None."""
+    sigs = _collect_recent(context, limit=1)
+    return sigs[0] if sigs else None
+
+
 def _latest_regime(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Regime from the most recent signal across shared DBs; the
     trading bot's bot_metrics is unreliable (often UNKNOWN)."""
-    sigs = _collect_recent(context, limit=1)
-    if sigs and sigs[0].get("regime"):
+    s = _latest_signal(context)
+    if s and s.get("regime"):
         # ORB strat encodes "orb:trend_up" — keep the base regime.
-        return str(sigs[0]["regime"]).split(":")[0]
+        return str(s["regime"]).split(":")[0]
     return "UNKNOWN"
 
 
@@ -185,7 +220,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Paginated signal history (page 1, all timeframes) with inline
     pagination + timeframe filter."""
     try:
-        text, kb = render_history_view(context, page=1, tf="all")
+        text, kb = render_history_view(context, page=1, sel="all")
         await update.effective_chat.send_message(text, reply_markup=kb)
     except Exception as exc:
         _log.error("cmd_history failed: {e}", e=exc, exc_info=True)
@@ -318,13 +353,39 @@ async def cmd_regime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Current market regime, derived from the most recent signal across
     the trading DBs (bot_metrics.regime is unreliable — often UNKNOWN)."""
     try:
-        regime = _latest_regime(context)
+        from src.telegram_bot.signal_formatter import _clean_symbol, _parse_dt
+        from src.telegram_bot.timeframes import get_tf_label
+
+        sig = _latest_signal(context)
+        regime = (
+            str(sig["regime"]).split(":")[0]
+            if sig and sig.get("regime") else "UNKNOWN"
+        )
         emoji, label, desc = _REGIME_INFO.get(regime, _REGIME_INFO["UNKNOWN"])
+
+        src_lines = ""
+        if sig:
+            dt = _parse_dt(sig.get("created_at"))
+            date_str = (
+                dt.strftime("%d.%m.%Y %H:%M UTC") if dt
+                else str(sig.get("created_at") or "—")[:16]
+            )
+            pair = _clean_symbol(sig.get("symbol", "BTC"))
+            tf_label = get_tf_label(sig.get("timeframe") or "4h")
+            src_lines = (
+                f"\n"
+                f"📌 Источник: последний сигнал\n"
+                f"🕐 {date_str}\n"
+                f"💱 Пара: {pair}\n"
+                f"⏱ TF: {tf_label}\n"
+            )
+
         await update.effective_chat.send_message(
-            f"🌡 Текущий режим рынка\n"
+            f"🌡 Режим рынка\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{emoji} {label}\n"
             f"ℹ️ {desc}\n"
+            f"{src_lines}"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
     except Exception as exc:
