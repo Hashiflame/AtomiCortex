@@ -442,14 +442,9 @@ class FeaturePipeline:
             bar's feature vector). When False return the full enriched
             frame (used by tests to compare against the offline build).
         """
-        from src.features.regime_detector import (
-            RegimeDetector1H,
-            RegimeDetector15M,
-        )
-
-        if self.interval not in ("15m", "1h"):
+        if self.interval not in ("15m", "1h", "4h"):
             raise ValueError(
-                f"build_from_buffer supports '15m'/'1h', got '{self.interval}'"
+                f"build_from_buffer supports '15m'/'1h'/'4h', got '{self.interval}'"
             )
 
         empty = pl.DataFrame()
@@ -460,20 +455,42 @@ class FeaturePipeline:
         df = add_volume_features(df)
         df = add_price_features(df)
 
-        # 2b. Derivatives — base columns for MTF momentum features.
+        # 2b. Derivatives — base columns (funding + OI).
         df = add_funding_features(df, funding_df if funding_df is not None else empty)
         df = add_oi_features(df, metrics_df if metrics_df is not None else empty)
 
-        # 3. Regime detection (interval-tuned, same call as build scripts).
-        if self.interval == "15m":
-            detector: RegimeDetector = RegimeDetector15M()
+        # 2c. Basis features (derived from funding_cum_24h).
+        df = add_basis_features(df)
+
+        # 3. Regime detection (interval-tuned, same detector as offline).
+        if self.interval == "4h":
+            # 4H uses the standard RegimeDetector (same as build()).
+            detector: RegimeDetector = RegimeDetector()
+            df = detector.detect_all(df)
         else:
-            detector = RegimeDetector1H()
-        df = detector.detect_all(df, min_bars=detector.hurst_window)
+            from src.features.regime_detector import (
+                RegimeDetector1H,
+                RegimeDetector15M,
+            )
+            if self.interval == "15m":
+                detector = RegimeDetector15M()
+            else:
+                detector = RegimeDetector1H()
+            df = detector.detect_all(df, min_bars=detector.hurst_window)
+
+        # 4H: no MTF/session features — build_mtf() is a no-op for '4h'.
+        if self.interval == "4h":
+            if single_row:
+                return df.tail(1)
+            return df
+
+        # --- Below: 15m / 1h only ---
 
         # 4a. 1H HTF prep (15m only) — microstructure + regime + session.
         htf_1h = None
         if df_htf_1h is not None and not df_htf_1h.is_empty():
+            from src.features.regime_detector import RegimeDetector1H
+
             h1 = self._ensure_taker_buy_volume(df_htf_1h)
             h1 = add_cvd_features(h1)
             h1 = add_volume_features(h1)

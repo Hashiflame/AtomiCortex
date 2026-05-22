@@ -312,7 +312,10 @@ class TestBuildFromBuffer:
         # The single row is the most recent bar in the buffer.
         assert out["open_time"][0] == df_15m["open_time"][-1]
 
-    def test_build_from_buffer_rejects_4h(self) -> None:
+    def test_build_from_buffer_accepts_4h(self) -> None:
+        """Phase 6: build_from_buffer now supports '4h' interval."""
         pipe = FeaturePipeline(None, "BTCUSDT", "4h")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="15m'/'1h'"):
-            pipe.build_from_buffer(_klines(50, _BAR_MS_4H))
+        result = pipe.build_from_buffer(_klines(300, _BAR_MS_4H))
+        assert result.height == 1  # single_row default
+        assert "cvd" in result.columns
+        assert "hurst" in result.columns

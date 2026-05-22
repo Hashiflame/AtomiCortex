@@ -147,6 +147,14 @@ class MLTradingStrategy(Strategy):
         self._pending_signal_ids: dict[str, int] = {}  # symbol -> signal_id
         self._last_regime: str = ""  # for detecting regime changes
 
+        # Live feature state (Phase 6 — train/serve skew fix)
+        from src.features.live_feature_state import LiveFeatureState
+        self._live_state = LiveFeatureState()
+        self._pipeline: Any = None  # FeaturePipeline, init in on_start
+
+        # Consecutive feature failure counter (Phase 6 observability)
+        self._consecutive_feature_failures: int = 0
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -197,6 +205,74 @@ class MLTradingStrategy(Strategy):
             self.log.warning(f"SignalBridge init failed (non-fatal): {exc}")
             self._signal_bridge = None
 
+        # 8. FeaturePipeline for build_from_buffer (Phase 6)
+        try:
+            from src.features.feature_pipeline import FeaturePipeline
+            sym = str(self._instrument_id)
+            sym_base = sym.split("-")[0] if "-" in sym else sym.split(".")[0]
+            self._pipeline = FeaturePipeline(
+                data_store=None,  # type: ignore[arg-type]
+                symbol=sym_base,
+                interval="4h",
+            )
+            self.log.info("FeaturePipeline (4H) initialised for live inference")
+        except Exception as exc:
+            self.log.warning(f"FeaturePipeline init failed (non-fatal): {exc}")
+            self._pipeline = None
+
+        # 9. Subscribe to funding rate updates (Phase 6)
+        try:
+            from nautilus_trader.adapters.binance.futures.types import (
+                BinanceFuturesMarkPriceUpdate,
+            )
+            self.subscribe_data(
+                BinanceFuturesMarkPriceUpdate,
+                instrument_id=self._instrument_id,
+            )
+            self.log.info("Subscribed to funding rate updates")
+        except Exception as exc:
+            self.log.warning(f"Funding rate subscription unavailable: {exc}")
+
+        # 10. Schedule OI poll every 5 minutes (Phase 6)
+        try:
+            self.clock.set_timer(
+                name="oi_poll",
+                interval_ns=5 * 60 * 1_000_000_000,
+                callback=self._poll_open_interest,
+            )
+            self.log.info("OI poll timer scheduled (every 5 min)")
+        except Exception as exc:
+            self.log.warning(f"OI poll timer failed (non-fatal): {exc}")
+
+        # 11. Preload historical settled funding rates (Phase 6)
+        try:
+            import requests as _req
+            mode = self._config.trading_mode.lower()
+            _base = (
+                "https://testnet.binancefuture.com"
+                if mode == "testnet"
+                else "https://fapi.binance.com"
+            )
+            _sym = str(self._instrument_id)
+            _sym_clean = _sym.split("-")[0] if "-" in _sym else _sym.split(".")[0]
+            resp = _req.get(
+                f"{_base}/fapi/v1/fundingRate",
+                params={"symbol": _sym_clean, "limit": 100},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                for fr in resp.json():
+                    self._live_state.funding_rate_history.append({
+                        "fundingTime": int(fr["fundingTime"]),
+                        "fundingRate": float(fr["fundingRate"]),
+                    })
+                self.log.info(
+                    f"Preloaded {len(self._live_state.funding_rate_history)} "
+                    f"historical settled funding rates"
+                )
+        except Exception as exc:
+            self.log.warning(f"Funding rate preload failed (non-fatal): {exc}")
+
         if self._warmup_complete:
             self.log.info(
                 f"Strategy ready | "
@@ -221,6 +297,54 @@ class MLTradingStrategy(Strategy):
         )
 
     # ------------------------------------------------------------------
+    # Data handler (Phase 6 — live funding feed)
+    # ------------------------------------------------------------------
+
+    def on_data(self, data) -> None:
+        """Handle incoming data events (funding rate updates).
+
+        Called by Nautilus when subscribed data arrives. Currently handles
+        ``BinanceFuturesMarkPriceUpdate`` for live funding rate.
+
+        Point-in-time fix (Phase 6)
+        ---------------------------
+        ``BinanceFuturesMarkPriceUpdate`` streams the **predicted** funding
+        rate every second. Training data uses **settled** rates (final value
+        at settlement: 01:00, 09:00, 17:00 UTC).
+
+        We update ``self._live_state.funding_rate`` on every tick (for the
+        current ``funding_rate`` feature), but only append to
+        ``funding_rate_history`` at settlement times so that rolling features
+        (zscore, cum_24h) match the training distribution.
+        """
+        try:
+            from nautilus_trader.adapters.binance.futures.types import (
+                BinanceFuturesMarkPriceUpdate,
+            )
+            if isinstance(data, BinanceFuturesMarkPriceUpdate):
+                rate = float(data.funding_rate)
+                ts_ms = data.ts_event // 1_000_000
+
+                # Always update current rate (used as point-in-time feature)
+                self._live_state.update_funding(
+                    rate=rate, timestamp_ms=ts_ms,
+                )
+
+                # Append to history ONLY at settlement (every 8h)
+                from datetime import datetime as _dt, timezone as _tz
+                dt = _dt.fromtimestamp(ts_ms / 1000, tz=_tz.utc)
+                if dt.hour in (1, 9, 17) and dt.minute == 0:
+                    self._live_state.funding_rate_history.append({
+                        "fundingTime": ts_ms,
+                        "fundingRate": rate,
+                    })
+                    self.log.info(
+                        f"Funding settled: {rate:.6f} @ {dt.isoformat()}"
+                    )
+        except Exception as exc:
+            self.log.debug(f"on_data error (non-critical): {exc}")
+
+    # ------------------------------------------------------------------
     # Bar handler
     # ------------------------------------------------------------------
 
@@ -236,6 +360,22 @@ class MLTradingStrategy(Strategy):
             )
             self._bars.append(bar)
             self._bar_count += 1
+
+            # Phase 6: track bar in live feature state
+            self._live_state.add_bar(bar, interval="4h")
+
+            # Timestamp diagnostic (first bar only — verify ts_event conversion)
+            if self._bar_count == 1 and self._live_state.bar_buffer_4h:
+                _diag = self._live_state.bar_buffer_4h[-1]
+                _close_ms = bar.ts_event // 1_000_000
+                _open_ms = _diag["open_time"]
+                self.log.info(
+                    f"TIMESTAMP DIAGNOSTIC: "
+                    f"ts_event_ms={_close_ms} "
+                    f"open_time_ms={_open_ms} "
+                    f"diff_hours={(_close_ms - _open_ms) / 3_600_000:.1f}h "
+                    f"(expected 4.0h for 4H bars)"
+                )
 
             # Record equity
             self._record_equity(bar.ts_event)
@@ -291,12 +431,12 @@ class MLTradingStrategy(Strategy):
                 )
                 return
 
-            # 4. Compute features
+            # 4. Compute features (Phase 6: unified pipeline)
             self.log.info(
                 f"on_bar step 4: computing features "
                 f"(n={len(features_list)})"
             )
-            feature_vector = self._compute_features(features_list)
+            feature_vector = self._compute_features_unified(features_list)
             if feature_vector is None:
                 self.log.info("on_bar: feature_vector is None — skipping")
                 return
@@ -648,8 +788,82 @@ class MLTradingStrategy(Strategy):
     # Feature computation
     # ------------------------------------------------------------------
 
+    def _compute_features_unified(
+        self, feature_names: list[str],
+    ) -> np.ndarray | None:
+        """Build a feature vector via FeaturePipeline.build_from_buffer().
+
+        Phase 6 — eliminates train/serve skew by using the same transforms
+        as the offline training pipeline. Real funding rate and OI data
+        from ``LiveFeatureState`` are injected.
+
+        Falls back gracefully: if the pipeline is unavailable or fails,
+        logs an error and returns None (caller skips the bar — never
+        trades on bad features).
+        """
+        if self._pipeline is None:
+            self.log.warning(
+                "_compute_features_unified: pipeline not available — skipping"
+            )
+            return None
+
+        try:
+            import polars as pl
+
+            df_bars = self._live_state.get_bar_df("4h")
+            if df_bars.is_empty() or len(df_bars) < 50:
+                self.log.info(
+                    f"_compute_features_unified: insufficient bars "
+                    f"({len(df_bars)}) — skipping"
+                )
+                return None
+
+            funding_df = self._live_state.get_funding_df()
+            metrics_df = self._live_state.get_metrics_df()
+
+            features_df = self._pipeline.build_from_buffer(
+                df=df_bars,
+                funding_df=funding_df,
+                metrics_df=metrics_df,
+                single_row=True,
+            )
+
+            if features_df.is_empty():
+                self.log.warning("build_from_buffer returned empty — skipping")
+                return None
+
+            # Build vector in trained feature order
+            rd = {c: features_df[c][0] for c in features_df.columns}
+
+            # Add symbol_encoded (not emitted by pipeline)
+            sym_str = str(self._instrument_id)
+            sym_map = {"BTCUSDT": 0, "ETHUSDT": 1, "SOLUSDT": 2}
+            base = sym_str.split("-")[0] if "-" in sym_str else sym_str.split(".")[0]
+            rd["symbol_encoded"] = float(sym_map.get(base, -1))
+
+            vector = np.array(
+                [float(rd.get(f, 0.0) or 0.0) for f in feature_names],
+                dtype=np.float64,
+            )
+            self._consecutive_feature_failures = 0
+            return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+
+        except Exception as exc:
+            self._consecutive_feature_failures += 1
+            self.log.error(f"_compute_features_unified failed: {exc}")
+            if self._consecutive_feature_failures >= 3:
+                self.log.critical(
+                    f"ALERT: {self._consecutive_feature_failures} consecutive "
+                    f"feature computation failures — bot NOT trading!"
+                )
+            return None
+
     def _compute_features(self, feature_names: list[str]) -> np.ndarray | None:
         """Build a feature vector from the current bar buffer.
+
+        .. deprecated::
+            DEPRECATED — replaced by ``_compute_features_unified()`` in
+            Phase 6.  Kept as reference only; not called from ``on_bar()``.
 
         Uses the last 50 bars to compute microstructure features,
         then extracts only the features the model was trained on.
@@ -796,6 +1010,124 @@ class MLTradingStrategy(Strategy):
         except Exception as exc:
             self.log.error(f"Feature computation failed: {exc}")
             return None
+
+    # ------------------------------------------------------------------
+    # Periodic OI poll (Phase 6)
+    # ------------------------------------------------------------------
+
+    def _poll_open_interest(self, event=None) -> None:
+        """Non-blocking OI poll — schedules async task on event loop.
+
+        Timer callbacks run on the Nautilus event loop thread.
+        ``requests.get()`` is synchronous and would block the loop for
+        50-5000 ms.  Instead we offload to a thread via
+        ``asyncio.to_thread``.
+
+        Parameters
+        ----------
+        event:
+            Timer event from Nautilus (unused, required by callback API).
+        """
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._poll_open_interest_async())
+            else:
+                # Fallback for non-async context (tests / backtest)
+                self._poll_open_interest_sync()
+        except Exception as exc:
+            self.log.debug(f"OI poll schedule failed (non-critical): {exc}")
+
+    async def _poll_open_interest_async(self) -> None:
+        """Async OI fetch — offloads blocking HTTP to thread pool.
+
+        Converts OI from contracts (Binance ``/fapi/v1/openInterest``)
+        to USDT-value to match training data (``sum_open_interest_value``).
+        """
+        try:
+            import asyncio
+            import requests
+
+            mode = self._config.trading_mode.lower()
+            base = (
+                "https://testnet.binancefuture.com"
+                if mode == "testnet"
+                else "https://fapi.binance.com"
+            )
+            sym = str(self._instrument_id)
+            sym_clean = sym.split("-")[0] if "-" in sym else sym.split(".")[0]
+
+            resp = await asyncio.to_thread(
+                requests.get,
+                f"{base}/fapi/v1/openInterest",
+                params={"symbol": sym_clean},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                oi_contracts = float(data.get("openInterest", 0))
+                ts = int(data.get("time", 0))
+
+                # Convert contracts → USDT-value (training uses
+                # sum_open_interest_value from /futures/data/openInterestHist)
+                current_price = (
+                    self._bars[-1].close.as_double()
+                    if self._bars else 0.0
+                )
+                oi_usdt = (
+                    oi_contracts * current_price
+                    if current_price > 0 else oi_contracts
+                )
+
+                self._live_state.update_oi(oi=oi_usdt, timestamp_ms=ts)
+                self.log.debug(
+                    f"OI poll: {oi_contracts:.0f} contracts "
+                    f"= ${oi_usdt / 1e9:.2f}B USDT"
+                )
+            else:
+                self.log.debug(f"OI poll: HTTP {resp.status_code}")
+        except Exception as exc:
+            self.log.debug(f"OI async poll failed (non-critical): {exc}")
+
+    def _poll_open_interest_sync(self) -> None:
+        """Synchronous OI fetch — fallback for non-async contexts."""
+        try:
+            import requests
+
+            mode = self._config.trading_mode.lower()
+            base = (
+                "https://testnet.binancefuture.com"
+                if mode == "testnet"
+                else "https://fapi.binance.com"
+            )
+            sym = str(self._instrument_id)
+            sym_clean = sym.split("-")[0] if "-" in sym else sym.split(".")[0]
+
+            resp = requests.get(
+                f"{base}/fapi/v1/openInterest",
+                params={"symbol": sym_clean},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                oi_contracts = float(data.get("openInterest", 0))
+                ts = int(data.get("time", 0))
+                current_price = (
+                    self._bars[-1].close.as_double()
+                    if self._bars else 0.0
+                )
+                oi_usdt = (
+                    oi_contracts * current_price
+                    if current_price > 0 else oi_contracts
+                )
+                self._live_state.update_oi(oi=oi_usdt, timestamp_ms=ts)
+                self.log.debug(
+                    f"OI sync poll: {oi_contracts:.0f} contracts "
+                    f"= ${oi_usdt / 1e9:.2f}B USDT"
+                )
+        except Exception as exc:
+            self.log.debug(f"OI sync poll failed (non-critical): {exc}")
 
     # ------------------------------------------------------------------
     # Regime detection
@@ -965,14 +1297,16 @@ class MLTradingStrategy(Strategy):
             except Exception as e:
                 self.log.warning(f"Binance API preload failed: {e}")
 
-        # Fill bar buffer
+        # Fill bar buffer + live feature state
         if bars:
             for bar in bars[-n_bars:]:
                 self._bars.append(bar)
+                self._live_state.add_bar(bar, interval="4h")
             self._warmup_complete = True
             self.log.info(
                 f"Warmup complete via {source} | "
-                f"bars={len(self._bars)}"
+                f"bars={len(self._bars)} | "
+                f"live_state_4h={len(self._live_state.bar_buffer_4h)}"
             )
         else:
             self.log.warning(
