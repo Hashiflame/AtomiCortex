@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from src.logger import get_logger
@@ -208,6 +209,161 @@ class DatasetBuilder:
             f"DOWN={df['target'].eq(-1).sum()}"
         )
         return df
+
+    # ------------------------------------------------------------------
+    # Triple-barrier target (v3, López de Prado AFML Ch.3)
+    # ------------------------------------------------------------------
+
+    def create_target_triple_barrier(
+        self,
+        df: pl.DataFrame,
+        pt_multiplier: float = 1.0,
+        sl_multiplier: float = 1.0,
+        max_holding: int = 6,
+        atr_col: str = "atr_pct",
+        drop_timeout: bool = True,
+    ) -> pl.DataFrame:
+        """Vol-scaled symmetric triple-barrier labels (v3).
+
+        Thin wrapper around :func:`src.features.triple_barrier.apply_triple_barrier`
+        that renames ``label`` → ``target`` (LGBMTrainer contract) and
+        optionally drops timeout rows (``target == 0``) so the binary
+        booster only sees decisive outcomes.
+
+        Barriers are ATR-scaled (atr_pct = ATR/close, dimensionless):
+            upper = close × (1 + pt_multiplier × atr_pct)
+            lower = close × (1 - sl_multiplier × atr_pct)
+            vertical = t + max_holding bars
+
+        ``future_return`` is the realized close-to-close return at the
+        bar the trade actually exits (real path, not the barrier constant).
+        """
+        from src.features.triple_barrier import apply_triple_barrier
+
+        if atr_col not in df.columns:
+            raise ValueError(
+                f"DataFrame must contain '{atr_col}'; available cols sample: "
+                f"{df.columns[:10]}"
+            )
+
+        labeled = apply_triple_barrier(
+            df,
+            close_col="close",
+            atr_col=atr_col,
+            pt_multiplier=pt_multiplier,
+            sl_multiplier=sl_multiplier,
+            max_holding_bars=max_holding,
+        )
+
+        # Rename label → target; keep future_return as-is (already emitted).
+        labeled = labeled.rename({"label": "target"}).with_columns(
+            pl.col("target").cast(pl.Int64)
+        )
+
+        n_total = len(labeled)
+        if drop_timeout:
+            labeled = labeled.filter(pl.col("target") != 0)
+
+        n_pos = int((labeled["target"] == 1).sum())
+        n_neg = int((labeled["target"] == -1).sum())
+        n_kept = len(labeled)
+        pos_pct = 100.0 * n_pos / n_kept if n_kept else 0.0
+        _log.info(
+            f"Triple-barrier target (pt={pt_multiplier}, sl={sl_multiplier}, "
+            f"h={max_holding}): kept {n_kept}/{n_total} rows | "
+            f"UP={n_pos} ({pos_pct:.1f}%), DOWN={n_neg} ({100-pos_pct:.1f}%)"
+        )
+        return labeled
+
+    # ------------------------------------------------------------------
+    # Sample uniqueness weights (López de Prado AFML Ch.4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def compute_uniqueness_weights(
+        n_samples: int,
+        max_holding: int,
+    ) -> np.ndarray:
+        """Sample uniqueness weights for overlapping triple-barrier labels.
+
+        Each label i is "alive" over bars [i, i + max_holding - 1].
+        For each bar t, c_t = number of active labels at t. The
+        uniqueness of label i is::
+
+            u_i = mean( 1 / c_t  for t in [i, i + max_holding - 1] )
+
+        Weights are normalized so they sum to n_samples (mean weight = 1)
+        — this preserves LightGBM's effective sample count and keeps the
+        balanced-class weight multiplier interpretable.
+
+        Pure NumPy, no mlfinlab dependency. Assumes labels are ordered by
+        time within each symbol; for multi-symbol concatenations call this
+        per-symbol and stitch.
+
+        Parameters
+        ----------
+        n_samples:
+            Number of labels in the (per-symbol) DataFrame.
+        max_holding:
+            Vertical-barrier horizon in bars; same value passed to
+            ``apply_triple_barrier``.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples,) — non-negative weights, mean ≈ 1.
+        """
+        if n_samples == 0:
+            return np.zeros(0, dtype=np.float64)
+        if max_holding < 1:
+            raise ValueError("max_holding must be >= 1")
+
+        h = max_holding
+        # Each label i spans bars [i, i + h - 1] in label-index space.
+        # Concurrency at bar t: c_t = #{i : max(0,t-h+1) <= i <= min(t,N-1)}.
+        # For t in [0, N-1] this simplifies to min(t+1, h) — capped at h
+        # once enough history accumulates; no tail decrease (labels at
+        # the very end are still "alive" relative to each other).
+        t = np.arange(n_samples, dtype=np.float64)
+        concur = np.minimum(t + 1.0, float(h))
+        concur = np.maximum(concur, 1.0)
+        inv_c = 1.0 / concur
+
+        # u_i = mean of inv_c over [i, min(i+h, n)-1] via cumulative sum.
+        cum = np.concatenate(([0.0], np.cumsum(inv_c)))
+        end = np.minimum(np.arange(n_samples) + h, n_samples)
+        span = end - np.arange(n_samples)
+        u = (cum[end] - cum[np.arange(n_samples)]) / span
+
+        # Normalize: mean weight = 1 so balanced class weights still mean
+        # what they say when multiplied in.
+        u_mean = u.mean()
+        if u_mean > 0:
+            u = u / u_mean
+        return u.astype(np.float64)
+
+    def compute_uniqueness_weights_by_symbol(
+        self,
+        df: pl.DataFrame,
+        max_holding: int,
+        symbol_col: str = "symbol",
+    ) -> np.ndarray:
+        """Per-symbol uniqueness weights aligned with df row order.
+
+        Concurrent labels only overlap within a single symbol's time
+        series, so weights are computed per-symbol then concatenated in
+        the original row order.
+        """
+        if symbol_col not in df.columns:
+            return self.compute_uniqueness_weights(len(df), max_holding)
+
+        weights = np.zeros(len(df), dtype=np.float64)
+        idx = np.arange(len(df))
+        symbols = df[symbol_col].to_numpy()
+        for sym in np.unique(symbols):
+            mask = symbols == sym
+            n_sym = int(mask.sum())
+            weights[idx[mask]] = self.compute_uniqueness_weights(n_sym, max_holding)
+        return weights
 
     # ------------------------------------------------------------------
     # Feature column selection

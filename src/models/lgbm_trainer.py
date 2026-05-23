@@ -100,6 +100,19 @@ class ModelConfig:
     confidence_threshold: float = 0.55
     random_state: int = 42
 
+    # v3: triple-barrier target + AFML uniqueness weights.
+    # Enable for retraining; defaults preserve legacy sign(return) target
+    # so existing callers (production trend/high_vol/range models) are
+    # untouched.
+    use_triple_barrier: bool = False
+    use_uniqueness_weights: bool = False
+    barrier_pt_multiplier: float = 1.0
+    barrier_sl_multiplier: float = 1.0
+    barrier_max_holding: int = 6
+    # Optional model-file suffix (e.g. "_v3"); written between regime
+    # and ".pkl" so v3 retrains never overwrite production weights.
+    model_suffix: str = ""
+
     # LightGBM hyperparameters (defaults; Optuna can refine later)
     lgbm_params: dict[str, Any] = field(default_factory=lambda: {
         "objective": "binary",
@@ -221,12 +234,22 @@ class LGBMTrainer:
                 continue
 
             # Target FIRST — on full contiguous data to ensure
-            # consistent 1-bar return horizons (ML-002 fix)
-            sym_df = self._builder.create_target(
-                sym_df,
-                forward_bars=self.config.forward_bars,
-                threshold_atr_multiplier=self.config.threshold_atr_multiplier,
-            )
+            # consistent 1-bar return horizons (ML-002 fix).
+            # v3: vol-scaled symmetric triple-barrier (drops timeouts);
+            # legacy: 1-bar sign(return).
+            if self.config.use_triple_barrier:
+                sym_df = self._builder.create_target_triple_barrier(
+                    sym_df,
+                    pt_multiplier=self.config.barrier_pt_multiplier,
+                    sl_multiplier=self.config.barrier_sl_multiplier,
+                    max_holding=self.config.barrier_max_holding,
+                )
+            else:
+                sym_df = self._builder.create_target(
+                    sym_df,
+                    forward_bars=self.config.forward_bars,
+                    threshold_atr_multiplier=self.config.threshold_atr_multiplier,
+                )
 
             # Regime filter AFTER target creation
             if self.config.regime != "all":
@@ -301,6 +324,25 @@ class LGBMTrainer:
         train_weights = compute_sample_weight("balanced", y_train_fit)
         val_weights = compute_sample_weight("balanced", y_val)
 
+        # v3: multiply in AFML uniqueness weights (per-symbol concurrency
+        # over the triple-barrier holding window). Aligned to train_df row
+        # order, so the same val_split slice applies. Multiplied with
+        # balanced weights; mean(uniqueness) ≈ 1 so the balanced scale is
+        # preserved and LightGBM's effective sample count stays in range.
+        if self.config.use_uniqueness_weights:
+            uniq_all = self._builder.compute_uniqueness_weights_by_symbol(
+                train_df, max_holding=self.config.barrier_max_holding,
+            )
+            uniq_fit = uniq_all[:val_split]
+            uniq_val = uniq_all[val_split:]
+            train_weights = train_weights * uniq_fit
+            val_weights = val_weights * uniq_val
+            _log.info(
+                f"Uniqueness weights applied (h={self.config.barrier_max_holding}): "
+                f"fit mean={uniq_fit.mean():.3f}, "
+                f"range=[{uniq_fit.min():.3f}, {uniq_fit.max():.3f}]"
+            )
+
         _log.info(
             f"Class balance — train: "
             f"DOWN(0)={int((y_train_fit==0).sum())}, "
@@ -363,7 +405,12 @@ class LGBMTrainer:
         self._log_to_mlflow(booster, feature_names)
 
         # --- Save model + feature columns ---
-        model_path = self.models_dir / f"{self.config.regime}_model.pkl"
+        # model_suffix lets v3 retrains coexist with production weights
+        # (empty string → legacy "{regime}_model.pkl"; "_v3" → "_v3.pkl").
+        model_path = (
+            self.models_dir
+            / f"{self.config.regime}_model{self.config.model_suffix}.pkl"
+        )
         model_bundle = {
             "booster": booster,
             "feature_columns": feature_names,
