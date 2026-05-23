@@ -28,6 +28,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -63,6 +64,13 @@ DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 CLASS_BALANCE_MIN = 0.35
 CLASS_BALANCE_MAX = 0.65
 
+# Winning cells from the Block-2 baseline grid. --best-only refits at
+# these so the only delta vs the 45-feature baseline is the whitelist.
+BEST_CELLS: dict[str, dict[str, Any]] = {
+    "trend":    {"pt": 1.25, "sl": 1.0, "hold": 4},
+    "high_vol": {"pt": 1.25, "sl": 1.0, "hold": 6},
+}
+
 
 def _sharpe_proxy(result: EvaluationResult) -> float:
     """OOS Sharpe proxy from WR & PF — same shape used in statistical_tests
@@ -78,6 +86,8 @@ def _build_config(
     pt: float,
     sl: float,
     hold: int,
+    feature_whitelist: list[str] | None = None,
+    model_suffix: str = "_v3",
 ) -> ModelConfig:
     return ModelConfig(
         regime=regime,
@@ -87,8 +97,64 @@ def _build_config(
         barrier_pt_multiplier=pt,
         barrier_sl_multiplier=sl,
         barrier_max_holding=hold,
-        model_suffix="_v3",
+        model_suffix=model_suffix,
+        feature_whitelist=feature_whitelist,
     )
+
+
+def run_best_only(
+    features_dir: Path,
+    models_dir: Path,
+    symbols: list[str],
+    regimes: list[str],
+    feature_whitelist: list[str] | None,
+    model_suffix: str,
+) -> dict[str, dict[str, Any]]:
+    """Refit at the winning Block-2 cells only — fast A/B vs the baseline.
+
+    Used to isolate the effect of the clustered-MDA feature selection
+    (or any other single change) without rerunning the full grid.
+    """
+    v3_dir = models_dir / "v3"
+    v3_dir.mkdir(parents=True, exist_ok=True)
+    summary: dict[str, dict[str, Any]] = {}
+
+    for regime in regimes:
+        cell = BEST_CELLS.get(regime)
+        if cell is None:
+            _log.warning(f"No BEST_CELLS entry for {regime} — skipping")
+            continue
+        print(f"\n{'='*78}\n  BEST-ONLY refit | regime={regime} | "
+              f"cell={cell} | suffix={model_suffix}\n{'='*78}")
+        if feature_whitelist:
+            print(f"  Whitelist active: {len(feature_whitelist)} features")
+        trainer = LGBMTrainer(
+            config=_build_config(
+                regime, symbols,
+                pt=cell["pt"], sl=cell["sl"], hold=cell["hold"],
+                feature_whitelist=feature_whitelist,
+                model_suffix=model_suffix,
+            ),
+            features_dir=features_dir,
+            models_dir=v3_dir,
+            use_mtf_params=True,
+        )
+        train_df, test_df = trainer.prepare_data()
+        n_pos = int((train_df["target"] == 1).sum())
+        pos_frac = n_pos / len(train_df) if len(train_df) else 0.0
+        model = trainer.train(train_df)
+        result = trainer.evaluate(model, test_df)
+        summary[regime] = {
+            "cell": cell,
+            "pos_frac": pos_frac,
+            "n_features": len(trainer._feature_columns),
+            "final": asdict(result),
+        }
+        print(f"  ✓ WR={result.win_rate}% PF={result.profit_factor} "
+              f"sig={result.signal_rate*100:.1f}% acc={result.accuracy}% "
+              f"avg_conf={result.avg_confidence}  "
+              f"(features={len(trainer._feature_columns)})")
+    return summary
 
 
 def _dry_run_cell(
@@ -259,8 +325,16 @@ def _print_summary(
     print(f"{'='*78}")
     for regime, s in summary.items():
         f = s["final"]
-        print(f"\n[{regime}] best={s['best_cell']} DSR={s['dsr']:.3f} "
-              f"(n_valid={s['n_valid_cells']})")
+        cell = s.get("best_cell") or s.get("cell")
+        extras = []
+        if "dsr" in s:
+            extras.append(f"DSR={s['dsr']:.3f}")
+        if "n_valid_cells" in s:
+            extras.append(f"n_valid={s['n_valid_cells']}")
+        if "n_features" in s:
+            extras.append(f"feats={s['n_features']}")
+        suffix = f"  ({', '.join(extras)})" if extras else ""
+        print(f"\n[{regime}] cell={cell}{suffix}")
         print(f"  WR={f['win_rate']}%  PF={f['profit_factor']}  "
               f"sig={f['signal_rate']*100:.1f}%  acc={f['accuracy']}%  "
               f"avg_conf={f['avg_confidence']}")
@@ -278,6 +352,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--regimes", default=",".join(DEFAULT_REGIMES))
     p.add_argument("--dry-run", action="store_true",
                    help="Print class balance + uniqueness stats per grid cell; no training.")
+    p.add_argument("--best-only", action="store_true",
+                   help="Skip grid; refit only at BEST_CELLS (Block-2 winners). "
+                        "Pair with --selected-features for fast A/B.")
+    p.add_argument("--selected-features", type=Path, default=None,
+                   help="Path to selected_features_v3.json (whitelist). "
+                        "Restricts X to these columns (+ symbol_encoded).")
+    p.add_argument("--model-suffix", default="_v3",
+                   help="Filename suffix written between regime and .pkl "
+                        "(e.g. '_v3_sel' for the selected-features variant).")
     return p.parse_args()
 
 
@@ -291,7 +374,19 @@ def main() -> None:
         run_dry_run(args.features_dir, symbols, regimes)
         return
 
-    summary = run_grid(args.features_dir, args.models_dir, symbols, regimes)
+    whitelist: list[str] | None = None
+    if args.selected_features:
+        payload = json.loads(args.selected_features.read_text())
+        whitelist = payload["selected_features"]
+        _log.info(f"Loaded whitelist ({len(whitelist)}): {whitelist}")
+
+    if args.best_only:
+        summary = run_best_only(
+            args.features_dir, args.models_dir, symbols, regimes,
+            feature_whitelist=whitelist, model_suffix=args.model_suffix,
+        )
+    else:
+        summary = run_grid(args.features_dir, args.models_dir, symbols, regimes)
     _print_summary(summary, args.models_dir)
 
 

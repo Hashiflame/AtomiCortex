@@ -112,6 +112,11 @@ class ModelConfig:
     # Optional model-file suffix (e.g. "_v3"); written between regime
     # and ".pkl" so v3 retrains never overwrite production weights.
     model_suffix: str = ""
+    # Optional feature whitelist (clustered-MDA selection output).
+    # When set, _prepare_xy restricts X to the intersection of the
+    # detected feature columns and this list (preserving the whitelist's
+    # order); symbol_encoded is still auto-appended downstream.
+    feature_whitelist: list[str] | None = None
 
     # LightGBM hyperparameters (defaults; Optuna can refine later)
     lgbm_params: dict[str, Any] = field(default_factory=lambda: {
@@ -588,6 +593,17 @@ class LGBMTrainer:
         else:
             # First call — discover features
             df_cols = self._builder.get_feature_columns(df)
+            # v3 feature selection: restrict to the whitelist if provided.
+            # Preserves the whitelist's order so retrains with the same
+            # JSON produce identical feature_columns ordering.
+            wl = self.config.feature_whitelist
+            if wl:
+                present = set(df_cols)
+                df_cols = [f for f in wl if f in present]
+                _log.info(
+                    f"Feature whitelist active: {len(df_cols)}/{len(wl)} "
+                    f"selected features present in data"
+                )
 
         X = df.select(df_cols).to_numpy().astype(np.float64)
 
