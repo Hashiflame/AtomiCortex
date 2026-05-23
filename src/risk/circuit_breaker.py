@@ -20,7 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from src.logger import get_logger
 
@@ -64,9 +65,19 @@ class CircuitBreaker:
     FUNDING_EXTREME: float = 0.001        # |funding| > 0.1%
     CONSECUTIVE_LOSSES: int = 5           # 5 consecutive losses
 
-    def __init__(self) -> None:
+    def __init__(self, state_path: Path | str | None = None) -> None:
         self._daily_triggered: bool = False
         self._daily_trigger_reason: str = ""
+
+        # Optional crash-safe persistence. Note ``consecutive_losses`` lives
+        # on PortfolioTracker — its persistence is handled there. What this
+        # store keeps is the sticky-for-the-day "halted" flag so a restart
+        # during a triggered day doesn't quietly resume trading.
+        self._store: Any = None
+        if state_path is not None:
+            from src.risk.risk_state_store import RiskStateStore
+            self._store = RiskStateStore(state_path)
+            self._restore_from_store()
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,6 +155,7 @@ class CircuitBreaker:
                 f"Daily loss HARD {portfolio_state.daily_pnl_pct:.2%} "
                 f"<= {self.DAILY_LOSS_HARD:.2%}"
             )
+            self._persist()
             log.error(
                 "Daily HARD breaker | daily_pnl={dp:.2%}",
                 dp=portfolio_state.daily_pnl_pct,
@@ -236,5 +248,59 @@ class CircuitBreaker:
         """Reset daily counters at midnight."""
         self._daily_triggered = False
         self._daily_trigger_reason = ""
+        self._persist()
         log.info("Circuit breaker daily counters reset")
+
+    # ------------------------------------------------------------------
+    # Persistence (optional — engaged only when state_path is supplied)
+    # ------------------------------------------------------------------
+
+    def _persist(self) -> None:
+        if self._store is None:
+            return
+        try:
+            # Merge — preserve unrelated keys (the same file is shared with
+            # PortfolioTracker in production).
+            existing = self._store.load() if self._store is not None else {}
+        except Exception:
+            existing = {}
+        existing["breaker_daily_triggered"] = self._daily_triggered
+        existing["breaker_daily_trigger_reason"] = self._daily_trigger_reason
+        # Stamp today's UTC midnight so RiskStateStore.load preserves the
+        # flag on a same-day reload (and clears it on a next-day reload).
+        # In production this key is also written by PortfolioTracker; we
+        # set it here so a breaker-only test still gets correct semantics.
+        if "day_start" not in existing:
+            now = datetime.now(timezone.utc)
+            existing["day_start"] = now.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            ).isoformat()
+        try:
+            self._store.save(existing)
+        except Exception as exc:
+            log.warning(
+                "CircuitBreaker persist failed (non-fatal): {err}",
+                err=str(exc),
+            )
+
+    def _restore_from_store(self) -> None:
+        """Re-apply the persisted halt flag; RiskStateStore.load already
+        applied the daily reset so a stale yesterday flag is cleared."""
+        try:
+            state = self._store.load() if self._store is not None else {}
+        except Exception as exc:
+            log.warning(
+                "CircuitBreaker restore failed (non-fatal): {err}",
+                err=str(exc),
+            )
+            return
+        if not state:
+            return
+        self._daily_triggered = bool(state.get("breaker_daily_triggered", False))
+        self._daily_trigger_reason = str(state.get("breaker_daily_trigger_reason", ""))
+        if self._daily_triggered:
+            log.warning(
+                "CircuitBreaker restored as TRIGGERED | reason={r}",
+                r=self._daily_trigger_reason,
+            )
 

@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 from src.logger import get_logger
 from src.risk.risk_engine import PortfolioState
+from src.risk.risk_state_store import RiskStateStore
 
 log = get_logger(__name__)
 
@@ -45,7 +48,11 @@ class PortfolioTracker:
     :class:`CircuitBreaker` to make risk decisions.
     """
 
-    def __init__(self, initial_equity: float) -> None:
+    def __init__(
+        self,
+        initial_equity: float,
+        state_path: Path | str | None = None,
+    ) -> None:
         self._initial_equity: float = initial_equity
         self._cash: float = initial_equity
         self._peak_equity: float = initial_equity
@@ -70,9 +77,18 @@ class PortfolioTracker:
         self._consecutive_losses: int = 0
         self._last_loss_time: datetime | None = None
 
+        # Optional crash-safe persistence (None → in-memory only, backward
+        # compatible with every existing caller).
+        self._store: RiskStateStore | None = (
+            RiskStateStore(state_path) if state_path is not None else None
+        )
+        if self._store is not None:
+            self._restore_from_store()
+
         log.info(
-            "PortfolioTracker initialised | equity={eq}",
+            "PortfolioTracker initialised | equity={eq} | persisted={p}",
             eq=initial_equity,
+            p=self._store is not None,
         )
 
     # ------------------------------------------------------------------
@@ -121,6 +137,7 @@ class PortfolioTracker:
             p=price,
             f=fee,
         )
+        self._persist()
 
     def update_price(self, symbol: str, current_price: float) -> None:
         """Update mark price for an open position."""
@@ -184,6 +201,7 @@ class PortfolioTracker:
         )
 
         del self._positions[symbol]
+        self._persist()
         return realized_pnl
 
     def get_state(self) -> PortfolioState:
@@ -233,6 +251,7 @@ class PortfolioTracker:
             n=self._consecutive_losses,
             t=timestamp.isoformat(),
         )
+        self._persist()
 
     # ------------------------------------------------------------------
     # Internals
@@ -246,13 +265,123 @@ class PortfolioTracker:
     def _roll_periods(self, now: datetime) -> None:
         """Reset daily/weekly accumulators if boundaries crossed."""
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        rolled = False
         if today_start > self._day_start:
             self._daily_realized_pnl = 0.0
             self._day_start = today_start
+            rolled = True
             log.debug("Daily PnL counter rolled over")
 
         week_start = today_start - timedelta(days=today_start.weekday())
         if week_start > self._week_start:
             self._weekly_realized_pnl = 0.0
             self._week_start = week_start
+            rolled = True
             log.debug("Weekly PnL counter rolled over")
+
+        if rolled:
+            self._persist()
+
+    # ------------------------------------------------------------------
+    # Persistence (optional — engaged only when state_path is supplied)
+    # ------------------------------------------------------------------
+
+    def _snapshot(self) -> dict[str, Any]:
+        """Serialise the persistable counters."""
+        return {
+            "cash": self._cash,
+            "peak_equity": self._peak_equity,
+            "daily_realized_pnl": self._daily_realized_pnl,
+            "weekly_realized_pnl": self._weekly_realized_pnl,
+            "total_realized_pnl": self._total_realized_pnl,
+            "consecutive_losses": self._consecutive_losses,
+            "last_loss_time": (
+                self._last_loss_time.isoformat()
+                if self._last_loss_time is not None else None
+            ),
+            "day_start": self._day_start.isoformat(),
+            "week_start": self._week_start.isoformat(),
+        }
+
+    def _persist(self) -> None:
+        if self._store is None:
+            return
+        try:
+            self._store.save(self._snapshot())
+        except Exception as exc:
+            log.warning(
+                "PortfolioTracker persist failed (non-fatal): {err}",
+                err=str(exc),
+            )
+
+    def _restore_from_store(self) -> None:
+        """Apply persisted scalars on top of the freshly initialised state.
+
+        ``RiskStateStore.load`` has already applied the daily / weekly
+        reset semantics, so we can trust the returned dict.
+        """
+        try:
+            state = self._store.load() if self._store is not None else {}
+        except Exception as exc:
+            log.warning(
+                "PortfolioTracker restore failed (non-fatal): {err}",
+                err=str(exc),
+            )
+            return
+        if not state:
+            return
+
+        try:
+            if "cash" in state:
+                self._cash = float(state["cash"])
+            if "peak_equity" in state:
+                self._peak_equity = float(state["peak_equity"])
+            if "daily_realized_pnl" in state:
+                self._daily_realized_pnl = float(state["daily_realized_pnl"])
+            if "weekly_realized_pnl" in state:
+                self._weekly_realized_pnl = float(state["weekly_realized_pnl"])
+            if "total_realized_pnl" in state:
+                self._total_realized_pnl = float(state["total_realized_pnl"])
+            if "consecutive_losses" in state:
+                self._consecutive_losses = int(state["consecutive_losses"])
+            llt = state.get("last_loss_time")
+            if isinstance(llt, str) and llt:
+                try:
+                    dt = datetime.fromisoformat(llt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self._last_loss_time = dt
+                except ValueError:
+                    pass
+            ds = state.get("day_start")
+            if isinstance(ds, str) and ds:
+                try:
+                    dt = datetime.fromisoformat(ds)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self._day_start = dt
+                except ValueError:
+                    pass
+            ws = state.get("week_start")
+            if isinstance(ws, str) and ws:
+                try:
+                    dt = datetime.fromisoformat(ws)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self._week_start = dt
+                except ValueError:
+                    pass
+            log.info(
+                "PortfolioTracker restored | cash={c} peak={p} "
+                "daily_pnl={d} weekly_pnl={w} consec_losses={cl}",
+                c=self._cash,
+                p=self._peak_equity,
+                d=self._daily_realized_pnl,
+                w=self._weekly_realized_pnl,
+                cl=self._consecutive_losses,
+            )
+        except Exception as exc:
+            log.warning(
+                "PortfolioTracker restore parse failed (non-fatal): {err}",
+                err=str(exc),
+            )
