@@ -161,6 +161,11 @@ class MLTradingStrategy(Strategy):
         # keeps trading even when monitoring is degraded.
         self._heartbeat: Any = None
 
+        # Multi-level circuit breaker (master-doc thresholds: -2/-3% daily,
+        # -8% weekly, -15% drawdown kill, 5 consecutive losses). Created in
+        # on_start; stays None in unit tests that never call on_start.
+        self._breaker: Any = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -180,6 +185,11 @@ class MLTradingStrategy(Strategy):
 
         # 2. Portfolio Tracker
         self._tracker = PortfolioTracker(self._config.initial_equity)
+
+        # 2b. Circuit Breaker — multi-level trading-halt guard. Hard-coded
+        # master-doc thresholds; evaluated each bar before regime detection.
+        from src.risk.circuit_breaker import CircuitBreaker
+        self._breaker = CircuitBreaker()
 
         # 3. Regime Detector
         from src.features.regime_detector import RegimeDetector
@@ -461,6 +471,34 @@ class MLTradingStrategy(Strategy):
                         f"{remaining} remaining)"
                     )
                     return
+
+            # 1b. Circuit breaker — block new entries when triggered.
+            # Existing positions stay protected by their exchange-side SL/TP;
+            # auto-flattening on drawdown would sell into the panic.
+            if self._breaker is not None and self._tracker is not None:
+                try:
+                    funding = float(
+                        getattr(self._live_state, "funding_rate", 0.0) or 0.0
+                    )
+                    # ATR=0 disables only the vol-spike branch (which never
+                    # sets is_triggered=True); loss / drawdown / consecutive-
+                    # loss guards run from portfolio_state alone.
+                    breaker_state = self._breaker.check(
+                        portfolio_state=self._tracker.get_state(),
+                        current_atr=0.0,
+                        avg_atr=0.0,
+                        current_funding=funding,
+                    )
+                    if breaker_state.is_triggered:
+                        self.log.warning(
+                            f"CIRCUIT BREAKER TRIPPED — skipping bar | "
+                            f"reason={breaker_state.trigger_reason}"
+                        )
+                        return
+                except Exception as exc:
+                    self.log.warning(
+                        f"Circuit breaker check failed (non-fatal): {exc}"
+                    )
 
             # 2. Detect regime
             self.log.info("on_bar step 2: detecting regime")
