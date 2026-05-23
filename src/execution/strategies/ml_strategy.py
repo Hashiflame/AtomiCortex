@@ -171,6 +171,11 @@ class MLTradingStrategy(Strategy):
         # state. Report-only (log.critical); operator decides remediation.
         self._reconciler: Any = None
 
+        # Crash-safe mirror of _pending_sl_params. Stays None if the store
+        # can't be created; the bot then runs with in-memory only (a
+        # degraded but non-fatal mode — same behaviour as before this fix).
+        self._pending_store: Any = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -303,6 +308,11 @@ class MLTradingStrategy(Strategy):
         # positions between tracker state and the exchange. Runs once at
         # start (catches leftovers from a previous crash) then every 15 min.
         self._schedule_reconciliation()
+
+        # 14. Pending-SL crash-safe store. Restore any entries from a
+        # prior run so that fills arriving after restart still trigger
+        # SL placement instead of being mis-classified as exits.
+        self._init_pending_store()
 
         if self._warmup_complete:
             self.log.info(
@@ -488,6 +498,51 @@ class MLTradingStrategy(Strategy):
             self.log.warning(
                 f"Reconciliation failed (non-fatal): {exc}"
             )
+
+    # ------------------------------------------------------------------
+    # Pending-SL persistence (crash-safe mirror of _pending_sl_params)
+    # ------------------------------------------------------------------
+
+    def _init_pending_store(self) -> None:
+        """Create the on-disk store and replay any entries from a prior run.
+
+        Restored entries are NOT used to re-submit stops directly — that
+        could double-place SL orders if the fill already happened before
+        the crash. They populate ``_pending_sl_params`` so that the next
+        fill event for the same client_order_id is recognised as an entry
+        and goes through the normal SL placement path. The case where the
+        fill happened *during* the crash window (Binance does not replay)
+        is covered by the PositionReconciler ORPHAN alert.
+        """
+        try:
+            from src.execution.pending_orders_store import PendingOrdersStore
+
+            project_root = Path(__file__).resolve().parents[3]
+            db_path = Path(self._config.signal_db_path)
+            if not db_path.is_absolute():
+                db_path = project_root / db_path
+            store_path = db_path.parent / "pending_sl_4h.json"
+
+            self._pending_store = PendingOrdersStore(store_path)
+            restored = self._pending_store.load_all()
+            if restored:
+                # Replay into the in-memory dict the rest of the strategy uses.
+                for oid, entry in restored.items():
+                    if oid not in self._pending_sl_params:
+                        self._pending_sl_params[oid] = entry
+                self.log.warning(
+                    f"Restored {len(restored)} pending SL params from "
+                    f"{store_path} — awaiting fill events to place stops"
+                )
+            else:
+                self.log.info(
+                    f"Pending-SL store initialised | path={store_path}"
+                )
+        except Exception as exc:
+            self.log.warning(
+                f"Pending-SL store init failed (non-fatal, in-memory only): {exc}"
+            )
+            self._pending_store = None
 
     # ------------------------------------------------------------------
     # Data handler (Phase 6 — live funding feed)
@@ -802,6 +857,15 @@ class MLTradingStrategy(Strategy):
 
             # Submit deferred stop-loss (PROD-005 fix: SL after confirmed entry)
             sl_params = self._pending_sl_params.pop(client_oid)
+            # Mirror the removal to disk so the entry isn't replayed on
+            # the next restart (would mis-classify a future exit fill).
+            if self._pending_store is not None:
+                try:
+                    self._pending_store.pop(client_oid)
+                except Exception as exc:
+                    self.log.warning(
+                        f"Pending-SL store pop failed (non-fatal): {exc}"
+                    )
             self._submit_stop_loss_with_retry(
                 decision=sl_params["decision"],
                 signal=sl_params["signal"],
@@ -899,10 +963,20 @@ class MLTradingStrategy(Strategy):
         )
 
         # Store SL params for deferred submission (on_order_filled will use these)
-        self._pending_sl_params[str(entry_order.client_order_id)] = {
+        client_oid = str(entry_order.client_order_id)
+        self._pending_sl_params[client_oid] = {
             "decision": decision,
             "signal": signal,
         }
+        # Mirror to disk so a crash between submit_order and on_order_filled
+        # cannot lose the SL params (which would leave the position unstopped).
+        if self._pending_store is not None:
+            try:
+                self._pending_store.put(client_oid, decision, signal)
+            except Exception as exc:
+                self.log.warning(
+                    f"Pending-SL store put failed (non-fatal): {exc}"
+                )
 
         self.submit_order(entry_order)
         self.log.info(
