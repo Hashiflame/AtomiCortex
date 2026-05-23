@@ -193,13 +193,31 @@ class MLTradingStrategy(Strategy):
         )
         self._risk_engine = RiskEngine(risk_cfg, equity=self._config.initial_equity)
 
+        # Resolve a shared crash-safe state file. Same dir as the signal DB
+        # so all 4H runtime state co-locates (pending_sl_4h.json lives here
+        # too). Fail-soft: if path resolution blows up, both classes accept
+        # state_path=None and fall back to in-memory only.
+        _risk_state_path = None
+        try:
+            _proj_root = Path(__file__).resolve().parents[3]
+            _db_path = Path(self._config.signal_db_path)
+            if not _db_path.is_absolute():
+                _db_path = _proj_root / _db_path
+            _risk_state_path = _db_path.parent / "risk_state_4h.json"
+        except Exception as exc:
+            self.log.warning(f"Risk state path resolution failed: {exc}")
+
         # 2. Portfolio Tracker
-        self._tracker = PortfolioTracker(self._config.initial_equity)
+        self._tracker = PortfolioTracker(
+            self._config.initial_equity, state_path=_risk_state_path,
+        )
 
         # 2b. Circuit Breaker — multi-level trading-halt guard. Hard-coded
         # master-doc thresholds; evaluated each bar before regime detection.
+        # Shares the same state file as PortfolioTracker so the persisted
+        # day_start stamp keeps daily-trigger semantics consistent.
         from src.risk.circuit_breaker import CircuitBreaker
-        self._breaker = CircuitBreaker()
+        self._breaker = CircuitBreaker(state_path=_risk_state_path)
 
         # 3. Regime Detector
         from src.features.regime_detector import RegimeDetector

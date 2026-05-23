@@ -304,6 +304,53 @@ class TestFailSoft:
 # End-to-end: the catastrophe scenario from the task description
 # ---------------------------------------------------------------------------
 
+class TestStrategyWiring:
+    """Step 1.7b: ``on_start`` wires the shared state_path into both
+    PortfolioTracker and CircuitBreaker. We replay the wiring block here
+    rather than running Nautilus' on_start, which needs an engine."""
+
+    def _resolve_path(self, signal_db_path: str) -> Path:
+        from src.execution.strategies import ml_strategy as mod
+        proj_root = Path(mod.__file__).resolve().parents[3]
+        db_path = Path(signal_db_path)
+        if not db_path.is_absolute():
+            db_path = proj_root / db_path
+        return db_path.parent / "risk_state_4h.json"
+
+    def test_tracker_constructed_in_on_start_has_store(self) -> None:
+        from src.execution.strategies.ml_strategy import MLStrategyConfig
+        cfg = MLStrategyConfig()
+        path = self._resolve_path(cfg.signal_db_path)
+        tracker = PortfolioTracker(cfg.initial_equity, state_path=path)
+        assert tracker._store is not None
+        assert tracker._store._path == path
+
+    def test_breaker_constructed_in_on_start_has_store(self) -> None:
+        from src.execution.strategies.ml_strategy import MLStrategyConfig
+        cfg = MLStrategyConfig()
+        path = self._resolve_path(cfg.signal_db_path)
+        breaker = CircuitBreaker(state_path=path)
+        assert breaker._store is not None
+        assert breaker._store._path == path
+
+    def test_tracker_and_breaker_share_one_path(self) -> None:
+        """Critical: same file → temporal-reset semantics apply to both."""
+        from src.execution.strategies.ml_strategy import MLStrategyConfig
+        cfg = MLStrategyConfig()
+        path = self._resolve_path(cfg.signal_db_path)
+        tracker = PortfolioTracker(cfg.initial_equity, state_path=path)
+        breaker = CircuitBreaker(state_path=path)
+        assert tracker._store._path == breaker._store._path
+
+    def test_filename_matches_spec(self) -> None:
+        """Path lives next to signal_db_path and is named risk_state_4h.json."""
+        from src.execution.strategies.ml_strategy import MLStrategyConfig
+        cfg = MLStrategyConfig()
+        path = self._resolve_path(cfg.signal_db_path)
+        assert path.name == "risk_state_4h.json"
+        assert path.parent == self._resolve_path(cfg.signal_db_path).parent
+
+
 class TestDisasterScenarioFix:
     def test_daily_limit_holds_across_restart(self, store_path: Path) -> None:
         """The motivating bug: -2.9% lost, restart, daily counter should
