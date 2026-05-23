@@ -155,6 +155,12 @@ class MLTradingStrategy(Strategy):
         # Consecutive feature failure counter (Phase 6 observability)
         self._consecutive_feature_failures: int = 0
 
+        # Dead-man's-switch heartbeat (isolated key — atomicortex:heartbeat
+        # for the 4H bot; distinct from bot_15m_heartbeat / bot_1h_heartbeat).
+        # Fail-soft: stays None if Redis / event loop unavailable so the bot
+        # keeps trading even when monitoring is degraded.
+        self._heartbeat: Any = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -274,6 +280,10 @@ class MLTradingStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"Funding rate preload failed (non-fatal): {exc}")
 
+        # 12. Dead-man's switch heartbeat — external watchdog reads this
+        # key and emergency-closes positions if the bot stops writing.
+        self._start_heartbeat()
+
         if self._warmup_complete:
             self.log.info(
                 f"Strategy ready | "
@@ -287,7 +297,18 @@ class MLTradingStrategy(Strategy):
             )
 
     def on_stop(self) -> None:
-        """Graceful shutdown: close all positions, cancel pending orders."""
+        """Graceful shutdown: stop heartbeat, close all positions, cancel orders."""
+        # Stop the heartbeat first so the watchdog sees a clean shutdown
+        # (key deleted) rather than mistaking a graceful stop for a crash.
+        if self._heartbeat is not None:
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._heartbeat.stop())
+                self.log.info("4H heartbeat stop scheduled")
+            except Exception as exc:
+                self.log.warning(f"4H heartbeat stop failed: {exc}")
+
         self.log.info("MLTradingStrategy stopping — closing positions...")
         if not self._config.dry_run:
             self.cancel_all_orders(self._instrument_id)
@@ -296,6 +317,47 @@ class MLTradingStrategy(Strategy):
             f"Strategy stopped | bars_processed={self._bar_count} | "
             f"equity_points={len(self._equity_curve)}"
         )
+
+    # ------------------------------------------------------------------
+    # Heartbeat (isolated — atomicortex:heartbeat; fail-soft)
+    # ------------------------------------------------------------------
+
+    def _start_heartbeat(self) -> None:
+        """Create + start the HeartbeatManager on the running event loop.
+
+        Fail-soft on every path: missing Redis, no running loop (e.g.
+        unit tests), or any error → log a warning and continue trading.
+        ``HeartbeatManager`` itself already retries Redis internally and
+        never raises, so a down Redis does not stop the bot.
+        """
+        try:
+            import asyncio
+            import os
+
+            from src.execution.heartbeat import HeartbeatManager
+
+            self._heartbeat = HeartbeatManager(
+                redis_host=os.getenv("REDIS_HOST", "localhost"),
+                redis_port=int(os.getenv("REDIS_PORT", "6379")),
+                redis_password=os.getenv("REDIS_PASSWORD", ""),
+                heartbeat_key=self._config.heartbeat_key,
+            )
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._heartbeat.start())
+            self.log.info(
+                f"4H heartbeat scheduled | key={self._config.heartbeat_key}"
+            )
+        except RuntimeError as exc:
+            # No running loop (unit-test / non-async context).
+            self.log.warning(
+                f"4H heartbeat not started — no event loop ({exc})"
+            )
+            self._heartbeat = None
+        except Exception as exc:
+            self.log.warning(
+                f"4H heartbeat init failed (non-fatal): {exc}"
+            )
+            self._heartbeat = None
 
     # ------------------------------------------------------------------
     # Data handler (Phase 6 — live funding feed)
