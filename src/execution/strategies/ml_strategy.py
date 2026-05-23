@@ -237,7 +237,7 @@ class MLTradingStrategy(Strategy):
         try:
             self.clock.set_timer(
                 name="oi_poll",
-                interval_ns=5 * 60 * 1_000_000_000,
+                interval=__import__("datetime").timedelta(minutes=5),
                 callback=self._poll_open_interest,
             )
             self.log.info("OI poll timer scheduled (every 5 min)")
