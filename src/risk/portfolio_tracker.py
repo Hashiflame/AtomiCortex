@@ -153,7 +153,12 @@ class PortfolioTracker:
         total_fees = pos.total_fees + fee
         realized_pnl = gross_pnl - total_fees
 
-        self._cash += pos.quantity * pos.avg_entry_price + realized_pnl
+        # Futures accounting: equity = cash + unrealized_pnl (mark-to-market
+        # relative to entry). update_fill never debited the notional from
+        # cash on open, so close must NOT credit it back here — only the
+        # gross PnL and the close-side fee flow into cash now. The open-side
+        # fees were already debited at fill time (avoid double-counting).
+        self._cash += gross_pnl - fee
         self._daily_realized_pnl += realized_pnl
         self._weekly_realized_pnl += realized_pnl
         self._total_realized_pnl += realized_pnl
