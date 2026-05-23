@@ -225,8 +225,9 @@ class MLTradingStrategy(Strategy):
             from nautilus_trader.adapters.binance.futures.types import (
                 BinanceFuturesMarkPriceUpdate,
             )
+            from nautilus_trader.model.data import DataType
             self.subscribe_data(
-                BinanceFuturesMarkPriceUpdate,
+                DataType(BinanceFuturesMarkPriceUpdate),
                 instrument_id=self._instrument_id,
             )
             self.log.info("Subscribed to funding rate updates")
