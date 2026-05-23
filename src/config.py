@@ -8,13 +8,17 @@ Settings directly, so the singleton + lru_cache stays intact.
 
 from __future__ import annotations
 
+import difflib
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+TradingMode = Literal["testnet", "paper", "live"]
+_ALLOWED_TRADING_MODES: tuple[str, ...] = ("testnet", "paper", "live")
 
 
 class Settings(BaseSettings):
@@ -79,7 +83,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Trading parameters
     # ------------------------------------------------------------------
-    trading_mode: str = Field(default="testnet", alias="TRADING_MODE")
+    trading_mode: TradingMode = Field(default="testnet", alias="TRADING_MODE")
     initial_capital: float = Field(default=10_000.0, alias="INITIAL_CAPITAL")
     max_leverage: int = Field(default=10, alias="MAX_LEVERAGE")
     risk_per_trade: float = Field(default=0.01, alias="RISK_PER_TRADE")
@@ -107,6 +111,37 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
+
+    @field_validator("trading_mode", mode="before")
+    @classmethod
+    def _validate_trading_mode(cls, v: Any) -> str:
+        """Strictly validate TRADING_MODE — fail-fast on any typo, whitespace, or wrong case.
+
+        Reject silently-normalizable inputs (e.g. " Testnet ") so a typo in .env
+        cannot quietly route the bot to mainnet with real funds.
+        """
+        if not isinstance(v, str):
+            raise ValueError(
+                f"TRADING_MODE must be a string, got {type(v).__name__}: {v!r}"
+            )
+        if v.strip() != v:
+            raise ValueError(
+                f"TRADING_MODE contains leading/trailing whitespace: {v!r}. "
+                f"Did you mean {v.strip()!r}?"
+            )
+        if v != v.lower():
+            raise ValueError(
+                f"TRADING_MODE must be lowercase, got {v!r}. "
+                f"Did you mean {v.lower()!r}?"
+            )
+        if v not in _ALLOWED_TRADING_MODES:
+            hint = difflib.get_close_matches(v, _ALLOWED_TRADING_MODES, n=1)
+            suggestion = f" Did you mean {hint[0]!r}?" if hint else ""
+            raise ValueError(
+                f"TRADING_MODE must be one of {_ALLOWED_TRADING_MODES}, "
+                f"got {v!r}.{suggestion}"
+            )
+        return v
 
     @field_validator("data_dir", "logs_dir", mode="before")
     @classmethod
@@ -175,6 +210,41 @@ class Settings(BaseSettings):
         "cryptobot_token",
     }
 
+    def log_startup_banner(self) -> None:
+        """Emit a highly-visible banner announcing the current trading mode.
+
+        Called once per process from ``get_settings()`` via the lru_cache,
+        so the operator cannot miss the active mode — especially ``live``.
+        """
+        from loguru import logger
+
+        mode = self.trading_mode
+        if mode == "live":
+            bar = "█" * 72
+            banner = (
+                "\n" + bar + "\n"
+                + "██" + " " * 68 + "██" + "\n"
+                + "██" + "⚠️  LIVE TRADING MODE — REAL MONEY AT RISK  ⚠️".center(68) + "██" + "\n"
+                + "██" + "ORDERS WILL HIT MAINNET EXCHANGES".center(68) + "██" + "\n"
+                + "██" + " " * 68 + "██" + "\n"
+                + bar
+            )
+            logger.warning(banner)
+        elif mode == "paper":
+            bar = "═" * 60
+            logger.info(
+                "\n" + bar + "\n"
+                + "   📝 PAPER TRADING MODE — simulated, no real orders\n"
+                + bar
+            )
+        else:  # testnet
+            bar = "═" * 60
+            logger.info(
+                "\n" + bar + "\n"
+                + "   🧪 TESTNET MODE — Binance/Bybit testnet, fake funds\n"
+                + bar
+            )
+
     def safe_dict(self) -> dict[str, Any]:
         """Return settings as a dict with secrets masked."""
         result: dict[str, Any] = {}
@@ -193,8 +263,14 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return the cached singleton Settings instance."""
-    return Settings()
+    """Return the cached singleton Settings instance.
+
+    Emits the trading-mode startup banner on first call so the operator
+    sees the active mode exactly once per process.
+    """
+    settings = Settings()
+    settings.log_startup_banner()
+    return settings
 
 
 # ---------------------------------------------------------------------------
