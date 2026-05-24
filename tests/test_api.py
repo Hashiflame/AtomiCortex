@@ -9,10 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from scripts.migrate_db_v3 import migrate
-from src.api.main import app
+from src.api.main import _reset_rate_buckets, app
 from src.execution.signal_bridge import SignalBridge
 
 _NOW = datetime.now(timezone.utc)
+_TEST_API_KEY = "test-api-key-1234567890"
 
 
 def _seed(db: str, rows: list[dict]) -> None:
@@ -56,7 +57,12 @@ def client(tmp_path, monkeypatch):
     ]
     _seed(db, rows)
     monkeypatch.setenv("ATOMICORTEX_DB_PATHS", db)
-    return TestClient(app)
+    monkeypatch.setenv("ATOMICORTEX_API_KEY", _TEST_API_KEY)
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "1000")
+    _reset_rate_buckets()
+    c = TestClient(app)
+    c.headers.update({"X-API-Key": _TEST_API_KEY})
+    return c
 
 
 def test_health_endpoint(client):
@@ -119,6 +125,12 @@ def test_live_endpoint_has_regime(client):
     assert "4h" in b["bots_status"]
 
 
-def test_cors_headers_present(client):
-    r = client.get("/api/v1/health", headers={"Origin": "https://example.com"})
-    assert r.headers.get("access-control-allow-origin") == "*"
+def test_cors_does_not_return_wildcard(client):
+    """CORS must never echo `*` — only specific allowlisted origins."""
+    r = client.get(
+        "/api/v1/health", headers={"Origin": "https://example.com"},
+    )
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") != "*"
+    # disallowed origin → no CORS header at all
+    assert "access-control-allow-origin" not in r.headers

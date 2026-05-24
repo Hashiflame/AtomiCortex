@@ -5,6 +5,15 @@ FastAPI app serving trading statistics from the isolated signal DBs
 (read-only). Stats come from :class:`StatsEngine` (cache-first);
 signals are paginated straight from ``signals_log``.
 
+Security (Phase 5.2):
+  * X-API-Key header required on all endpoints except /health.
+  * Key read from ``ATOMICORTEX_API_KEY``; if absent, an ephemeral key
+    is generated at startup and logged (rotate by setting the env var).
+  * CORS allowlist via ``API_CORS_ORIGINS`` (comma-separated); wildcard
+    ``*`` is never returned.
+  * In-memory per-IP sliding-window rate limiter
+    (``API_RATE_LIMIT_PER_MINUTE``, default 60).
+
 DB discovery:
   * ``ATOMICORTEX_DB_PATHS`` env (comma-separated) — explicit override
     (used by tests);
@@ -15,17 +24,23 @@ Run: uvicorn src.api.main:app --host 0.0.0.0 --port 8080
 
 from __future__ import annotations
 
+import logging
 import os
+import secrets
 import sqlite3
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 
 from src.analytics.stats_engine import StatsEngine
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
+_LOG = logging.getLogger(__name__)
 
 
 def get_db_paths() -> list[str]:
@@ -90,15 +105,105 @@ def _engine() -> StatsEngine:
     return StatsEngine(get_db_paths())
 
 
+# ----------------------------------------------------------------------
+# Security: API key, CORS allowlist, rate limiter
+# ----------------------------------------------------------------------
+_GENERATED_API_KEY: str | None = None
+
+
+def _get_api_key() -> str:
+    """Return the active API key. Generate + log one if env is empty."""
+    key = os.getenv("ATOMICORTEX_API_KEY", "").strip()
+    if key:
+        return key
+    global _GENERATED_API_KEY
+    if _GENERATED_API_KEY is None:
+        _GENERATED_API_KEY = secrets.token_urlsafe(32)
+        _LOG.warning(
+            "ATOMICORTEX_API_KEY not set — generated ephemeral key for this "
+            "process: %s  (set ATOMICORTEX_API_KEY in .env to persist)",
+            _GENERATED_API_KEY,
+        )
+    return _GENERATED_API_KEY
+
+
+def _allowed_origins() -> set[str]:
+    raw = os.getenv("API_CORS_ORIGINS", "http://localhost,http://127.0.0.1")
+    return {o.strip() for o in raw.split(",") if o.strip() and o.strip() != "*"}
+
+
+def _rate_limit_per_minute() -> int:
+    try:
+        return max(1, int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "60")))
+    except ValueError:
+        return 60
+
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(
+    provided: str | None = Depends(_api_key_header),
+) -> None:
+    if provided is None or provided == "":
+        raise HTTPException(status_code=401, detail="Missing API key")
+    if not secrets.compare_digest(provided, _get_api_key()):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _reset_rate_buckets() -> None:
+    """Test helper — clear in-memory rate-limit state."""
+    _rate_buckets.clear()
+
+
 app = FastAPI(title="AtomiCortex API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    bucket = _rate_buckets[ip]
+    cutoff = now - 60.0
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= _rate_limit_per_minute():
+        return JSONResponse(
+            {"detail": "Rate limit exceeded"}, status_code=429,
+        )
+    bucket.append(now)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    allowed = _allowed_origins()
+
+    if request.method == "OPTIONS" and origin:
+        response = JSONResponse({}, status_code=200)
+    else:
+        response = await call_next(request)
+
+    if origin and origin in allowed:
+        response.headers["access-control-allow-origin"] = origin
+        response.headers["access-control-allow-credentials"] = "true"
+        response.headers["access-control-allow-methods"] = (
+            "GET, OPTIONS"
+        )
+        response.headers["access-control-allow-headers"] = (
+            "X-API-Key, Content-Type"
+        )
+        response.headers["vary"] = "Origin"
+    return response
+
+
+# ----------------------------------------------------------------------
+# Endpoints
+# ----------------------------------------------------------------------
 @app.get("/api/v1/health")
 def health() -> dict:
     bots: dict[str, str] = {}
@@ -107,21 +212,23 @@ def health() -> dict:
     return {"status": "ok", "bots": bots}
 
 
-@app.get("/api/v1/stats")
+@app.get("/api/v1/stats", dependencies=[Depends(require_api_key)])
 def stats(period: int = Query(30), timeframe: str = Query("all")) -> dict:
     return _engine().compute_performance(
         timeframe=timeframe, period_days=period, symbol="all",
     )
 
 
-@app.get("/api/v1/stats/{timeframe}")
+@app.get(
+    "/api/v1/stats/{timeframe}", dependencies=[Depends(require_api_key)],
+)
 def stats_by_tf(timeframe: str, period: int = Query(30)) -> dict:
     return _engine().compute_performance(
         timeframe=timeframe, period_days=period, symbol="all",
     )
 
 
-@app.get("/api/v1/signals")
+@app.get("/api/v1/signals", dependencies=[Depends(require_api_key)])
 def signals(
     status: str = Query("all"),
     timeframe: str = Query("all"),
@@ -135,13 +242,17 @@ def signals(
     }
 
 
-@app.get("/api/v1/signals/open")
+@app.get(
+    "/api/v1/signals/open", dependencies=[Depends(require_api_key)],
+)
 def signals_open(timeframe: str = Query("all")) -> dict:
     items = _query_signals("open", timeframe, 500, 0)
     return {"count": len(items), "signals": items}
 
 
-@app.get("/api/v1/equity-curve")
+@app.get(
+    "/api/v1/equity-curve", dependencies=[Depends(require_api_key)],
+)
 def equity_curve(
     timeframe: str = Query("all"), period: int = Query(90),
 ) -> list[dict]:
@@ -150,12 +261,14 @@ def equity_curve(
     )
 
 
-@app.get("/api/v1/monthly-stats")
+@app.get(
+    "/api/v1/monthly-stats", dependencies=[Depends(require_api_key)],
+)
 def monthly_stats(timeframe: str = Query("all")) -> list[dict]:
     return _engine().compute_monthly(timeframe=timeframe, symbol="all")
 
 
-@app.get("/api/v1/live")
+@app.get("/api/v1/live", dependencies=[Depends(require_api_key)])
 def live() -> dict:
     """Real-time snapshot: regime / equity / open positions / last signal."""
     regime = "UNKNOWN"

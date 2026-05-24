@@ -100,6 +100,18 @@ class Settings(BaseSettings):
     logs_dir: Path = Field(default=Path("./logs"), alias="LOGS_DIR")
 
     # ------------------------------------------------------------------
+    # REST API (src/api/main.py) — internal service consumed by website
+    # ------------------------------------------------------------------
+    atomicortex_api_key: str = Field(default="", alias="ATOMICORTEX_API_KEY")
+    api_cors_origins: str = Field(
+        default="http://localhost,http://127.0.0.1",
+        alias="API_CORS_ORIGINS",
+    )
+    api_rate_limit_per_minute: int = Field(
+        default=60, alias="API_RATE_LIMIT_PER_MINUTE",
+    )
+
+    # ------------------------------------------------------------------
     # Symbols — stored as a raw comma-separated string so pydantic-settings
     # does not attempt JSON-parsing; exposed as list[str] via @property.
     # ------------------------------------------------------------------
