@@ -48,9 +48,13 @@ class LiveFeatureState:
 
     # Latest derivatives (updated from live feed)
     funding_rate: float = 0.0
+    # Phase 4 Step 4.2 — funding_zscore_30d in add_funding_features uses a
+    # 180 4H-bar rolling window (~30 days). At 3 settlements/day that's
+    # ≥ 90 records; bumped to 300 (~100 days) so the window stays
+    # populated even after preloaded samples age out. Memory ≈ 15 KB.
     funding_rate_history: deque = field(
-        default_factory=lambda: deque(maxlen=100)
-    )  # last 100 funding marks
+        default_factory=lambda: deque(maxlen=300)
+    )
 
     oi_value: float = 0.0
     # Phase 4 Step 4.1 — oi_zscore in add_oi_features uses a 180 4H-bar
@@ -88,6 +92,45 @@ class LiveFeatureState:
             "timestamp": timestamp_ms,
             "oi_value": oi,
         })
+
+    def preload_funding(self, records: list[dict]) -> int:
+        """Seed ``funding_rate_history`` with historical settlements.
+
+        Same shape and semantics as ``preload_oi``: idempotent (dedup
+        against existing entries by ``fundingTime``), preserves
+        chronological order, skips malformed records, and updates the
+        latest snapshot only if a preloaded sample is fresher than the
+        current one. Returns the number of records inserted.
+
+        Expected record schema (mirrors what ``/fapi/v1/fundingRate``
+        returns after the strategy parses it):
+            {"fundingTime": <epoch ms int>, "fundingRate": <float>}
+        """
+        existing_ts = {r.get("fundingTime") for r in self.funding_rate_history}
+        new_clean: list[dict] = []
+        for rec in records:
+            try:
+                ts = int(rec["fundingTime"])
+                rate = float(rec["fundingRate"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ts in existing_ts:
+                continue
+            new_clean.append({"fundingTime": ts, "fundingRate": rate})
+            existing_ts.add(ts)
+        if not new_clean:
+            return 0
+        merged = sorted(
+            list(self.funding_rate_history) + new_clean,
+            key=lambda r: r["fundingTime"],
+        )
+        self.funding_rate_history.clear()
+        self.funding_rate_history.extend(merged)
+        latest = merged[-1]
+        if latest["fundingTime"] >= self.last_funding_update:
+            self.funding_rate = latest["fundingRate"]
+            self.last_funding_update = latest["fundingTime"]
+        return len(new_clean)
 
     def preload_oi(self, records: list[dict]) -> int:
         """Seed ``oi_history`` with historical OI samples.

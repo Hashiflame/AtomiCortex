@@ -102,14 +102,18 @@ class TestLiveFeatureStateFunding:
         assert len(state.funding_rate_history) == 5
 
     def test_funding_history_maxlen(self):
-        """funding_rate_history respects maxlen=100."""
+        """funding_rate_history respects its capped maxlen (Phase 4 Step
+        4.2 bumped it from 100 → 300 so the 30-day rolling
+        funding_zscore_30d window stays populated)."""
         state = LiveFeatureState()
-        for i in range(150):
+        cap = state.funding_rate_history.maxlen
+        for i in range(cap + 50):
             state.funding_rate_history.append({
                 "fundingTime": i,
                 "fundingRate": 0.0001,
             })
-        assert len(state.funding_rate_history) == 100
+        assert len(state.funding_rate_history) == cap
+        assert cap >= 90  # >= 30 days × 3 settlements/day
 
     def test_update_funding_does_not_append_history(self):
         """update_funding() updates current rate but NOT history."""

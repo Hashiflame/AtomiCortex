@@ -310,7 +310,12 @@ class MLTradingStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"OI poll timer failed (non-fatal): {exc}")
 
-        # 11. Preload historical settled funding rates (Phase 6)
+        # 11. Preload historical settled funding rates. Phase 4 Step 4.2
+        # — limit bumped from 100 → 200 (≈ 66 days at 3 settlements/day)
+        # so the 30-day ``funding_zscore_30d`` rolling window is fully
+        # populated from the very first inference. Routed through
+        # ``preload_funding`` so a reconnect / second call dedupes
+        # rather than duplicating entries.
         try:
             import requests as _req
             mode = self._config.trading_mode.lower()
@@ -323,18 +328,26 @@ class MLTradingStrategy(Strategy):
             _sym_clean = _sym.split("-")[0] if "-" in _sym else _sym.split(".")[0]
             resp = _req.get(
                 f"{_base}/fapi/v1/fundingRate",
-                params={"symbol": _sym_clean, "limit": 100},
+                params={"symbol": _sym_clean, "limit": 200},
                 timeout=5,
             )
             if resp.status_code == 200:
+                records = []
                 for fr in resp.json():
-                    self._live_state.funding_rate_history.append({
-                        "fundingTime": int(fr["fundingTime"]),
-                        "fundingRate": float(fr["fundingRate"]),
-                    })
+                    try:
+                        records.append({
+                            "fundingTime": int(fr["fundingTime"]),
+                            "fundingRate": float(fr["fundingRate"]),
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                inserted = self._live_state.preload_funding(records)
                 self.log.info(
-                    f"Preloaded {len(self._live_state.funding_rate_history)} "
-                    f"historical settled funding rates"
+                    f"Preloaded {inserted} historical settled funding rates"
+                )
+            else:
+                self.log.warning(
+                    f"Funding preload HTTP {resp.status_code} — continuing"
                 )
         except Exception as exc:
             self.log.warning(f"Funding rate preload failed (non-fatal): {exc}")
