@@ -114,14 +114,23 @@ class AtomiCortexCatalog:
             .filter(
                 (pl.col("open_time") >= start_ms) & (pl.col("open_time") < end_ms)
             )
-            .select(["open_time", "open", "high", "low", "close", "volume"])
+            .select([
+                "open_time", "close_time",
+                "open", "high", "low", "close", "volume",
+            ])
             .sort("open_time")
             .collect()
         )
 
         bars: list[Bar] = []
         for row in df.iter_rows(named=True):
-            ts_ns = row["open_time"] * 1_000_000
+            # Nautilus convention for OHLCV bars: ts_event = bar CLOSE time
+            # (the moment the bar "happened" / became final on the exchange).
+            # Using open_time here would deliver full OHLC to the strategy
+            # at the start of the period — one full bar of lookahead bias.
+            # Binance's close_time is `open_time + duration - 1ms`, which
+            # matches the "close-of-bar event" semantics exactly.
+            ts_ns = row["close_time"] * 1_000_000
             bars.append(
                 Bar(
                     bar_type=bar_type,
