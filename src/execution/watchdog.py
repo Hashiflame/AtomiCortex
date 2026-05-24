@@ -36,6 +36,18 @@ _log = get_logger(__name__)
 # Binance API URLs
 # ---------------------------------------------------------------------------
 
+# H17: canonical map from --strategy short name to (heartbeat_key,
+# service_name) so the watchdog launcher cannot drift from the keys the
+# strategies actually publish to. Exported so tests / external tools can
+# share the same source of truth.
+STRATEGY_HEARTBEAT_KEYS: dict[str, str] = {
+    "4h":  "atomicortex:heartbeat",
+    "1h":  "bot_1h_heartbeat",
+    "15m": "bot_15m_heartbeat",
+}
+DEFAULT_HEARTBEAT_KEY: str = STRATEGY_HEARTBEAT_KEYS["4h"]
+
+
 _BINANCE_URLS: dict[str, dict[str, str]] = {
     "testnet": {
         "base": "https://testnet.binancefuture.com",

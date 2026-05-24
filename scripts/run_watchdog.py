@@ -24,8 +24,66 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.config import get_settings
-from src.execution.watchdog import Watchdog, WatchdogConfig
+from src.execution.watchdog import (
+    DEFAULT_HEARTBEAT_KEY,
+    STRATEGY_HEARTBEAT_KEYS,
+    Watchdog,
+    WatchdogConfig,
+)
 from src.logger import setup_logging, get_logger
+
+
+def resolve_strategy_args(
+    strategy: str | None,
+    heartbeat_key: str,
+    service_name: str,
+    *,
+    default_heartbeat_key: str = DEFAULT_HEARTBEAT_KEY,
+    default_service_name: str = "4h",
+) -> tuple[str, str, str | None]:
+    """Resolve --strategy + --heartbeat-key + --service-name into the
+    final (heartbeat_key, service_name, warning_or_none) tuple.
+
+    Rules:
+      * Explicit ``--heartbeat-key`` (anything other than the launcher
+        default) ALWAYS wins — backward compat for ops scripts that
+        already pin the key directly.
+      * Otherwise, ``--strategy`` derives both the key and (when the
+        service name is still default) the service name.
+      * Neither flag passed → return the default key plus a warning so
+        the operator notices they're implicitly monitoring the 4H bot.
+    """
+    explicit_key = heartbeat_key != default_heartbeat_key
+
+    if explicit_key and strategy is not None:
+        # Both given — explicit key wins. Surface as a warning so the
+        # operator sees the conflict.
+        warn = (
+            f"Both --strategy={strategy} and --heartbeat-key={heartbeat_key} "
+            "were supplied — using the explicit key."
+        )
+        return heartbeat_key, service_name, warn
+
+    if explicit_key:
+        return heartbeat_key, service_name, None
+
+    if strategy is not None:
+        key = STRATEGY_HEARTBEAT_KEYS[strategy]
+        # Only auto-derive service_name if the operator left it at the
+        # 4H default, so a custom label stays intact.
+        svc = (
+            strategy if service_name == default_service_name
+            else service_name
+        )
+        return key, svc, None
+
+    warn = (
+        "No --strategy specified and no explicit --heartbeat-key — "
+        f"falling back to {default_heartbeat_key!r} (the 4H bot). "
+        "Pass --strategy=4h to silence this warning, or "
+        "--strategy=15m / --strategy=1h to monitor a different bot."
+    )
+    return default_heartbeat_key, service_name, warn
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,11 +121,21 @@ def parse_args() -> argparse.Namespace:
         help="Max silence before emergency close (default: 60s)",
     )
     parser.add_argument(
+        "--strategy",
+        choices=sorted(STRATEGY_HEARTBEAT_KEYS.keys()),
+        default=None,
+        help="Strategy to monitor (4h / 1h / 15m). Selects the matching "
+        "heartbeat key and labels the service. Recommended over passing "
+        "--heartbeat-key directly. Without this flag the launcher "
+        "implicitly targets the 4H bot and logs a WARNING.",
+    )
+    parser.add_argument(
         "--heartbeat-key",
-        default="atomicortex:heartbeat",
-        help="Redis heartbeat key to monitor "
-        "(default: atomicortex:heartbeat — the 4H bot). "
-        "Use bot_15m_heartbeat for the isolated 15m watchdog.",
+        default=DEFAULT_HEARTBEAT_KEY,
+        help=f"Redis heartbeat key to monitor "
+        f"(default: {DEFAULT_HEARTBEAT_KEY!r} — the 4H bot). "
+        "Use bot_15m_heartbeat for the isolated 15m watchdog. "
+        "If supplied, overrides --strategy's auto-derived key.",
     )
     parser.add_argument(
         "--symbol",
@@ -95,6 +163,18 @@ async def _main(args: argparse.Namespace) -> None:
 
     is_testnet = args.trading_mode == "testnet"
 
+    # H17: derive the effective heartbeat key / service name from
+    # --strategy when present. Surface any conflict / missing-flag
+    # condition as a WARNING so the operator notices it in the launch
+    # banner.
+    heartbeat_key, service_name, warn = resolve_strategy_args(
+        strategy=args.strategy,
+        heartbeat_key=args.heartbeat_key,
+        service_name=args.service_name,
+    )
+    if warn:
+        log.warning(warn)
+
     config = WatchdogConfig(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
@@ -108,9 +188,9 @@ async def _main(args: argparse.Namespace) -> None:
             else settings.binance_mainnet_api_secret
         ),
         trading_mode=args.trading_mode,
-        heartbeat_key=args.heartbeat_key,
+        heartbeat_key=heartbeat_key,
         symbol=args.symbol,
-        service_name=args.service_name,
+        service_name=service_name,
         check_interval=args.check_interval,
         max_silence_seconds=args.max_silence,
         telegram_token=settings.telegram_bot_token,
@@ -122,8 +202,8 @@ async def _main(args: argparse.Namespace) -> None:
     log.info("=" * 60)
     log.info("  AtomiCortex External Watchdog")
     log.info("=" * 60)
-    log.info(f"  Service:        {args.service_name}")
-    log.info(f"  Heartbeat key:  {args.heartbeat_key}")
+    log.info(f"  Service:        {service_name}")
+    log.info(f"  Heartbeat key:  {heartbeat_key}")
     log.info(f"  Scope symbol:   {args.symbol or 'ALL (legacy)'}")
     log.info(f"  Redis:          {args.redis_host}:{args.redis_port}")
     log.info(f"  Trading Mode:   {args.trading_mode}")
