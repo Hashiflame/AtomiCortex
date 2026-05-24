@@ -42,6 +42,18 @@ _log = get_logger(__name__)
 # Must exceed the longest rolling window (180 for funding_zscore_30d).
 _WARMUP_ROWS = 200
 
+# Bar duration per interval (minutes). Used to scale time-based rolling
+# windows in add_funding_features / add_oi_features so the named horizons
+# (24h / 7d / 30d / 4h / 12h) hold across timeframes instead of silently
+# meaning "180 bars" regardless of TF.
+_INTERVAL_MINUTES: dict[str, int] = {
+    "4h": 240,
+    "1h": 60,
+    "15m": 15,
+    "5m": 5,
+    "1m": 1,
+}
+
 FEATURE_GROUPS: dict[str, list[str]] = {
     "microstructure": [
         "cvd",
@@ -261,9 +273,10 @@ class FeaturePipeline:
         df = add_volume_features(df)
         df = add_price_features(df)
 
-        # 7-9. Derivatives
-        df = add_funding_features(df, funding_df)
-        df = add_oi_features(df, metrics_df)
+        # 7-9. Derivatives (TF-aware rolling windows)
+        bar_min = _INTERVAL_MINUTES.get(self.interval, 240)
+        df = add_funding_features(df, funding_df, bar_duration_minutes=bar_min)
+        df = add_oi_features(df, metrics_df, bar_duration_minutes=bar_min)
         df = add_basis_features(df)
 
         # 10. Regime detection (Hurst, ADX, ATR)
@@ -456,9 +469,18 @@ class FeaturePipeline:
         df = add_volume_features(df)
         df = add_price_features(df)
 
-        # 2b. Derivatives — base columns (funding + OI).
-        df = add_funding_features(df, funding_df if funding_df is not None else empty)
-        df = add_oi_features(df, metrics_df if metrics_df is not None else empty)
+        # 2b. Derivatives — base columns (funding + OI), TF-aware windows.
+        bar_min = _INTERVAL_MINUTES.get(self.interval, 240)
+        df = add_funding_features(
+            df,
+            funding_df if funding_df is not None else empty,
+            bar_duration_minutes=bar_min,
+        )
+        df = add_oi_features(
+            df,
+            metrics_df if metrics_df is not None else empty,
+            bar_duration_minutes=bar_min,
+        )
 
         # 2c. Basis features (derived from funding_cum_24h).
         df = add_basis_features(df)

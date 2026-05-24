@@ -57,9 +57,20 @@ def _zero_oi(df: pl.DataFrame) -> pl.DataFrame:
 
 # --- public functions --------------------------------------------------------
 
+def _bars_for(minutes: int, bar_duration_minutes: int) -> int:
+    """Number of bars whose total duration approximates *minutes*.
+
+    Floors to ≥1 so a window never collapses. Used to convert the named
+    horizons (24h / 7d / 30d / 4h / 12h) into bar counts that scale with
+    the timeframe of the input DataFrame.
+    """
+    return max(1, int(minutes) // max(1, int(bar_duration_minutes)))
+
+
 def add_funding_features(
     df: pl.DataFrame,
     funding_df: pl.DataFrame,
+    bar_duration_minutes: int = 240,
 ) -> pl.DataFrame:
     """Funding rate features via asof join on open_time → fundingTime.
 
@@ -69,6 +80,12 @@ def add_funding_features(
     Added columns: funding_rate, funding_abs, funding_zscore_7d,
                    funding_zscore_30d, funding_extreme, funding_positive,
                    funding_cum_24h
+
+    ``bar_duration_minutes`` scales rolling windows to the timeframe of
+    ``df``. Default 240 reproduces the historical 4H behavior (bars_30d=180,
+    bars_7d=42, bars_24h=6). For 1H pass 60, for 15m pass 15. Offline
+    build scripts that don't go through FeaturePipeline still default to
+    240 — known follow-up to keep train/serve aligned on 1H/15m datasets.
     """
     if funding_df.is_empty():
         _log.warning("add_funding_features: empty funding_df — using zeros")
@@ -104,16 +121,20 @@ def add_funding_features(
         pl.col("funding_rate").fill_null(0.0).fill_nan(0.0)
     )
 
+    bars_7d  = _bars_for(7 * 24 * 60, bar_duration_minutes)
+    bars_30d = _bars_for(30 * 24 * 60, bar_duration_minutes)
+    bars_24h = _bars_for(24 * 60, bar_duration_minutes)
+
     df = df.with_columns([
         pl.col("funding_rate").abs().alias("funding_abs"),
-        rolling_zscore(pl.col("funding_rate"), 42).alias("funding_zscore_7d"),   # 42 bars × 4H = 7 days
-        rolling_zscore(pl.col("funding_rate"), 180).alias("funding_zscore_30d"), # 180 bars × 4H = 30 days
+        rolling_zscore(pl.col("funding_rate"), bars_7d).alias("funding_zscore_7d"),
+        rolling_zscore(pl.col("funding_rate"), bars_30d).alias("funding_zscore_30d"),
     ])
     df = df.with_columns([
         (pl.col("funding_zscore_7d").abs() > 2.0).cast(pl.Int8).alias("funding_extreme"),
         (pl.col("funding_rate") > 0).cast(pl.Int8).alias("funding_positive"),
         pl.col("funding_rate")
-            .rolling_sum(window_size=6)   # 6 bars × 4H = 24 hours
+            .rolling_sum(window_size=bars_24h)
             .fill_null(0.0)
             .fill_nan(0.0)
             .alias("funding_cum_24h"),
@@ -125,6 +146,7 @@ def add_funding_features(
 def add_oi_features(
     df: pl.DataFrame,
     metrics_df: pl.DataFrame,
+    bar_duration_minutes: int = 240,
 ) -> pl.DataFrame:
     """Open interest and long/short ratio features via asof join.
 
@@ -134,6 +156,10 @@ def add_oi_features(
 
     Added columns: oi_value, oi_delta_4h, oi_delta_12h, oi_zscore, oi_quadrant,
                    ls_ratio, ls_ratio_zscore, taker_vol_ratio
+
+    ``bar_duration_minutes`` scales shifts/windows so the named horizons
+    (4h / 12h / 30d) hold across timeframes. Default 240 reproduces the
+    historical 4H behavior (shift(1)=4h, shift(3)=12h, rolling=180=30d).
     """
     if metrics_df.is_empty():
         _log.warning("add_oi_features: empty metrics_df — using zeros")
@@ -159,18 +185,22 @@ def add_oi_features(
     for col in ("oi_value", "ls_ratio", "taker_vol_ratio"):
         df = df.with_columns(pl.col(col).fill_null(0.0).fill_nan(0.0))
 
-    # OI deltas: (current - past) / current
+    bars_4h  = _bars_for(4 * 60, bar_duration_minutes)
+    bars_12h = _bars_for(12 * 60, bar_duration_minutes)
+    bars_30d = _bars_for(30 * 24 * 60, bar_duration_minutes)
+
+    # OI deltas: (current - past) / past
     df = df.with_columns([
         safe_divide(
-            pl.col("oi_value") - pl.col("oi_value").shift(1),
-            pl.col("oi_value").shift(1),
-        ).alias("oi_delta_4h"),   # pct change over 1 bar (4H)
+            pl.col("oi_value") - pl.col("oi_value").shift(bars_4h),
+            pl.col("oi_value").shift(bars_4h),
+        ).alias("oi_delta_4h"),
         safe_divide(
-            pl.col("oi_value") - pl.col("oi_value").shift(3),
-            pl.col("oi_value").shift(3),
-        ).alias("oi_delta_12h"),  # pct change over 3 bars (12H)
-        rolling_zscore(pl.col("oi_value"), 180).alias("oi_zscore"),
-        rolling_zscore(pl.col("ls_ratio"), 180).alias("ls_ratio_zscore"),
+            pl.col("oi_value") - pl.col("oi_value").shift(bars_12h),
+            pl.col("oi_value").shift(bars_12h),
+        ).alias("oi_delta_12h"),
+        rolling_zscore(pl.col("oi_value"), bars_30d).alias("oi_zscore"),
+        rolling_zscore(pl.col("ls_ratio"), bars_30d).alias("ls_ratio_zscore"),
     ])
 
     # oi_quadrant: sign(price_change) × sign(oi_delta_4h)

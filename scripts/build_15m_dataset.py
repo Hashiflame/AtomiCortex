@@ -174,10 +174,14 @@ def build_feature_matrix(
     # 2b. Derivatives (funding + OI) — base columns for MTF momentum
     # features. add_* zero-fill when data is empty (fail-soft).
     df_15m = add_funding_features(
-        df_15m, funding_df if funding_df is not None else pl.DataFrame()
+        df_15m,
+        funding_df if funding_df is not None else pl.DataFrame(),
+        bar_duration_minutes=15,
     )
     df_15m = add_oi_features(
-        df_15m, metrics_df if metrics_df is not None else pl.DataFrame()
+        df_15m,
+        metrics_df if metrics_df is not None else pl.DataFrame(),
+        bar_duration_minutes=15,
     )
 
     # 3. Regime detection (15m-tuned parameters)
