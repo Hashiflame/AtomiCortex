@@ -703,8 +703,12 @@ class MLTradingStrategy(Strategy):
             self._bars.append(bar)
             self._bar_count += 1
 
-            # Phase 6: track bar in live feature state
-            self._live_state.add_bar(bar, interval="4h")
+            # Phase 6: track bar in live feature state.
+            # Step H1c: fetch real taker_buy_volume from Binance klines so
+            # CVD features in live match training. Fail-soft — see
+            # _fetch_taker_buy_volume_for_bar().
+            _tbv = self._fetch_taker_buy_volume_for_bar(bar)
+            self._live_state.add_bar(bar, interval="4h", taker_buy_volume=_tbv)
 
             # Timestamp diagnostic (first bar only — verify ts_event conversion)
             if self._bar_count == 1 and self._live_state.bar_buffer_4h:
@@ -1404,6 +1408,41 @@ class MLTradingStrategy(Strategy):
 
         except Exception as exc:
             self.log.error(f"Feature computation failed: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # taker_buy_volume fetch (Step H1c)
+    # ------------------------------------------------------------------
+
+    def _fetch_taker_buy_volume_for_bar(self, bar) -> float | None:
+        """Fetch real taker_buy_base_asset_volume for *bar* from Binance.
+
+        Returns ``None`` on any failure — caller forwards it to
+        ``LiveFeatureState.add_bar`` which applies the documented
+        volume*0.5 fallback. Synchronous with a 3s timeout to keep
+        on_bar responsive.
+        """
+        try:
+            close_ms = bar.ts_event // 1_000_000
+            open_ms = close_ms - 4 * 3_600_000  # 4H bars
+            sym = str(self._instrument_id)
+            sym_clean = sym.split("-")[0] if "-" in sym else sym.split(".")[0]
+            base = (
+                "https://testnet.binancefuture.com"
+                if self._config.trading_mode.lower() == "testnet"
+                else "https://fapi.binance.com"
+            )
+            return self._live_state.fetch_taker_buy_volume(
+                symbol=sym_clean,
+                interval="4h",
+                open_time_ms=open_ms,
+                base_url=base,
+                timeout=3.0,
+            )
+        except Exception as exc:
+            self.log.debug(
+                f"_fetch_taker_buy_volume_for_bar failed (non-critical): {exc}"
+            )
             return None
 
     # ------------------------------------------------------------------

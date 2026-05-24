@@ -217,6 +217,123 @@ class TestFetchTakerBuyVolume:
         assert v is None
 
 
+class TestMLStrategyWiring:
+    """Step H1c: _fetch_taker_buy_volume_for_bar correctly wires the
+    REST fetch into add_bar() — symbol extraction, open_time_ms math,
+    testnet/mainnet URL, fail-soft on None."""
+
+    @staticmethod
+    def _make_strategy(trading_mode="live", instrument_id="BTCUSDT-PERP.BINANCE"):
+        from src.execution.strategies.ml_strategy import (
+            MLStrategyConfig, MLTradingStrategy,
+        )
+        cfg = MLStrategyConfig(
+            instrument_id=instrument_id,
+            bar_type=f"{instrument_id}-4-HOUR-LAST-EXTERNAL",
+            warmup_bars=10,
+            dry_run=True,
+            trading_mode=trading_mode,
+        )
+        return MLTradingStrategy(config=cfg)
+
+    @staticmethod
+    def _bar(close_ms: int):
+        class _B:
+            ts_event = close_ms * 1_000_000
+        return _B()
+
+    def test_fetch_called_with_correct_params_live(self):
+        from unittest.mock import patch
+        strat = self._make_strategy(trading_mode="live")
+        close_ms = 1_700_000_000_000 + 4 * 3_600_000
+        bar = self._bar(close_ms)
+
+        with patch.object(
+            LiveFeatureState, "fetch_taker_buy_volume", return_value=123.4,
+        ) as mock_fetch:
+            result = strat._fetch_taker_buy_volume_for_bar(bar)
+
+        assert result == 123.4
+        mock_fetch.assert_called_once()
+        kwargs = mock_fetch.call_args.kwargs
+        assert kwargs["symbol"] == "BTCUSDT"  # stripped from BTCUSDT-PERP.BINANCE
+        assert kwargs["interval"] == "4h"
+        assert kwargs["open_time_ms"] == close_ms - 4 * 3_600_000
+        assert kwargs["base_url"] == "https://fapi.binance.com"
+        assert kwargs["timeout"] == 3.0
+
+    def test_fetch_called_with_testnet_url(self):
+        from unittest.mock import patch
+        strat = self._make_strategy(trading_mode="testnet")
+        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+
+        with patch.object(
+            LiveFeatureState, "fetch_taker_buy_volume", return_value=99.0,
+        ) as mock_fetch:
+            strat._fetch_taker_buy_volume_for_bar(bar)
+
+        assert (
+            mock_fetch.call_args.kwargs["base_url"]
+            == "https://testnet.binancefuture.com"
+        )
+
+    def test_fail_soft_returns_none(self):
+        from unittest.mock import patch
+        strat = self._make_strategy()
+        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+
+        with patch.object(
+            LiveFeatureState, "fetch_taker_buy_volume", return_value=None,
+        ):
+            result = strat._fetch_taker_buy_volume_for_bar(bar)
+        assert result is None
+
+    def test_fail_soft_on_exception(self):
+        from unittest.mock import patch
+        strat = self._make_strategy()
+        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+
+        with patch.object(
+            LiveFeatureState,
+            "fetch_taker_buy_volume",
+            side_effect=RuntimeError("boom"),
+        ):
+            # Must not propagate — caller (on_bar) cannot tolerate exceptions.
+            result = strat._fetch_taker_buy_volume_for_bar(bar)
+        assert result is None
+
+    def test_open_time_ms_computed_correctly(self):
+        """For 4H bar with close_ms = T, open_ms must be T - 4*3_600_000."""
+        from unittest.mock import patch
+        strat = self._make_strategy()
+        # Pick a precise UTC-aligned 4H close.
+        close_ms = 1_705_000_000_000  # arbitrary
+        bar = self._bar(close_ms)
+
+        with patch.object(
+            LiveFeatureState, "fetch_taker_buy_volume", return_value=1.0,
+        ) as mock_fetch:
+            strat._fetch_taker_buy_volume_for_bar(bar)
+
+        assert (
+            mock_fetch.call_args.kwargs["open_time_ms"]
+            == close_ms - 4 * 3_600_000
+        )
+
+    def test_symbol_with_dot_only(self):
+        """instrument_id without '-' (e.g. 'BTCUSDT.BINANCE') uses split('.')[0]."""
+        from unittest.mock import patch
+        strat = self._make_strategy(instrument_id="ETHUSDT.BINANCE")
+        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+
+        with patch.object(
+            LiveFeatureState, "fetch_taker_buy_volume", return_value=1.0,
+        ) as mock_fetch:
+            strat._fetch_taker_buy_volume_for_bar(bar)
+
+        assert mock_fetch.call_args.kwargs["symbol"] == "ETHUSDT"
+
+
 class TestBackwardCompatibility:
     """Existing call sites that don't pass taker_buy_volume keep working."""
 
