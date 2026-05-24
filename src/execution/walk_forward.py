@@ -189,6 +189,41 @@ class WindowResult:
 
 
 @dataclass
+class WalkForwardGateConfig:
+    """Acceptance thresholds for ``WalkForwardResult.passes_walk_forward_test``.
+
+    H7 — single binary "% profitable" gate was vulnerable to one
+    catastrophic window hidden among many tiny positives (5×+0.1% then
+    1×-30% scored 5/6 profitable but lost ~30%). Multi-criteria gate
+    requires every threshold to pass.
+
+    Defaults are tuned to catch true catastrophes without rejecting
+    healthy strategies:
+    * ``min_profitable_pct=60`` — legacy threshold.
+    * ``min_avg_sharpe=0.0`` — mean Sharpe across windows must be ≥ 0;
+       a strategy that loses more than it wins fails here.
+    * ``min_worst_sharpe=-1.0`` — single worst window's Sharpe must be
+       ≥ -1.0; rejects "one big blowup" patterns.
+    * ``min_aggregate_return=0.0`` — sum of per-window total_return_pct
+       must be non-negative; the headline arithmetic rejects the
+       catastrophe scenario above (aggregate ≈ -29.5%).
+
+    Use ``>=`` semantics throughout so all-zero / dummy metrics still
+    pass (backward-compat for existing fixtures).
+    """
+    min_profitable_pct: float = 60.0
+    min_avg_sharpe: float = 0.0
+    min_worst_sharpe: float = -1.0
+    min_aggregate_return: float = 0.0
+
+
+# Module-level default — `passes_walk_forward_test` (a zero-arg property)
+# reads thresholds from here so callers who want different gates can
+# either pass their own config to `passes_gate()` or mutate this object.
+DEFAULT_GATE = WalkForwardGateConfig()
+
+
+@dataclass
 class WalkForwardResult:
     windows: list[WindowResult]
 
@@ -207,9 +242,68 @@ class WalkForwardResult:
         return sum(w.metrics.sharpe_ratio for w in self.windows) / len(self.windows)
 
     @property
+    def worst_sharpe(self) -> float:
+        """Minimum Sharpe across all windows (catastrophe detector)."""
+        if not self.windows:
+            return 0.0
+        return min(w.metrics.sharpe_ratio for w in self.windows)
+
+    @property
+    def aggregate_return_pct(self) -> float:
+        """Sum of per-window ``total_return_pct``.
+
+        Sum rather than compound average — the gate cares about whether
+        the headline P&L is positive, and summing per-window % returns is
+        the same shape ``WindowResult.is_profitable`` uses internally.
+        """
+        if not self.windows:
+            return 0.0
+        return sum(w.metrics.total_return_pct for w in self.windows)
+
+    def passes_gate(
+        self,
+        config: WalkForwardGateConfig | None = None,
+    ) -> tuple[bool, list[str]]:
+        """Multi-criteria walk-forward acceptance check.
+
+        Returns ``(passed, reasons)``. ``reasons`` lists every criterion
+        that failed (empty when ``passed`` is True). Useful for surfacing
+        *why* a strategy was rejected instead of a bare bool.
+        """
+        cfg = config or DEFAULT_GATE
+        reasons: list[str] = []
+        if self.profitable_windows_pct < cfg.min_profitable_pct:
+            reasons.append(
+                f"profitable_windows_pct {self.profitable_windows_pct:.1f} "
+                f"< {cfg.min_profitable_pct:.1f}"
+            )
+        if self.avg_sharpe < cfg.min_avg_sharpe:
+            reasons.append(
+                f"avg_sharpe {self.avg_sharpe:.3f} < {cfg.min_avg_sharpe:.3f}"
+            )
+        if self.worst_sharpe < cfg.min_worst_sharpe:
+            reasons.append(
+                f"worst_sharpe {self.worst_sharpe:.3f} "
+                f"< {cfg.min_worst_sharpe:.3f}"
+            )
+        if self.aggregate_return_pct < cfg.min_aggregate_return:
+            reasons.append(
+                f"aggregate_return_pct {self.aggregate_return_pct:.3f} "
+                f"< {cfg.min_aggregate_return:.3f}"
+            )
+        return (not reasons, reasons)
+
+    @property
     def passes_walk_forward_test(self) -> bool:
-        """True when ≥ 60 % of windows are profitable (go-live criterion)."""
-        return self.profitable_windows_pct >= 60.0
+        """Multi-criteria gate using ``DEFAULT_GATE`` thresholds.
+
+        Backward-compatible: the legacy "≥ 60% profitable" rule is one
+        of the criteria (``min_profitable_pct=60``); the additional
+        Sharpe and aggregate-return checks only fire on catastrophic
+        windows, leaving normal strategies unaffected.
+        """
+        passed, _ = self.passes_gate()
+        return passed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
