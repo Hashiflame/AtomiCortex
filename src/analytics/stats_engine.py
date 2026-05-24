@@ -58,14 +58,94 @@ def _std(xs: list[float]) -> float:
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1))
 
 
+_PERF_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS performance_cache (
+    id             INTEGER PRIMARY KEY,
+    timeframe      TEXT NOT NULL DEFAULT 'all',
+    period_days    INTEGER NOT NULL DEFAULT 30,
+    symbol         TEXT NOT NULL DEFAULT 'all',
+    win_rate       REAL,
+    profit_factor  REAL,
+    expected_value REAL,
+    total_pnl_pct  REAL,
+    max_drawdown   REAL,
+    sharpe_ratio   REAL,
+    sortino_ratio  REAL,
+    calmar_ratio   REAL,
+    avg_rr_ratio   REAL,
+    total_signals  INTEGER,
+    closed_signals INTEGER,
+    win_count      INTEGER,
+    loss_count     INTEGER,
+    avg_duration_h REAL,
+    live_since     DATE,
+    days_tracked   INTEGER,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(timeframe, period_days, symbol)
+);
+"""
+
+
 class StatsEngine:
     def __init__(
-        self, db_paths: list[str], initial_capital: float = 10_000.0,
+        self,
+        db_paths: list[str],
+        initial_capital: float = 10_000.0,
+        cache_db_path: str | Path | None = None,
     ) -> None:
+        """Compute Telegram /stats from one or more trading DBs.
+
+        H10: the ``performance_cache`` table is now isolated in a
+        dedicated cache DB (default ``stats_cache.db`` sibling to the
+        first trading DB) so that:
+        * Schema mutations stay out of the trading DB.
+        * WAL writes from StatsEngine never race the live SignalBridge
+          writer for the same DB lock.
+        * A missing cache file is created on first use; existing
+          trading DBs are read-only from StatsEngine's POV.
+
+        Override ``cache_db_path`` to point the cache anywhere — pass
+        the trading DB path explicitly to opt back into the legacy
+        co-located behaviour.
+        """
         self.db_paths = [str(p) for p in db_paths]
         self.initial_capital = initial_capital
-        # Canonical cache lives in the first (base/4H) DB.
-        self._cache_db = self.db_paths[0] if self.db_paths else None
+
+        if cache_db_path is not None:
+            self._cache_db = str(cache_db_path)
+        elif self.db_paths:
+            # Default: sibling file next to the first (base/4H) trading DB.
+            self._cache_db = str(
+                Path(self.db_paths[0]).parent / "stats_cache.db"
+            )
+        else:
+            self._cache_db = None
+
+        self._init_cache_db()
+
+    def _init_cache_db(self) -> None:
+        """Create the cache DB and ``performance_cache`` table if missing.
+
+        Idempotent + fail-soft: caching is a non-critical optimisation,
+        so a write/permission error must not stop /stats from rendering.
+        """
+        if not self._cache_db:
+            return
+        try:
+            cache_path = Path(self._cache_db)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = _connect(self._cache_db)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.executescript(_PERF_CACHE_DDL)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            _log.warning(
+                "StatsEngine cache DB init failed (non-fatal): {e}", e=exc,
+            )
 
     # ------------------------------------------------------------------
     # Row loading
@@ -275,7 +355,10 @@ class StatsEngine:
     ) -> dict | None:
         if not self._cache_db or not Path(self._cache_db).exists():
             return None
-        conn = _connect(self._cache_db)
+        try:
+            conn = _connect(self._cache_db)
+        except sqlite3.Error:
+            return None
         try:
             row = conn.execute(
                 "SELECT * FROM performance_cache "
@@ -303,7 +386,11 @@ class StatsEngine:
     def _write_cache(self, stats: dict) -> None:
         if not self._cache_db:
             return
-        conn = _connect(self._cache_db)
+        try:
+            conn = _connect(self._cache_db)
+        except sqlite3.Error as exc:
+            _log.warning("performance_cache connect skipped: {e}", e=exc)
+            return
         try:
             pf = stats["profit_factor"]
             conn.execute(

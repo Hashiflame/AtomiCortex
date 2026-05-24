@@ -165,7 +165,8 @@ def test_performance_cache_written(tmp_path):
     _add(db, result="win", pnl=1.5, created=d, closed=d)
     eng = StatsEngine([db])
     eng.compute_performance(timeframe="all", period_days=30, use_cache=False)
-    conn = sqlite3.connect(db)
+    # H10: cache lives in stats_cache.db sibling, not the trading DB.
+    conn = sqlite3.connect(eng._cache_db)
     try:
         row = conn.execute(
             "SELECT win_rate FROM performance_cache "

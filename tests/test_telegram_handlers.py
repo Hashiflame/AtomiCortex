@@ -610,8 +610,16 @@ class TestStatsNoneSafety:
             ((now - timedelta(days=3)).isoformat(),
              (now - timedelta(days=3)).isoformat()),
         )
-        # Fresh cache rows with NULL numeric metrics → forces the
-        # None-formatting path that previously crashed.
+        conn.commit()
+        conn.close()
+
+        # H10: performance_cache lives in the isolated stats_cache.db
+        # sibling, not in the trading DB. StatsEngine creates the cache
+        # DB + table on construction; we just seed the NULL rows here.
+        cache_db = str(tmp_path / "stats_cache.db")
+        from src.analytics.stats_engine import StatsEngine
+        StatsEngine([sdb])  # creates stats_cache.db + schema
+        conn = sqlite3.connect(cache_db)
         for tf in ("all", "4h"):
             conn.execute(
                 "INSERT INTO performance_cache "
