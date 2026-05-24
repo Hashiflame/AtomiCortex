@@ -257,6 +257,83 @@ class Settings(BaseSettings):
                 + bar
             )
 
+    # ------------------------------------------------------------------
+    # H11 — startup validation helpers
+    # ------------------------------------------------------------------
+
+    def assert_live_credentials_present(self) -> None:
+        """Fail-fast guard: never start in live mode without API keys.
+
+        Pre-H11, an empty ``BINANCE_API_KEY`` silently defaulted to ``""``
+        and the bot would only discover the problem at the first 401 from
+        Binance — potentially after placing test orders. This raises at
+        ``get_settings()`` time instead.
+
+        Tests can still build ``Settings(TRADING_MODE='live')`` directly
+        without keys — the guard is only enforced at the cached-singleton
+        boundary, not in the constructor.
+        """
+        if self.trading_mode != "live":
+            return
+        missing: list[str] = []
+        if not self.binance_mainnet_api_key:
+            missing.append("BINANCE_API_KEY")
+        if not self.binance_mainnet_api_secret:
+            missing.append("BINANCE_API_SECRET")
+        if missing:
+            raise RuntimeError(
+                f"TRADING_MODE=live but {', '.join(missing)} not set. "
+                "Refusing to start — set the credentials in .env or "
+                "switch TRADING_MODE to 'testnet' / 'paper'."
+            )
+
+    def warn_env_typos(self) -> None:
+        """Scan os.environ + .env for keys that look like typos of known
+        Settings aliases and emit a WARNING for each match.
+
+        Fail-soft: any error inside this scan is swallowed so a broken
+        startup heuristic never blocks the bot from starting.
+
+        Uses ``difflib`` with a 0.85 cutoff so unrelated system env vars
+        (PATH, HOME, LANG, ...) don't generate false positives — only
+        close lexical neighbours of valid aliases are flagged.
+        """
+        from loguru import logger
+
+        try:
+            valid_aliases = {
+                (info.alias or name).upper()
+                for name, info in self.__class__.model_fields.items()
+            }
+
+            candidates: set[str] = set(os.environ.keys())
+
+            env_file = Path(self.model_config.get("env_file") or ".env")
+            if env_file.exists():
+                try:
+                    for raw in env_file.read_text(encoding="utf-8").splitlines():
+                        line = raw.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        candidates.add(line.split("=", 1)[0].strip())
+                except OSError:
+                    pass
+
+            for key in candidates:
+                ku = key.upper()
+                if ku in valid_aliases:
+                    continue
+                hint = difflib.get_close_matches(
+                    ku, valid_aliases, n=1, cutoff=0.85,
+                )
+                if hint:
+                    logger.warning(
+                        "Configuration: env var {k!r} not recognized — "
+                        "did you mean {s!r}?", k=key, s=hint[0],
+                    )
+        except Exception as exc:  # noqa: BLE001 — fail-soft startup heuristic
+            logger.debug("warn_env_typos failed (non-fatal): {e}", e=exc)
+
     def safe_dict(self) -> dict[str, Any]:
         """Return settings as a dict with secrets masked."""
         result: dict[str, Any] = {}
@@ -282,6 +359,9 @@ def get_settings() -> Settings:
     """
     settings = Settings()
     settings.log_startup_banner()
+    # H11: fail-fast on live mode without credentials + warn about typos.
+    settings.assert_live_credentials_present()
+    settings.warn_env_typos()
     return settings
 
 
