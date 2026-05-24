@@ -70,6 +70,16 @@ class SignalPoller:
         self._last_signal_ids: dict[str, int] = {p: 0 for p in paths}
         self._last_event_ids: dict[str, int] = {p: 0 for p in paths}
 
+        # Per-DB set of signal_ids whose close has already been broadcast
+        # in this process. Seeded at startup with every currently-closed
+        # signal so that, after a restart, we never re-broadcast an
+        # already-closed signal even if it falls inside the lookback
+        # window. New closes during runtime are added only after a
+        # *successful* broadcast (at-least-once semantics + dedup).
+        self._broadcasted_close_ids: dict[str, set[int]] = {
+            p: set() for p in paths
+        }
+
         # Cached metrics for /health and /stats commands
         self._cached_metrics: dict[str, Any] = {}
 
@@ -159,11 +169,26 @@ class SignalPoller:
                     ).fetchone()
                     self._last_event_ids[db_path] = row[0] if row else 0
 
+                    # Seed the broadcasted-close set with every signal
+                    # that is already closed at startup — they were
+                    # either announced in a prior session or are stale,
+                    # and must never be re-announced after a restart.
+                    closed = conn.execute(
+                        "SELECT id FROM signals_log "
+                        "WHERE result IN ('win','loss','breakeven') "
+                        "AND closed_at IS NOT NULL"
+                    ).fetchall()
+                    self._broadcasted_close_ids[db_path] = {
+                        int(r[0]) for r in closed
+                    }
+
                     _log.info(
-                        "High-water marks | db={db} signal_id={s} event_id={e}",
+                        "High-water marks | db={db} signal_id={s} "
+                        "event_id={e} closed_seeded={c}",
                         db=db_path,
                         s=self._last_signal_ids[db_path],
                         e=self._last_event_ids[db_path],
+                        c=len(self._broadcasted_close_ids[db_path]),
                     )
                 finally:
                     conn.close()
@@ -238,31 +263,51 @@ class SignalPoller:
             _log.error("_check_new_signals failed: {err}", err=str(exc))
 
     async def _check_closed_signals(self, db_path: str) -> None:
-        """Check for recently closed signals and broadcast close events."""
+        """Check for recently closed signals and broadcast close events.
+
+        Deduplication: ``self._broadcasted_close_ids[db_path]`` tracks
+        every signal_id whose close has already been broadcast in this
+        process. The set is seeded on startup with all already-closed
+        signals (see ``_init_high_water_marks``) so a restart never
+        re-announces an old close. The 10-minute window is just a query
+        bound — correctness comes from the set.
+
+        On broadcast failure the id is *not* added, so the next poll
+        cycle retries (at-least-once + idempotent dedup).
+        """
         try:
             conn = self._connect(db_path)
             try:
-                # Get signals closed in the last 2 poll intervals
                 rows = conn.execute(
                     "SELECT * FROM signals_log "
                     "WHERE result IN ('win', 'loss', 'breakeven') "
                     "AND closed_at IS NOT NULL "
-                    "AND datetime(closed_at) > datetime('now', '-2 minutes') "
+                    "AND datetime(closed_at) > datetime('now', '-10 minutes') "
                     "ORDER BY closed_at ASC",
                 ).fetchall()
             finally:
                 conn.close()
 
+            seen = self._broadcasted_close_ids.setdefault(db_path, set())
+
             for row in rows:
                 signal = dict(row)
+                sid = int(signal["id"])
+                if sid in seen:
+                    continue
+
                 self._tag_timeframe(signal, db_path)
                 try:
                     await self._broadcaster.broadcast_signal_closed(signal)
                 except Exception as exc:
                     _log.error(
                         "Failed to broadcast signal close {sid}: {err}",
-                        sid=signal.get("id"), err=str(exc),
+                        sid=sid, err=str(exc),
                     )
+                    # Do not mark as broadcasted — retry on next cycle.
+                    continue
+
+                seen.add(sid)
         except Exception as exc:
             _log.error("_check_closed_signals failed: {err}", err=str(exc))
 
