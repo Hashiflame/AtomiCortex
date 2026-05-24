@@ -186,7 +186,60 @@ class Watchdog:
                     result["errors"].append("Failed to fetch positions")
                     return result
 
-                # 2. Close positions with |positionAmt| > 0
+                # H15: cancel BEFORE close.
+                #
+                # Old order was MARKET close → then cancel. If a resting
+                # SL fired during the close, the position was closed
+                # twice — the second leg flipped the account into the
+                # reverse direction. The correct ordering kills the
+                # resting orders first so only our reduceOnly MARKET
+                # actually moves the book.
+                #
+                # 2. Build the set of in-scope symbols once.
+                symbols_with_positions = {
+                    pos.get("symbol") for pos in positions
+                    if abs(float(pos.get("positionAmt", 0))) > 1e-10
+                    and (
+                        not self._scope_symbol
+                        or str(pos.get("symbol", "")).upper() == self._scope_symbol
+                    )
+                }
+
+                # 3. Cancel all open orders for each symbol FIRST.
+                #    Fail-soft: a failed cancel still proceeds to close —
+                #    leaving the account open is the bigger risk.
+                for symbol in symbols_with_positions:
+                    try:
+                        cancel_result = await self._signed_delete(
+                            session,
+                            self._urls["all_open_orders"],
+                            {"symbol": symbol},
+                        )
+                        if cancel_result is not None:
+                            _log.warning(
+                                "EMERGENCY CANCEL ORDERS | {sym}",
+                                sym=symbol,
+                            )
+                        else:
+                            result["errors"].append(
+                                f"Cancel orders failed for {symbol} — "
+                                "proceeding with close anyway"
+                            )
+                    except Exception as exc:
+                        result["errors"].append(
+                            f"Cancel orders raised for {symbol}: {exc} — "
+                            "proceeding with close anyway"
+                        )
+
+                result["orders_cancelled"] = True
+
+                # 4. Brief pause so the exchange has finished processing
+                #    the cancellations before we send the reduceOnly
+                #    MARKETs. Half a second matches the upper bound of
+                #    Binance's documented order-state propagation.
+                await asyncio.sleep(0.5)
+
+                # 5. Close positions with |positionAmt| > 0.
                 for pos in positions:
                     amt = float(pos.get("positionAmt", 0))
                     if abs(amt) < 1e-10:
@@ -231,29 +284,6 @@ class Watchdog:
                         result["errors"].append(
                             f"Failed to close {symbol} {side} {qty}"
                         )
-
-                # 3. Cancel all open orders for each symbol
-                symbols_with_positions = {
-                    pos.get("symbol") for pos in positions
-                    if abs(float(pos.get("positionAmt", 0))) > 1e-10
-                    and (
-                        not self._scope_symbol
-                        or str(pos.get("symbol", "")).upper() == self._scope_symbol
-                    )
-                }
-                for symbol in symbols_with_positions:
-                    cancel_result = await self._signed_delete(
-                        session,
-                        self._urls["all_open_orders"],
-                        {"symbol": symbol},
-                    )
-                    if cancel_result is not None:
-                        _log.warning(
-                            "EMERGENCY CANCEL ORDERS | {sym}",
-                            sym=symbol,
-                        )
-
-                result["orders_cancelled"] = True
 
         except Exception as exc:
             _log.error(
