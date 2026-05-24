@@ -322,8 +322,16 @@ class RegimeDetector:
         price = close[idx]
         atr_pct = (current_atr / price) if price > 0 else 0.0
 
-        # --- Classify ---
-        regime = self._classify(hurst, adx_val, atr_percentile, close, idx)
+        # --- Classify (EMA over [:idx+1] for no-lookahead trend direction)
+        ema_slice = self._ema(close[: idx + 1], span=self.adx_period)
+        # _classify expects ema indexed by `idx`; pad left with the slice's
+        # first value so positions <= idx remain consistent (only ema[idx]
+        # and ema[idx - w] are read).
+        ema_full = np.empty_like(close)
+        ema_full[: len(ema_slice)] = ema_slice
+        regime = self._classify(
+            hurst, adx_val, atr_percentile, close, idx, ema=ema_full,
+        )
 
         # --- Composite scores ---
         hurst_distance = abs(hurst - 0.5) * 2.0  # 0–1
@@ -387,6 +395,11 @@ class RegimeDetector:
         atr_arr = atr_ind.average_true_range().values
         atr_arr = np.where(np.isnan(atr_arr), 0.0, atr_arr)
 
+        # Pre-compute EMA(close, span=adx_period) once — used by _classify
+        # for trend-direction stability (slope sign instead of single-bar
+        # return sign).
+        ema_arr = self._ema(close, span=self.adx_period)
+
         # Result arrays — default to "range" (never "unknown" in normal flow)
         regimes = ["range"] * n
         hursts = np.full(n, 0.5)
@@ -432,7 +445,9 @@ class RegimeDetector:
             atr_pcts[i] = (current_atr / price) if price > 0 else 0.0
 
             # --- Classify ---
-            regime = self._classify(last_hurst, adx_val, pct, close, i)
+            regime = self._classify(
+                last_hurst, adx_val, pct, close, i, ema=ema_arr,
+            )
             regimes[i] = regime.value
 
             # --- Composite scores ---
@@ -496,6 +511,31 @@ class RegimeDetector:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _trend_slope_window(self) -> int:
+        """Bars over which the EMA slope determines trend direction.
+
+        Scales with adx_period so 4H / 1H / 15m detectors get proportionally
+        responsive smoothing without explicit per-TF wiring.
+        """
+        return max(2, int(self.adx_period) // 3)
+
+    @staticmethod
+    def _ema(values: np.ndarray, span: int) -> np.ndarray:
+        """Standard EMA with smoothing factor 2/(span+1).
+
+        Pure numpy — pandas would also work but we already operate on raw
+        arrays here and want to keep _classify allocation-light.
+        """
+        n = len(values)
+        if n == 0 or span <= 1:
+            return np.asarray(values, dtype=np.float64).copy()
+        alpha = 2.0 / (span + 1.0)
+        out = np.empty(n, dtype=np.float64)
+        out[0] = values[0]
+        for i in range(1, n):
+            out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
+        return out
+
     def _classify(
         self,
         hurst: float,
@@ -503,14 +543,21 @@ class RegimeDetector:
         atr_percentile: float,
         close: np.ndarray,
         idx: int,
+        ema: np.ndarray | None = None,
     ) -> MarketRegime:
         """Deterministic regime classification — never returns UNKNOWN.
 
         Priority (top → bottom):
         1. atr_percentile > atr_vol_threshold      → HIGH_VOL
-        2. adx > adx_trend_threshold AND last_return > 0  → TREND_UP
-        3. adx > adx_trend_threshold AND last_return < 0  → TREND_DOWN
-        4. otherwise                                → RANGE  (range/transitional)
+        2. adx > adx_trend_threshold AND ema_slope > 0  → TREND_UP
+        3. adx > adx_trend_threshold AND ema_slope ≤ 0  → TREND_DOWN
+        4. otherwise                                → RANGE
+
+        Trend *direction* uses the sign of an EMA(close, span=adx_period)
+        slope over the last ``_trend_slope_window()`` bars. The previous
+        implementation used a single-bar return sign, which flickered every
+        bar in choppy markets. EMA + multi-bar slope is the standard
+        stability fix without adding lookahead.
 
         Hurst is deliberately excluded — it remains a numeric ML feature.
         """
@@ -518,12 +565,22 @@ class RegimeDetector:
             return MarketRegime.HIGH_VOL
 
         if adx > self.adx_trend_threshold:
-            last_return = 0.0
-            if idx >= 1 and close[idx - 1] > 0:
-                last_return = (close[idx] - close[idx - 1]) / close[idx - 1]
-            if last_return >= 0:
-                return MarketRegime.TREND_UP
-            return MarketRegime.TREND_DOWN
+            if ema is None:
+                ema = self._ema(close[: idx + 1], span=self.adx_period)
+                ema_idx = len(ema) - 1
+            else:
+                ema_idx = idx
+            w = self._trend_slope_window()
+            if ema_idx >= w:
+                slope = ema[ema_idx] - ema[ema_idx - w]
+            elif idx >= 1 and close[idx - 1] > 0:
+                # Warmup fallback (insufficient history for EMA slope) —
+                # use the single-bar return sign so detect() on tiny
+                # fixtures still returns a real direction.
+                slope = close[idx] - close[idx - 1]
+            else:
+                slope = 0.0
+            return MarketRegime.TREND_UP if slope > 0 else MarketRegime.TREND_DOWN
 
         return MarketRegime.RANGE
 
