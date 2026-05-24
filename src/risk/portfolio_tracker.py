@@ -56,6 +56,10 @@ class PortfolioTracker:
         self._initial_equity: float = initial_equity
         self._cash: float = initial_equity
         self._peak_equity: float = initial_equity
+        # H5: equity snapshot at the start of the current UTC day. Used as
+        # the denominator for daily_pnl_pct so the percent-of-equity stop
+        # tracks current portfolio size, not the original deposit.
+        self._day_start_equity: float = initial_equity
 
         # Open positions by symbol
         self._positions: dict[str, _Position] = {}
@@ -140,7 +144,13 @@ class PortfolioTracker:
         self._persist()
 
     def update_price(self, symbol: str, current_price: float) -> None:
-        """Update mark price for an open position."""
+        """Update mark price for an open position.
+
+        Also bumps ``peak_equity`` when mark-to-market gains push the
+        portfolio above the previous high. Without this, drawdown was
+        measured from a stale (pre-position) peak and intraday round-trips
+        (up 1k → back to flat) registered no drawdown at all.
+        """
         if symbol not in self._positions:
             return
         pos = self._positions[symbol]
@@ -148,6 +158,10 @@ class PortfolioTracker:
         pos.unrealized_pnl = (
             pos.direction * (current_price - pos.avg_entry_price) * pos.quantity
         )
+
+        current_eq = self._get_equity()
+        if current_eq > self._peak_equity:
+            self._peak_equity = current_eq
 
     def close_position(
         self,
@@ -219,12 +233,18 @@ class PortfolioTracker:
         )
 
     def get_daily_pnl(self) -> float:
-        """Return today's realised P&L as a fraction of initial equity."""
+        """Today's realised + unrealised P&L as a fraction of *day-start* equity.
+
+        Denominator is ``_day_start_equity`` (frozen at the day's open),
+        not the original deposit — so percent-of-equity daily stops scale
+        with the current portfolio after compounding gains/losses.
+        """
         total_unrealized = sum(p.unrealized_pnl for p in self._positions.values())
         daily_total = self._daily_realized_pnl + total_unrealized
-        if self._initial_equity <= 0:
+        denom = self._day_start_equity if self._day_start_equity > 0 else self._initial_equity
+        if denom <= 0:
             return 0.0
-        return daily_total / self._initial_equity
+        return daily_total / denom
 
     def get_weekly_pnl(self) -> float:
         """Return this week's realised P&L as a fraction of initial equity."""
@@ -269,6 +289,10 @@ class PortfolioTracker:
         if today_start > self._day_start:
             self._daily_realized_pnl = 0.0
             self._day_start = today_start
+            # Freeze the new day's denominator at current equity (includes
+            # any open unrealised PnL) so daily % stops scale with the
+            # portfolio rather than the original deposit.
+            self._day_start_equity = self._get_equity()
             rolled = True
             log.debug("Daily PnL counter rolled over")
 
@@ -291,6 +315,7 @@ class PortfolioTracker:
         return {
             "cash": self._cash,
             "peak_equity": self._peak_equity,
+            "day_start_equity": self._day_start_equity,
             "daily_realized_pnl": self._daily_realized_pnl,
             "weekly_realized_pnl": self._weekly_realized_pnl,
             "total_realized_pnl": self._total_realized_pnl,
@@ -336,6 +361,8 @@ class PortfolioTracker:
                 self._cash = float(state["cash"])
             if "peak_equity" in state:
                 self._peak_equity = float(state["peak_equity"])
+            if "day_start_equity" in state:
+                self._day_start_equity = float(state["day_start_equity"])
             if "daily_realized_pnl" in state:
                 self._daily_realized_pnl = float(state["daily_realized_pnl"])
             if "weekly_realized_pnl" in state:

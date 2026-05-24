@@ -726,6 +726,17 @@ class MLTradingStrategy(Strategy):
                     f"(expected 4.0h for 4H bars)"
                 )
 
+            # H5: mark-to-market all open positions on this bar's close so
+            # unrealized_pnl / peak_equity / drawdown reflect the current
+            # state — without this, drawdown gates only see realized P&L
+            # and miss losing-but-still-open positions. Fail-soft.
+            try:
+                close_px = float(bar.close)
+                for _sym in list(self._tracker._positions.keys()):
+                    self._tracker.update_price(_sym, close_px)
+            except Exception as exc:
+                self.log.debug(f"update_price failed (non-critical): {exc}")
+
             # Record equity
             self._record_equity(bar.ts_event)
 
