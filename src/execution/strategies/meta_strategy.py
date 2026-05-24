@@ -84,8 +84,11 @@ class MetaSignalGate:
         min_size: float = 0.0,
     ) -> None:
         self._bundle_path = Path(bundle_path)
-        with open(self._bundle_path, "rb") as f:
-            bundle = pickle.load(f)
+        # H13: route through LGBMTrainer.load_model_bundle so this
+        # accepts both legacy pickled-booster bundles and the new
+        # sidecar (.lgb) format.
+        from src.models.lgbm_trainer import LGBMTrainer
+        bundle = LGBMTrainer.load_model_bundle(self._bundle_path)
         self._booster = bundle["booster"]
         self._feature_columns: list[str] = bundle["feature_columns"]
         self._threshold = float(threshold)

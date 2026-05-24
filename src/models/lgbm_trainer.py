@@ -117,6 +117,12 @@ class ModelConfig:
     # detected feature columns and this list (preserving the whitelist's
     # order); symbol_encoded is still auto-appended downstream.
     feature_whitelist: list[str] | None = None
+    # H13: opt-in to LightGBM's native, text-based ``save_model`` format
+    # (sidecar ``.lgb`` next to the legacy ``.pkl`` metadata bundle). The
+    # default is False so production retraining keeps the byte-for-byte
+    # historic artifact; new training pipelines set True to insulate
+    # models from Python / LightGBM / numpy version drift.
+    use_native_save: bool = False
 
     # LightGBM hyperparameters (defaults; Optuna can refine later)
     lgbm_params: dict[str, Any] = field(default_factory=lambda: {
@@ -436,12 +442,26 @@ class LGBMTrainer:
             self.models_dir
             / f"{self.config.regime}_model{self.config.model_suffix}.pkl"
         )
-        model_bundle = {
-            "booster": booster,
-            "feature_columns": feature_names,
-            "regime": self.config.regime,
-            "symbols": self.config.symbols,
-        }
+        # H13: native ``.lgb`` text save is opt-in. Default behaviour
+        # (use_native_save=False) is byte-for-byte identical to pre-H13:
+        # a single pickle bundle containing the live booster object.
+        if self.config.use_native_save:
+            lgb_path = model_path.with_suffix(".lgb")
+            booster.save_model(str(lgb_path))
+            model_bundle = {
+                "booster": None,                 # legacy slot kept for shape compat
+                "booster_file": lgb_path.name,   # sidecar reference for new loaders
+                "feature_columns": feature_names,
+                "regime": self.config.regime,
+                "symbols": self.config.symbols,
+            }
+        else:
+            model_bundle = {
+                "booster": booster,
+                "feature_columns": feature_names,
+                "regime": self.config.regime,
+                "symbols": self.config.symbols,
+            }
         with open(model_path, "wb") as f:
             pickle.dump(model_bundle, f)
         _log.info(f"Model saved: {model_path} ({len(feature_names)} features)")
@@ -518,6 +538,36 @@ class LGBMTrainer:
             f"passes={result.passes_minimum_thresholds()}"
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Model persistence helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_model_bundle(pkl_path: Path | str) -> dict:
+        """Load a model bundle in either legacy or H13 sidecar format.
+
+        Returns a dict with at minimum ``booster`` (an ``lgb.Booster``)
+        and ``feature_columns``. Detects the new format by the presence
+        of a non-null ``booster_file`` key in the pickle metadata; loads
+        the sidecar via ``lgb.Booster(model_file=...)``. Falls back to
+        the legacy "booster pickled inline" shape transparently — so a
+        single call site reads both formats and existing production
+        ``.pkl`` files keep working.
+
+        The sidecar path is resolved relative to the pickle file's
+        directory, so models can be moved as a (``.pkl`` + ``.lgb``)
+        pair without breaking the link.
+        """
+        pkl_path = Path(pkl_path)
+        with open(pkl_path, "rb") as f:
+            bundle = pickle.load(f)
+        sidecar = bundle.get("booster_file")
+        booster = bundle.get("booster")
+        if sidecar and booster is None:
+            lgb_path = pkl_path.parent / sidecar
+            bundle["booster"] = lgb.Booster(model_file=str(lgb_path))
+        return bundle
 
     # ------------------------------------------------------------------
     # Signal generation

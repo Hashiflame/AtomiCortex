@@ -1611,13 +1611,13 @@ class MLTradingStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _load_models(self) -> None:
-        """Load pickled LightGBM model bundles."""
+        """Load LightGBM model bundles (legacy pickle OR H13 sidecar)."""
+        from src.models.lgbm_trainer import LGBMTrainer
         models_dir = Path(self._config.models_dir)
         for regime in ["trend", "high_vol"]:
             path = models_dir / f"{regime}_model.pkl"
             if path.exists():
-                with open(path, "rb") as f:
-                    bundle = pickle.load(f)
+                bundle = LGBMTrainer.load_model_bundle(path)
                 booster = bundle["booster"]
                 features = bundle.get("feature_columns", [])
                 if regime == "trend":
