@@ -400,12 +400,26 @@ class MLValidator:
                 _log.warning(f"No data for {symbol}")
                 continue
 
-            # Create target (must be done before regime filter)
-            sym_df = trainer._builder.create_target(
-                sym_df,
-                forward_bars=trainer.config.forward_bars,
-                threshold_atr_multiplier=trainer.config.threshold_atr_multiplier,
-            )
+            # Create target (must be done before regime filter).
+            # Branch exactly as LGBMTrainer.train does so walk-forward
+            # validates the SAME label the model was trained on. Previously
+            # this always called the legacy 1-bar sign(return) target, so
+            # a v3 triple-barrier model was being scored against a target
+            # it had never seen — the "60% profitable windows" go-live
+            # gate was checked on the wrong labels.
+            if trainer.config.use_triple_barrier:
+                sym_df = trainer._builder.create_target_triple_barrier(
+                    sym_df,
+                    pt_multiplier=trainer.config.barrier_pt_multiplier,
+                    sl_multiplier=trainer.config.barrier_sl_multiplier,
+                    max_holding=trainer.config.barrier_max_holding,
+                )
+            else:
+                sym_df = trainer._builder.create_target(
+                    sym_df,
+                    forward_bars=trainer.config.forward_bars,
+                    threshold_atr_multiplier=trainer.config.threshold_atr_multiplier,
+                )
 
             # Apply regime filter
             if trainer.config.regime != "all":
