@@ -62,10 +62,40 @@ class SignalBridge:
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        """Create a new connection with WAL mode and foreign keys."""
-        conn = sqlite3.connect(self._db_path)
+        """Create a new connection with WAL mode and foreign keys.
+
+        H9: applies per-connection PRAGMAs so concurrent readers/writers
+        (trading strategy + Telegram bot + reconciler) don't fail
+        immediately on "database is locked":
+
+        * ``busy_timeout=5000`` — wait up to 5s for the lock instead of
+          erroring out at once. Per-connection setting; must be set on
+          every connect (not just at init time).
+        * ``journal_mode=WAL`` — concurrent reads while a writer holds
+          the lock. WAL persists at the DB level but re-asserting on
+          every connect is cheap and self-healing if another tool ever
+          flips it back.
+        * ``synchronous=NORMAL`` — pairs with WAL for a 5-10× write
+          speed-up at negligible durability cost.
+
+        Each PRAGMA is wrapped individually — a single bad pragma (e.g.
+        a build of sqlite without WAL) must not lose the others.
+        """
+        conn = sqlite3.connect(self._db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
+        for pragma in (
+            "PRAGMA busy_timeout=5000",
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA foreign_keys=ON",
+        ):
+            try:
+                conn.execute(pragma)
+            except sqlite3.Error as exc:
+                _log.warning(
+                    "SignalBridge {pragma} failed (non-fatal): {err}",
+                    pragma=pragma, err=str(exc),
+                )
         return conn
 
     # ------------------------------------------------------------------
@@ -80,7 +110,8 @@ class SignalBridge:
             _log.error("SignalBridge cannot connect to DB: {err}", err=str(exc))
             return
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
+            # WAL / busy_timeout already applied in _connect(); proceed
+            # straight to schema creation.
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS signals_log (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
