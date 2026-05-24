@@ -124,21 +124,38 @@ class ORBDetector:
             & (pl.col("_hour") < end_hour)
         )
 
-        # Compute ORB high/low within each day's ORB window.
-        df = df.with_columns([
-            pl.when(is_orb_bar)
-            .then(pl.col("high"))
-            .otherwise(None)
-            .max()
-            .over("_date")
-            .alias(f"orb_high_{session}"),
+        # Causal ORB:
+        # * inside the ORB window  → expanding cum_max / cum_min so far
+        #   (bar T only sees bars whose open_time <= T)
+        # * after the ORB window    → final ORB = max/min of all 4 bars
+        #   (legitimate by then — every ORB bar has closed)
+        # * before the ORB window   → None (forward_fill below picks up
+        #   the previous day's frozen ORB, exactly as before)
+        # Pre-fix this used max/min().over("_date") which broadcast the
+        # full-day ORB back to bars 0/1/2 of the window — every early
+        # ORB bar peeked at the highs/lows of later ORB bars.
+        masked_high = (
+            pl.when(is_orb_bar).then(pl.col("high")).otherwise(None)
+        )
+        masked_low = (
+            pl.when(is_orb_bar).then(pl.col("low")).otherwise(None)
+        )
+        within_high = masked_high.cum_max().over("_date")
+        within_low = masked_low.cum_min().over("_date")
+        final_high = masked_high.max().over("_date")
+        final_low = masked_low.min().over("_date")
+        after_orb = pl.col("_hour") >= end_hour
 
-            pl.when(is_orb_bar)
-            .then(pl.col("low"))
-            .otherwise(None)
-            .min()
-            .over("_date")
-            .alias(f"orb_low_{session}"),
+        df = df.with_columns([
+            pl.when(is_orb_bar).then(within_high)
+              .when(after_orb).then(final_high)
+              .otherwise(None)
+              .alias(f"orb_high_{session}"),
+
+            pl.when(is_orb_bar).then(within_low)
+              .when(after_orb).then(final_low)
+              .otherwise(None)
+              .alias(f"orb_low_{session}"),
         ])
 
         # Fill null (days with no ORB data) with forward-fill.

@@ -92,21 +92,24 @@ def _15m_with_breakout(
 
 class TestORBAsiaSession:
     def test_orb_asia_uses_first_4_bars(self) -> None:
-        """Asia ORB should be set from first 4 bars (00:00-00:45)."""
+        """Asia ORB equals the max of the first 4 bars *once the window
+        closes* — checked at the last ORB bar (index 3). Indices 0/1/2
+        deliberately do NOT carry the full ORB yet (causal expanding max);
+        that is the lookahead-bias fix from Phase 2 Step 2.5."""
         df = _15m_klines_full_day()
         out = ORBDetector().calculate(df)
         assert "orb_high_asia" in out.columns
         assert "orb_low_asia" in out.columns
-        # ORB high should be the max high of first 4 bars.
         first4_highs = df["high"][:4].to_list()
-        assert out["orb_high_asia"][0] == pytest.approx(max(first4_highs))
+        assert out["orb_high_asia"][3] == pytest.approx(max(first4_highs))
 
     def test_orb_asia_low_correct(self) -> None:
-        """Asia ORB low should be the min low of first 4 bars."""
+        """Asia ORB low = min of first 4 bars, checked at bar 3 (last
+        ORB bar) — earlier bars only see the expanding min so far."""
         df = _15m_klines_full_day()
         out = ORBDetector().calculate(df)
         first4_lows = df["low"][:4].to_list()
-        assert out["orb_low_asia"][0] == pytest.approx(min(first4_lows))
+        assert out["orb_low_asia"][3] == pytest.approx(min(first4_lows))
 
 
 class TestORBLondonSession:
@@ -141,12 +144,18 @@ class TestORBNYSession:
 
 class TestORBForwardFill:
     def test_orb_values_forward_filled(self) -> None:
-        """ORB values should remain constant after formation."""
+        """ORB value stays constant once the window has fully formed.
+
+        Pre-Step-2.5 every bar in the day shared the same broadcast value
+        (the lookahead-buggy ``max().over("_date")``). Now bars 0/1/2 carry
+        the expanding running max — different values — and only bars 3+
+        share the final fixed ORB. We assert the post-formation invariant
+        (the actually-useful one for trading)."""
         df = _15m_klines_full_day()
         out = ORBDetector().calculate(df)
-        # Asia ORB should be the same for all bars (forward filled).
-        asia_highs = out["orb_high_asia"].unique()
-        assert len(asia_highs) == 1  # All same value
+        # Post-window bars (index 4 onward) must all show the final ORB.
+        post_window = out["orb_high_asia"][4:].unique()
+        assert len(post_window) == 1
 
 
 class TestORBBreakout:
