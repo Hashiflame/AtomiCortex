@@ -62,30 +62,115 @@ class PurgedKFoldCV:
         self,
         data: pl.DataFrame,
         timestamp_col: str = "datetime",
+        symbol_col: str | None = None,
     ) -> Generator[tuple[pl.DataFrame, pl.DataFrame], None, None]:
-        """Yield ``(train_df, test_df)`` for each fold."""
+        """Yield ``(train_df, test_df)`` for each fold.
+
+        Boundaries are computed over the **time axis**, not row indices.
+        With multi-symbol concatenated frames (``[BTC...][ETH...][SOL...]``)
+        the row index is not monotone in time — slicing by row would put
+        late BTC and early ETH in the same fold's "test". Pass
+        ``symbol_col`` to filter every symbol independently by time so no
+        symbol's future leaks into another symbol's training set
+        (same fix pattern as ``temporal_split_multi``).
+
+        ``embargo_pct`` is the fraction of the **total time range** (not
+        of rows) to discard immediately after train_end. For a uniformly
+        spaced single-symbol frame this is numerically equivalent to the
+        old row-based embargo, so existing single-symbol tests still hold.
+        """
         n = len(data)
         if n < self.n_splits + 1:
             raise ValueError(
                 f"Dataset too small ({n} rows) for {self.n_splits} splits"
             )
+        # Auto-fallback: synthetic / test frames frequently have a real
+        # ``open_time`` (epoch ms) but a null / missing ``datetime`` column.
+        # When the caller did not pick an alternative explicitly, try
+        # ``open_time`` before failing — this preserves the old behaviour
+        # of split() working on these frames without an explicit kwarg.
+        candidates = [timestamp_col]
+        if timestamp_col == "datetime" and "open_time" in data.columns:
+            candidates.append("open_time")
 
-        block_size = n // (self.n_splits + 1)
-        embargo_rows = max(1, int(n * self.embargo_pct))
+        ts = None
+        chosen_col = None
+        for col in candidates:
+            if col not in data.columns:
+                continue
+            s = data[col]
+            if s.null_count() >= len(s):
+                continue
+            if s.min() is None or s.max() is None:
+                continue
+            ts = s
+            chosen_col = col
+            break
+
+        if ts is None or chosen_col is None:
+            raise ValueError(
+                f"PurgedKFoldCV.split: no usable timestamp column among "
+                f"{candidates} in data (columns: {data.columns})"
+            )
+        timestamp_col = chosen_col
+        t_min = ts.min()
+        t_max = ts.max()
+
+        # ``t_max - t_min`` works for both Datetime (→ timedelta) and
+        # integer epoch (→ int). Subsequent multiplication / addition
+        # follow the same generic arithmetic.
+        total = t_max - t_min
+        block = total / (self.n_splits + 1)
+        embargo = self.embargo_pct * total
+
+        use_per_symbol = (
+            symbol_col is not None and symbol_col in data.columns
+        )
+        if use_per_symbol:
+            symbols = sorted(data[symbol_col].unique().to_list())
 
         for i in range(self.n_splits):
-            train_end = (i + 1) * block_size
-            test_start = train_end + embargo_rows
-            test_end = (i + 2) * block_size
-
-            if test_end > n:
-                test_end = n
-            if test_start >= test_end:
-                log.warning("Fold %d: test window is empty after embargo — skipping", i)
+            train_end_t = t_min + (i + 1) * block
+            test_start_t = train_end_t + embargo
+            test_end_t = t_min + (i + 2) * block
+            if test_end_t > t_max:
+                test_end_t = t_max
+            if test_start_t >= test_end_t:
+                log.warning(
+                    "Fold %d: test window is empty after embargo — skipping", i,
+                )
                 continue
 
-            train_df = data.slice(0, train_end)
-            test_df = data.slice(test_start, test_end - test_start)
+            if use_per_symbol:
+                train_parts: list[pl.DataFrame] = []
+                test_parts: list[pl.DataFrame] = []
+                for sym in symbols:
+                    sub = (
+                        data.filter(pl.col(symbol_col) == sym)
+                        .sort(timestamp_col)
+                    )
+                    train_parts.append(
+                        sub.filter(pl.col(timestamp_col) < train_end_t)
+                    )
+                    test_parts.append(
+                        sub.filter(
+                            (pl.col(timestamp_col) >= test_start_t)
+                            & (pl.col(timestamp_col) < test_end_t)
+                        )
+                    )
+                train_df = pl.concat(train_parts, how="diagonal").sort(
+                    timestamp_col
+                )
+                test_df = pl.concat(test_parts, how="diagonal").sort(
+                    timestamp_col
+                )
+            else:
+                s = data.sort(timestamp_col)
+                train_df = s.filter(pl.col(timestamp_col) < train_end_t)
+                test_df = s.filter(
+                    (pl.col(timestamp_col) >= test_start_t)
+                    & (pl.col(timestamp_col) < test_end_t)
+                )
             yield train_df, test_df
 
 

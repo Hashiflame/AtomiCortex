@@ -151,9 +151,33 @@ class MLValidator:
             embargo_pct=self.embargo_pct,
         )
 
+        # Pick the best available timestamp column. Prefer a real Datetime
+        # ``datetime`` (cheaper comparison and human-readable); fall back to
+        # the always-present ``open_time`` epoch-ms integer. Without this
+        # the split would slice by row index and a multi-symbol concat
+        # frame would produce temporally-incoherent folds.
+        if (
+            "datetime" in df.columns
+            and df["datetime"].dtype == pl.Datetime
+            and df["datetime"].null_count() < len(df)
+        ):
+            ts_col = "datetime"
+        elif "open_time" in df.columns:
+            ts_col = "open_time"
+        else:
+            raise ValueError(
+                "purged_kfold_cv: no timestamp column ('datetime' or "
+                "'open_time') in dataframe — cannot do a time-aware split"
+            )
+        # Per-symbol filtering when the concat dataset carries a symbol
+        # column (the multi-symbol case that originally produced ML-018).
+        sym_col = "symbol" if "symbol" in df.columns else None
+
         results: list[EvaluationResult] = []
 
-        for fold_idx, (train_df, test_df) in enumerate(cv.split(df)):
+        for fold_idx, (train_df, test_df) in enumerate(
+            cv.split(df, timestamp_col=ts_col, symbol_col=sym_col)
+        ):
             _log.info(
                 f"Fold {fold_idx + 1}/{self.n_splits}: "
                 f"train={len(train_df)}, test={len(test_df)}"
