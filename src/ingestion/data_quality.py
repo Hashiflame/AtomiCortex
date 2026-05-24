@@ -36,6 +36,10 @@ _log = get_logger(__name__)
 
 # Primary timestamp column for each data type
 _TIMESTAMP_COL: dict[str, str] = {
+    "klines_1m":    "open_time",
+    "klines_5m":    "open_time",
+    "klines_15m":   "open_time",
+    "klines_1h":    "open_time",
     "klines_4h":    "open_time",
     "klines_1d":    "open_time",
     "funding_rate": "fundingTime",
@@ -45,7 +49,18 @@ _TIMESTAMP_COL: dict[str, str] = {
 
 # Gap threshold in milliseconds — gaps strictly LARGER than this value are flagged.
 # None = skip gap check for this type.
+#
+# H14: thresholds were defined only for 4h / 1d, so klines_1h / klines_15m /
+# klines_5m / klines_1m silently fell through to ``None`` and gap checks
+# were no-ops. Maintenance-window gaps in 1H / 15m training data went
+# unflagged, polluting rolling features. Now every kline interval has a
+# bar-aligned threshold = one bar duration → one missing bar trips the
+# flag (consistent with the 4h rule).
 _GAP_THRESHOLD_MS: dict[str, int | None] = {
+    "klines_1m":    1 * 60_000,         # > 1 min
+    "klines_5m":    5 * 60_000,         # > 5 min
+    "klines_15m":   15 * 60_000,        # > 15 min
+    "klines_1h":    1 * 3_600_000,      # > 1 h
     "klines_4h":    4 * 3_600_000,      # > 4 h  (one missing 4h bar)
     "klines_1d":    24 * 3_600_000,     # > 1 day
     "funding_rate": 9 * 3_600_000,      # > 9 h  (funding every 8 h)
@@ -54,9 +69,14 @@ _GAP_THRESHOLD_MS: dict[str, int | None] = {
 }
 
 # Key columns checked for NULL values per data type
+_KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume"]
 _KEY_COLS: dict[str, list[str]] = {
-    "klines_4h":    ["open_time", "open", "high", "low", "close", "volume"],
-    "klines_1d":    ["open_time", "open", "high", "low", "close", "volume"],
+    "klines_1m":    _KLINE_COLS,
+    "klines_5m":    _KLINE_COLS,
+    "klines_15m":   _KLINE_COLS,
+    "klines_1h":    _KLINE_COLS,
+    "klines_4h":    _KLINE_COLS,
+    "klines_1d":    _KLINE_COLS,
     "funding_rate": ["fundingTime", "fundingRate"],
     "metrics":      ["create_time", "sum_open_interest"],
     "agg_trades":   ["transact_time", "price", "quantity"],
@@ -485,7 +505,10 @@ def _month_range(start: date, end: date) -> set[str]:
 
 def _anomaly_sql(data_type: str) -> str:
     """SQL expression counting rows that violate domain rules."""
-    if data_type in ("klines_4h", "klines_1d"):
+    if data_type in (
+        "klines_1m", "klines_5m", "klines_15m",
+        "klines_1h", "klines_4h", "klines_1d",
+    ):
         return "COUNT(*) FILTER (WHERE high < low OR close <= 0 OR volume < 0)"
     if data_type == "funding_rate":
         return "COUNT(*) FILTER (WHERE ABS(fundingRate) >= 0.05)"
