@@ -23,6 +23,7 @@ list is the canonical contract.
 
 from __future__ import annotations
 
+import math
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ from src.execution.strategies.ml_strategy import (
     MLStrategyConfig,
     MLTradingStrategy,
 )
+from src.risk.risk_engine import RiskDecision, TradeSignal
 
 _log = get_logger(__name__)
 
@@ -198,20 +200,42 @@ class MetaMLTradingStrategy(MLTradingStrategy):
     def __init__(self, config: MetaMLStrategyConfig) -> None:
         super().__init__(config)
         self._meta_config: MetaMLStrategyConfig = config
+        # Defer gate loading to on_start so a missing/corrupt bundle
+        # degrades gracefully (we keep trading on the base signal)
+        # instead of crashing the strategy at construction time.
         self._gate: MetaSignalGate | None = None
-        if config.meta_enabled:
-            self._gate = MetaSignalGate(
-                bundle_path=Path(config.meta_model_path),
-                threshold=config.meta_threshold,
-                min_size=config.meta_min_size,
-            )
 
     # ------------------------------------------------------------------
-    # Override the single point where direction/confidence become a
-    # trade. We hook the risk engine: before evaluate(), we either drop
-    # the signal (meta says skip) or shrink risk_per_trade in proportion
-    # to meta_proba. Restored afterwards so other regimes/symbols aren't
-    # affected.
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def on_start(self) -> None:
+        """Set up base strategy, then load the meta-gate (fail-soft)."""
+        super().on_start()
+        if not self._meta_config.meta_enabled:
+            self.log.info("Meta gate disabled by config — base strategy only")
+            return
+        try:
+            self._gate = MetaSignalGate(
+                bundle_path=Path(self._meta_config.meta_model_path),
+                threshold=self._meta_config.meta_threshold,
+                min_size=self._meta_config.meta_min_size,
+            )
+            self.log.info(
+                f"Meta gate active | threshold={self._meta_config.meta_threshold} "
+                f"min_size={self._meta_config.meta_min_size}"
+            )
+        except Exception as exc:
+            # Fail-soft: degrade to base strategy. No silent corruption —
+            # log loudly so the operator can fix it.
+            self.log.error(
+                f"Meta gate failed to load ({exc}); "
+                f"continuing as base MLTradingStrategy"
+            )
+            self._gate = None
+
+    # ------------------------------------------------------------------
+    # Gate evaluation
     # ------------------------------------------------------------------
 
     def _apply_meta_gate(
@@ -230,3 +254,71 @@ class MetaMLTradingStrategy(MLTradingStrategy):
             f"take={decision.take} size_mult={decision.size_multiplier:.3f}"
         )
         return decision.take, decision.size_multiplier
+
+    def _build_meta_context(self, signal: TradeSignal) -> dict[str, float]:
+        """Best-effort feature dict for the meta gate.
+
+        Populates only the columns we can read directly from the live
+        ``TradeSignal``; the gate's ``build_feature_vector`` defaults
+        any unknown / missing column to 0.0, which LightGBM handles
+        natively. This keeps the integration robust to future schema
+        evolution without silently mis-aligning features.
+        """
+        ctx: dict[str, float] = {
+            "atr_pct": float(signal.atr_pct or 0.0),
+            "funding_rate": float(signal.funding_rate or 0.0),
+        }
+        ts = getattr(signal, "timestamp", None)
+        if ts is not None:
+            try:
+                hour = float(ts.hour) + float(ts.minute) / 60.0
+                ctx["hour_sin"] = math.sin(2.0 * math.pi * hour / 24.0)
+                ctx["hour_cos"] = math.cos(2.0 * math.pi * hour / 24.0)
+            except Exception:
+                pass
+        regime = getattr(signal, "regime", None)
+        if isinstance(regime, str) and regime:
+            ctx[f"regime_{regime}"] = 1.0
+        return ctx
+
+    # ------------------------------------------------------------------
+    # Integration point: meta-gate fires AFTER risk approval, BEFORE
+    # the order is actually submitted. Rejection here drops the trade;
+    # approval may shrink the position size by ``size_multiplier``.
+    # ------------------------------------------------------------------
+
+    def _open_position(
+        self,
+        decision: RiskDecision,
+        signal: TradeSignal,
+    ) -> None:
+        if self._gate is None:
+            super()._open_position(decision, signal)
+            return
+
+        context = self._build_meta_context(signal)
+        take, size_mult = self._apply_meta_gate(
+            direction=signal.direction,
+            confidence=signal.confidence,
+            context=context,
+        )
+
+        if not take:
+            self.log.info(
+                f"META-GATE REJECTED | regime={signal.regime} "
+                f"dir={signal.direction} conf={signal.confidence:.3f} | "
+                f"holding for next bar"
+            )
+            return
+
+        if size_mult < 1.0:
+            decision.position_size *= size_mult
+            decision.notional *= size_mult
+            decision.leverage *= size_mult
+            self.log.info(
+                f"META-GATE SCALED | mult={size_mult:.3f} → "
+                f"size={decision.position_size:.6f} "
+                f"notional=${decision.notional:.2f}"
+            )
+
+        super()._open_position(decision, signal)
