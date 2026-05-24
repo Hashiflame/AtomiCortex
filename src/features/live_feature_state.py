@@ -53,8 +53,13 @@ class LiveFeatureState:
     )  # last 100 funding marks
 
     oi_value: float = 0.0
+    # Phase 4 Step 4.1 — oi_zscore in add_oi_features uses a 180 4H-bar
+    # rolling window (~30 days). At 5-min poll cadence that's ~8 640
+    # samples; bumped to 10 000 (~35 days) so live z-score is stable
+    # even when the bot has been up long enough for preloaded samples
+    # to age out. Memory cost ≈ 500 KB — negligible.
     oi_history: deque = field(
-        default_factory=lambda: deque(maxlen=100)
+        default_factory=lambda: deque(maxlen=10_000)
     )
 
     # Timestamps (unix ms)
@@ -83,6 +88,52 @@ class LiveFeatureState:
             "timestamp": timestamp_ms,
             "oi_value": oi,
         })
+
+    def preload_oi(self, records: list[dict]) -> int:
+        """Seed ``oi_history`` with historical OI samples.
+
+        Called once at strategy startup (after fetching Binance's
+        ``openInterestHist`` endpoint) so the 30-day ``oi_zscore``
+        rolling window is meaningful from the very first inference,
+        rather than degenerating to ~0 for the first few days of
+        run-time. Each record must carry ``timestamp`` (epoch ms)
+        and ``oi_value``; malformed records are skipped silently
+        (fail-soft — strategy still operates).
+
+        Idempotent w.r.t. already-present samples: records whose
+        timestamp matches an existing one are dropped, so calling
+        ``preload_oi`` twice with overlapping data does not duplicate
+        history. Buffer is left chronologically sorted.
+
+        Returns the number of records actually inserted.
+        """
+        existing_ts = {r.get("timestamp") for r in self.oi_history}
+        new_clean: list[dict] = []
+        for rec in records:
+            try:
+                ts = int(rec["timestamp"])
+                oi = float(rec["oi_value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ts in existing_ts:
+                continue
+            new_clean.append({"timestamp": ts, "oi_value": oi})
+            existing_ts.add(ts)
+        if not new_clean:
+            return 0
+        # Merge + sort + re-seed deque so chronological order is preserved.
+        merged = sorted(
+            list(self.oi_history) + new_clean,
+            key=lambda r: r["timestamp"],
+        )
+        self.oi_history.clear()
+        self.oi_history.extend(merged)
+        # Update latest snapshot if the preloaded samples are fresher.
+        latest = merged[-1]
+        if latest["timestamp"] >= self.last_oi_update:
+            self.oi_value = latest["oi_value"]
+            self.last_oi_update = latest["timestamp"]
+        return len(new_clean)
 
     # ---------------------------------------------------------------
     # DataFrame builders (compatible with derivatives.py expectations)

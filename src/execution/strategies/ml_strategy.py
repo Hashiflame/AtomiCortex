@@ -339,6 +339,48 @@ class MLTradingStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"Funding rate preload failed (non-fatal): {exc}")
 
+        # 11b. Preload historical open interest at 4H granularity so the
+        # 30-day rolling oi_zscore window is populated from the first
+        # inference. Without this preload the bot needs ~30 days of
+        # 5-min polling before z-score stabilises (Phase 4 Step 4.1).
+        try:
+            import requests as _req
+            _sym = str(self._instrument_id)
+            _sym_clean = (
+                _sym.split("-")[0] if "-" in _sym else _sym.split(".")[0]
+            )
+            # openInterestHist lives on production (mainnet) for testnet
+            # too — testnet has no historical OI endpoint of its own.
+            resp = _req.get(
+                "https://fapi.binance.com/futures/data/openInterestHist",
+                params={
+                    "symbol": _sym_clean,
+                    "period": "4h",
+                    "limit": 500,
+                },
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                records = []
+                for d in resp.json():
+                    try:
+                        records.append({
+                            "timestamp": int(d["timestamp"]),
+                            "oi_value": float(d["sumOpenInterestValue"]),
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                inserted = self._live_state.preload_oi(records)
+                self.log.info(
+                    f"Preloaded {inserted} historical OI samples (4h period)"
+                )
+            else:
+                self.log.warning(
+                    f"OI preload HTTP {resp.status_code} — continuing without"
+                )
+        except Exception as exc:
+            self.log.warning(f"OI preload failed (non-fatal): {exc}")
+
         # 12. Dead-man's switch heartbeat — external watchdog reads this
         # key and emergency-closes positions if the bot stops writing.
         self._start_heartbeat()
