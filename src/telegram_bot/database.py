@@ -852,6 +852,43 @@ class Database:
         finally:
             conn.close()
 
+    def get_payment_by_invoice_id(
+        self, invoice_id: str,
+    ) -> dict[str, Any] | None:
+        """Find a payment by its ``invoice_id`` column.
+
+        Used for idempotent payment processing:
+          * Telegram Stars — ``invoice_id`` stores
+            ``telegram_payment_charge_id`` (unique per charge).
+          * CryptoBot — ``invoice_id`` stores the CryptoBot invoice_id.
+        """
+        if not invoice_id:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM payments WHERE invoice_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (invoice_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def set_payment_invoice_id(
+        self, payment_id: int, invoice_id: str,
+    ) -> None:
+        """Attach an invoice/charge id to an existing payment row."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE payments SET invoice_id = ? WHERE id = ?",
+                (invoice_id, payment_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_pending_payments(self, method: str | None = None) -> list[dict[str, Any]]:
         """Return all pending payments, optionally filtered by method."""
         conn = self._connect()

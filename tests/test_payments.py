@@ -156,6 +156,7 @@ class TestSuccessfulPayment:
         update.message.successful_payment = MagicMock()
         update.message.successful_payment.invoice_payload = "premium_30d_111"
         update.message.successful_payment.total_amount = 500
+        update.message.successful_payment.telegram_payment_charge_id = "ch_a1"
 
         ctx = _make_context(db)
         await successful_payment_handler(update, ctx)
@@ -175,6 +176,7 @@ class TestSuccessfulPayment:
         update.message.successful_payment = MagicMock()
         update.message.successful_payment.invoice_payload = "premium_30d_111"
         update.message.successful_payment.total_amount = 500
+        update.message.successful_payment.telegram_payment_charge_id = "ch_b2"
 
         ctx = _make_context(db)
         await successful_payment_handler(update, ctx)
@@ -185,17 +187,22 @@ class TestSuccessfulPayment:
 
     @pytest.mark.asyncio
     async def test_duplicate_payment_ignored(self, db):
-        """Already-paid payment should not extend again."""
+        """Same telegram_payment_charge_id must not be activated twice."""
         db.create_user(111, "alice", "Alice")
         now = datetime.now(timezone.utc)
-        pid = db.create_payment(111, "stars", 6.50, 30,
-                               payload="premium_30d_111", stars_amount=500)
+        # Pre-existing PAID row with charge_id "ch_dup".
+        pid = db.create_payment(
+            111, "stars", 6.50, 30,
+            payload="premium_30d_111", invoice_id="ch_dup",
+            stars_amount=500,
+        )
         db.update_payment_status(pid, "paid", now.isoformat())
 
         update = _make_update()
         update.message.successful_payment = MagicMock()
         update.message.successful_payment.invoice_payload = "premium_30d_111"
         update.message.successful_payment.total_amount = 500
+        update.message.successful_payment.telegram_payment_charge_id = "ch_dup"
 
         ctx = _make_context(db)
         await successful_payment_handler(update, ctx)
@@ -227,9 +234,12 @@ class TestPreCheckout:
         update = _make_update()
         update.pre_checkout_query = MagicMock()
         update.pre_checkout_query.invoice_payload = "premium_30d_111"
+        update.pre_checkout_query.from_user = MagicMock()
+        update.pre_checkout_query.from_user.id = 111
+        update.pre_checkout_query.total_amount = 500
         update.pre_checkout_query.answer = AsyncMock()
 
-        ctx = _make_context(db)
+        ctx = _make_context(db, prices={"stars_30d": 500, "stars_90d": 1200})
         await pre_checkout_handler(update, ctx)
         update.pre_checkout_query.answer.assert_awaited_once_with(ok=True)
 

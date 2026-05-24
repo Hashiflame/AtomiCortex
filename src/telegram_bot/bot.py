@@ -90,6 +90,7 @@ from src.telegram_bot.keyboards import (
 from src.telegram_bot.payments_crypto import CryptoBotPayment
 from src.telegram_bot.payments_stars import (
     pre_checkout_handler,
+    refund_stars_handler,
     send_invoice_stars,
     successful_payment_handler,
 )
@@ -218,6 +219,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("stats_admin", cmd_stats_admin))
         app.add_handler(CommandHandler("payments", cmd_payments))
         app.add_handler(CommandHandler("revenue", cmd_revenue))
+        app.add_handler(CommandHandler("refund", refund_stars_handler))
 
         # Payment handlers — Telegram Stars
         app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))

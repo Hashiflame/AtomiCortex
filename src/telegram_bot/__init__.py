@@ -6,6 +6,7 @@ from src.telegram_bot.database import Database
 from src.telegram_bot.payments_crypto import CryptoBotPayment
 from src.telegram_bot.payments_stars import (
     pre_checkout_handler,
+    refund_stars_handler,
     send_invoice_stars,
     successful_payment_handler,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "Database",
     "CryptoBotPayment",
     "pre_checkout_handler",
+    "refund_stars_handler",
     "send_invoice_stars",
     "successful_payment_handler",
 ]

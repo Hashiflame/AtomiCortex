@@ -177,10 +177,19 @@ class CryptoBotPayment:
     async def poll_payments(self) -> int:
         """Check paid invoices and activate new ones.
 
-        1. GET /getInvoices?status=paid
-        2. For each paid invoice with known payload:
-           - If not already processed → activate premium
-           - Track processed_invoice_ids to avoid duplicates
+        Hardened (Phase 5.3):
+          * Deduplication is keyed on ``invoice_id`` and **persisted in
+            the DB** via ``get_payment_by_invoice_id``. The in-memory
+            ``_processed_ids`` set is now just a per-process cache; it is
+            re-hydratable from DB so replays survive restart.
+          * Each paid invoice must match a **pending row we created**
+            (``get_payment_by_payload``). An incoming invoice with no
+            matching pending row is treated as untrusted (we did not
+            issue it) and skipped with a WARNING.
+          * The reported ``amount`` is verified against the amount we
+            recorded when the invoice was created (tolerance 0.01 USD).
+            Amount mismatch is logged as ERROR and the activation is
+            skipped — defends against forged-payload replay.
 
         Returns the number of newly activated payments.
         """
@@ -191,41 +200,87 @@ class CryptoBotPayment:
         activated = 0
         for inv in paid_invoices:
             invoice_id = str(inv.get("invoice_id", ""))
+            if not invoice_id:
+                continue
 
-            # Skip already processed
+            # 1. In-memory short-circuit (avoids hitting DB on every poll).
             if invoice_id in self._processed_ids:
                 continue
 
-            payload = inv.get("payload", "")
+            # 2. Persistent dedup — survives restart.
+            prior = self._db.get_payment_by_invoice_id(invoice_id)
+            if prior and prior.get("status") in ("paid", "refunded"):
+                self._processed_ids.add(invoice_id)
+                continue
+
+            payload = str(inv.get("payload", ""))
             if not payload:
+                _log.warning(
+                    "CryptoBot: paid invoice without payload "
+                    "| invoice_id={i} — skipping",
+                    i=invoice_id,
+                )
                 self._processed_ids.add(invoice_id)
                 continue
 
-            # Check if this payment is already in our DB as paid
-            existing = self._db.get_payment_by_payload(payload)
-            if existing and existing.get("status") == "paid":
-                self._processed_ids.add(invoice_id)
-                continue
-
-            # Parse payload
+            # Parse payload.
             try:
                 parts = payload.split("_")
                 if len(parts) != 3 or parts[0] != "premium":
-                    self._processed_ids.add(invoice_id)
-                    continue
+                    raise ValueError("bad shape")
                 days = int(parts[1].rstrip("d"))
                 user_id = int(parts[2])
+                if days <= 0 or user_id <= 0:
+                    raise ValueError("bad values")
             except (ValueError, IndexError):
+                _log.warning(
+                    "CryptoBot: unparseable payload {p} | invoice_id={i}",
+                    p=payload, i=invoice_id,
+                )
                 self._processed_ids.add(invoice_id)
                 continue
 
-            # Activate
+            # 3. Anti-replay: the invoice must match a pending row we
+            #    created via create_invoice(). If no such row exists,
+            #    the invoice was not issued by us — refuse activation.
+            pending = self._db.get_payment_by_payload(payload)
+            if pending is None:
+                _log.warning(
+                    "CryptoBot: paid invoice with no matching pending row "
+                    "| payload={p} invoice_id={i} — refusing activation",
+                    p=payload, i=invoice_id,
+                )
+                self._processed_ids.add(invoice_id)
+                continue
+            if pending.get("status") == "paid":
+                # Same payload already activated (e.g. a stale duplicate
+                # from CryptoBot's side after we processed via charge_id).
+                self._processed_ids.add(invoice_id)
+                continue
+
+            # 4. Amount verification.
+            try:
+                paid_amount = float(inv.get("amount", "0"))
+            except (TypeError, ValueError):
+                paid_amount = 0.0
+            expected_amount = float(pending.get("amount_usd") or 0.0)
+            if expected_amount > 0 and abs(paid_amount - expected_amount) > 0.01:
+                _log.error(
+                    "CryptoBot: AMOUNT MISMATCH | payload={p} invoice={i} "
+                    "paid={pa} expected={ea} — refusing activation",
+                    p=payload, i=invoice_id, pa=paid_amount, ea=expected_amount,
+                )
+                self._processed_ids.add(invoice_id)
+                continue
+
+            # 5. Activate.
             await self._activate_payment(
                 user_id=user_id,
                 days=days,
-                amount_usd=float(inv.get("amount", "0")),
+                amount_usd=paid_amount,
                 payload=payload,
                 invoice_id=invoice_id,
+                pending=pending,
             )
             self._processed_ids.add(invoice_id)
             activated += 1
@@ -242,8 +297,14 @@ class CryptoBotPayment:
         amount_usd: float,
         payload: str,
         invoice_id: str,
+        pending: dict[str, Any] | None = None,
     ) -> None:
-        """Activate a paid CryptoBot payment."""
+        """Activate a paid CryptoBot payment.
+
+        ``pending`` is the pre-existing pending DB row (matched on
+        payload) — its row is updated in place so the same charge yields
+        exactly one DB record.
+        """
         now = datetime.now(timezone.utc)
 
         # Calculate expiry — extend if already premium
@@ -265,13 +326,18 @@ class CryptoBotPayment:
         # Activate subscription
         self._db.set_role(user_id, "premium", expires_at)
 
-        # Update or create payment record
-        existing = self._db.get_payment_by_payload(payload)
-        if existing:
+        # Update the pre-existing pending row in place (preferred) so we
+        # keep a 1:1 mapping between create_invoice() and activation.
+        row = pending or self._db.get_payment_by_payload(payload)
+        if row:
+            self._db.set_payment_invoice_id(int(row["id"]), invoice_id)
             self._db.update_payment_status(
-                existing["id"], "paid", now.isoformat(),
+                int(row["id"]), "paid", now.isoformat(),
             )
         else:
+            # Defensive fallback — should not happen given poll_payments
+            # checks; kept so callers invoking _activate_payment directly
+            # (e.g. ad-hoc admin tooling) still get a record.
             pid = self._db.create_payment(
                 user_id=user_id,
                 method="usdt",
