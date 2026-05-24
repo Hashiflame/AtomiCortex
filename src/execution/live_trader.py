@@ -55,8 +55,19 @@ class LiveTraderConfig:
     dry_run: bool = False
     log_level: str = "INFO"
 
-    # Strategy overrides (forwarded to MLStrategyConfig)
-    confidence_threshold: float = 0.65
+    # Strategy overrides (forwarded to MLStrategyConfig).
+    #
+    # H12: confidence_threshold defaults to ``None`` so that build_node()
+    # pulls the value from ``Settings.confidence_threshold`` (.env-driven).
+    # Pre-H12 the dataclass default 0.65 happened to match the Settings
+    # default by coincidence, so changing CONFIDENCE_THRESHOLD in .env
+    # silently had no effect. Explicit values (``LiveTraderConfig(
+    # confidence_threshold=0.7)``) still win — they short-circuit the
+    # Settings lookup.
+    #
+    # NOTE: the 15m path is wired via ``strategy_factory`` and bypasses
+    # this field entirely; per-TF factories must read Settings directly.
+    confidence_threshold: float | None = None
     risk_per_trade: float = 0.01
     max_leverage: int = 10
     max_open_positions: int = 3
@@ -200,10 +211,19 @@ class LiveTrader:
                 # Default 4H path — unchanged (running bot unaffected).
                 instrument_id = f"{symbol}.BINANCE"
                 bar_type = f"{instrument_id}-4-HOUR-LAST-EXTERNAL"
+                # H12: when LiveTraderConfig didn't pin an explicit
+                # confidence_threshold, fall through to the Settings
+                # value so CONFIDENCE_THRESHOLD in .env actually flows
+                # into the strategy / risk engine.
+                conf_threshold = (
+                    cfg.confidence_threshold
+                    if cfg.confidence_threshold is not None
+                    else settings.confidence_threshold
+                )
                 strat_config = MLStrategyConfig(
                     instrument_id=instrument_id,
                     bar_type=bar_type,
-                    confidence_threshold=cfg.confidence_threshold,
+                    confidence_threshold=conf_threshold,
                     models_dir=cfg.models_dir,
                     features_dir=cfg.features_dir,
                     risk_per_trade=cfg.risk_per_trade,
