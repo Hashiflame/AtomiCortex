@@ -18,17 +18,25 @@ _log = get_logger(__name__)
 
 
 def add_cvd_features(df: pl.DataFrame) -> pl.DataFrame:
-    """Cumulative Volume Delta and derived slope / ratio features.
+    """Volume Delta and derived rolling / slope / ratio features.
 
     Required columns: taker_buy_volume, volume
-    Added columns: cvd, cvd_cum, cvd_slope_3, cvd_slope_6, cvd_slope_12,
-                   taker_buy_ratio
+    Added columns: cvd, cvd_rolling_24, cvd_rolling_96, cvd_slope_3,
+                   cvd_slope_6, cvd_slope_12, taker_buy_ratio
+
+    cvd_rolling_N replaces the previous non-stationary cvd_cum (full-history
+    cumulative sum). Rolling windows are bounded and epoch-independent, so
+    LightGBM splits learned on them transfer to live where the buffer starts
+    fresh on each bot restart.
     """
     df = df.with_columns(
         (2.0 * pl.col("taker_buy_volume") - pl.col("volume")).alias("cvd")
     )
     df = df.with_columns([
-        pl.col("cvd").cum_sum().alias("cvd_cum"),
+        pl.col("cvd").rolling_sum(window_size=24, min_periods=1)
+        .fill_null(0.0).fill_nan(0.0).alias("cvd_rolling_24"),
+        pl.col("cvd").rolling_sum(window_size=96, min_periods=1)
+        .fill_null(0.0).fill_nan(0.0).alias("cvd_rolling_96"),
         ((pl.col("cvd") - pl.col("cvd").shift(3)) / 3.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_3"),
         ((pl.col("cvd") - pl.col("cvd").shift(6)) / 6.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_6"),
         ((pl.col("cvd") - pl.col("cvd").shift(12)) / 12.0).fill_null(0.0).fill_nan(0.0).alias("cvd_slope_12"),

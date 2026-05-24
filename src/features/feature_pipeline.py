@@ -45,7 +45,8 @@ _WARMUP_ROWS = 200
 FEATURE_GROUPS: dict[str, list[str]] = {
     "microstructure": [
         "cvd",
-        "cvd_cum",
+        "cvd_rolling_24",
+        "cvd_rolling_96",
         "cvd_slope_3",
         "cvd_slope_6",
         "cvd_slope_12",

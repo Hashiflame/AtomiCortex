@@ -16,8 +16,13 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import polars as pl
+
+from src.logger import get_logger
+
+_log = get_logger(__name__)
 
 
 # Interval → duration in ms (for close_time → open_time conversion)
@@ -69,6 +74,12 @@ class LiveFeatureState:
     # Timestamps (unix ms)
     last_funding_update: int = 0
     last_oi_update: int = 0
+
+    # One-shot WARNING flag: emitted the first time get_bar_df() falls back
+    # to volume*0.5 because add_bar() was called without taker_buy_volume.
+    # In live this means CVD ≡ 0 — a real train/serve skew. The flag keeps
+    # the log from being spammed every inference tick.
+    _tbv_fallback_warned: bool = False
 
     # ---------------------------------------------------------------
     # Updates
@@ -226,7 +237,12 @@ class LiveFeatureState:
     # Bar management
     # ---------------------------------------------------------------
 
-    def add_bar(self, bar, interval: str) -> None:
+    def add_bar(
+        self,
+        bar,
+        interval: str,
+        taker_buy_volume: float | None = None,
+    ) -> None:
         """Add a closed bar to the appropriate buffer.
 
         Timestamp handling
@@ -242,6 +258,11 @@ class LiveFeatureState:
             ``open``, ``high``, ``low``, ``close``, ``volume`` attrs).
         interval:
             One of ``"4h"``, ``"1h"``, ``"15m"``.
+        taker_buy_volume:
+            Real taker-buy base-asset volume for the bar (matches Binance
+            ``taker_buy_base_asset_volume`` used in training). When ``None``,
+            ``get_bar_df()`` will fall back to ``volume*0.5`` so CVD ≡ 0
+            (the historical live behavior) — and emit a one-shot WARNING.
         """
         bar_duration_ms = _INTERVAL_MS.get(interval, 4 * 3_600_000)
         close_time_ms = bar.ts_event // 1_000_000   # ns → ms
@@ -254,6 +275,9 @@ class LiveFeatureState:
             "low": float(bar.low),
             "close": float(bar.close),
             "volume": float(bar.volume),
+            "taker_buy_volume": (
+                float(taker_buy_volume) if taker_buy_volume is not None else None
+            ),
         }
         if interval == "4h":
             self.bar_buffer_4h.append(record)
@@ -266,7 +290,12 @@ class LiveFeatureState:
         """Get bar buffer as DataFrame sorted by time.
 
         Returns columns: ``open_time``, ``open``, ``high``, ``low``,
-        ``close``, ``volume``.
+        ``close``, ``volume``, ``taker_buy_volume``.
+
+        ``taker_buy_volume`` is filled with ``volume * 0.5`` for any record
+        added without a real value — matches the historical fallback in
+        ``FeaturePipeline._ensure_taker_buy_volume``. A WARNING is emitted
+        once per state instance when this fallback triggers.
         """
         if interval == "4h":
             buf = self.bar_buffer_4h
@@ -277,4 +306,75 @@ class LiveFeatureState:
 
         if not buf:
             return pl.DataFrame()
-        return pl.DataFrame(list(buf)).sort("open_time")
+
+        records = [dict(r) for r in buf]
+        missing_tbv = sum(1 for r in records if r.get("taker_buy_volume") is None)
+        if missing_tbv:
+            if not self._tbv_fallback_warned:
+                _log.warning(
+                    "live_feature_state[%s]: %d/%d bars missing real "
+                    "taker_buy_volume — falling back to volume*0.5. "
+                    "CVD will be ≡ 0 until add_bar() is called with a "
+                    "real taker_buy_volume (e.g. from Binance klines "
+                    "taker_buy_base_asset_volume). Train/serve skew.",
+                    interval, missing_tbv, len(records),
+                )
+                self._tbv_fallback_warned = True
+            for r in records:
+                if r.get("taker_buy_volume") is None:
+                    r["taker_buy_volume"] = r["volume"] * 0.5
+
+        return pl.DataFrame(records).sort("open_time")
+
+    # ---------------------------------------------------------------
+    # REST helper — fetch real taker_buy_volume from Binance klines.
+    # Strategy may call this on bar-close and pass the result into
+    # add_bar(taker_buy_volume=...). Kept here (not in the strategy)
+    # so live and tests share one source of truth.
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def fetch_taker_buy_volume(
+        symbol: str,
+        interval: str,
+        open_time_ms: int,
+        *,
+        base_url: str = "https://fapi.binance.com",
+        timeout: float = 5.0,
+        session: Any | None = None,
+    ) -> float | None:
+        """Fetch ``taker_buy_base_asset_volume`` for one closed kline.
+
+        Returns ``None`` on any failure (network, parse, empty response,
+        timestamp mismatch). Caller decides whether to retry or fall back.
+
+        ``session`` is an optional object exposing ``get(url, params, timeout)``
+        — used by tests to inject a mock; defaults to ``requests``.
+        """
+        try:
+            if session is None:
+                import requests as session  # type: ignore[no-redef]
+            resp = session.get(
+                f"{base_url}/fapi/v1/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": int(open_time_ms),
+                    "limit": 1,
+                },
+                timeout=timeout,
+            )
+            if getattr(resp, "status_code", 200) != 200:
+                return None
+            data = resp.json()
+            if not data:
+                return None
+            row = data[0]
+            # Binance kline schema: [open_time, o, h, l, c, vol, close_time,
+            # quote_vol, n_trades, taker_buy_base_vol, taker_buy_quote_vol, _]
+            if int(row[0]) != int(open_time_ms):
+                return None
+            return float(row[9])
+        except Exception as exc:
+            _log.debug("fetch_taker_buy_volume failed (non-critical): %s", exc)
+            return None

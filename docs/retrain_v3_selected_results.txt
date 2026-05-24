@@ -1,0 +1,403 @@
+[32m12:00:18[0m | [1mINFO    [0m | [36m__main__[0m:[36m381[0m | Loaded whitelist (22): ['adx', 'regime_confidence', 'trend_strength', 'oi_zscore', 'body_ratio', 'funding_zscore_30d', 'basis_approx', 'oi_quadrant', 'volume_zscore', 'oi_delta_12h', 'atr_pct', 'hurst', 'funding_zscore_7d', 'returns_6', 'price_to_vwap', 'taker_vol_ratio', 'taker_buy_ratio', 'cvd', 'cvd_slope_12', 'volume_ratio', 'upper_wick', 'vwap_4h']
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1385 (33.2%) | short=1308 (31.3%) | vertical=1482 (35.5%) | coverage=64.5%
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2693/4175 rows | UP=1385 (51.4%), DOWN=1308 (48.6%)
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 930 rows → train=744, test=186
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1323 (31.7%) | short=1296 (31.0%) | vertical=1556 (37.3%) | coverage=62.7%
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2619/4175 rows | UP=1323 (50.5%), DOWN=1296 (49.5%)
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 877 rows → train=701, test=176
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1419 (34.0%) | short=1421 (34.0%) | vertical=1335 (32.0%) | coverage=68.0%
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2840/4175 rows | UP=1419 (50.0%), DOWN=1421 (50.0%)
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 1014 rows → train=811, test=203
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=2256, test=565 (20% test)
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.995, range=[0.447, 3.055]
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=1010, UP(1)=901 → weight range [0.42, 3.24]
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:18[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=1911, val=339, features=45
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: bdf1d8f8b15f4f3bba9f0aa21649c1f4
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=56.99%, WR=53.24%, PF=1.1501, sig=38.2%, passes=False
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1361 (32.6%) | short=1539 (36.9%) | vertical=1275 (30.5%) | coverage=69.5%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2900/4175 rows | UP=1361 (46.9%), DOWN=1539 (53.1%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 1005 rows → train=804, test=201
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1303 (31.2%) | short=1528 (36.6%) | vertical=1344 (32.2%) | coverage=67.8%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2831/4175 rows | UP=1303 (46.0%), DOWN=1528 (54.0%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 935 rows → train=748, test=187
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1387 (33.2%) | short=1702 (40.8%) | vertical=1086 (26.0%) | coverage=74.0%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 3089/4175 rows | UP=1387 (44.9%), DOWN=1702 (55.1%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 1109 rows → train=887, test=222
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=2439, test=610 (20% test)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.992, range=[0.445, 2.996]
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=1179, UP(1)=888 → weight range [0.39, 3.49]
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=2067, val=366, features=45
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 1bc3bea4fdb84964b815d75140462b2f
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=54.43%, WR=59.01%, PF=1.3786, sig=62.8%, passes=True
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1143 (27.4%) | short=1330 (31.9%) | vertical=1702 (40.8%) | coverage=59.2%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2473/4175 rows | UP=1143 (46.2%), DOWN=1330 (53.8%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 858 rows → train=686, test=172
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1067 (25.6%) | short=1319 (31.6%) | vertical=1789 (42.9%) | coverage=57.1%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2386/4175 rows | UP=1067 (44.7%), DOWN=1319 (55.3%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 791 rows → train=632, test=159
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1164 (27.9%) | short=1443 (34.6%) | vertical=1568 (37.6%) | coverage=62.4%
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2607/4175 rows | UP=1164 (44.6%), DOWN=1443 (55.4%)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 934 rows → train=747, test=187
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=2065, test=518 (20% test)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.994, range=[0.431, 3.042]
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=1030, UP(1)=719 → weight range [0.38, 3.70]
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:21[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=1749, val=310, features=45
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: c4b53988c66f49a88f809e3c50efc8ae
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=50.97%, WR=55.94%, PF=1.3779, sig=50.4%, passes=True
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=834 (20.0%) | short=1029 (24.6%) | vertical=2314 (55.4%) | coverage=44.6%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1863/4177 rows | UP=834 (44.8%), DOWN=1029 (55.2%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 648 rows → train=518, test=130
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=764 (18.3%) | short=1010 (24.2%) | vertical=2403 (57.5%) | coverage=42.5%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1774/4177 rows | UP=764 (43.1%), DOWN=1010 (56.9%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 582 rows → train=465, test=117
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=818 (19.6%) | short=1077 (25.8%) | vertical=2282 (54.6%) | coverage=45.4%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1895/4177 rows | UP=818 (43.2%), DOWN=1077 (56.8%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 707 rows → train=565, test=142
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1548, test=389 (20% test)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=4): fit mean=0.998, range=[0.459, 2.373]
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=791, UP(1)=520 → weight range [0.38, 2.99]
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=1311, val=233, features=45
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 1eace47fbfa14f1e8a7cef9e07c809f4
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=53.98%, WR=52.48%, PF=1.1389, sig=26.0%, passes=False
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1071 (25.6%) | short=1022 (24.5%) | vertical=2084 (49.9%) | coverage=50.1%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2093/4177 rows | UP=1071 (51.2%), DOWN=1022 (48.8%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 726 rows → train=580, test=146
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1012 (24.2%) | short=1001 (24.0%) | vertical=2164 (51.8%) | coverage=48.2%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2013/4177 rows | UP=1012 (50.3%), DOWN=1001 (49.7%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 659 rows → train=527, test=132
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1071 (25.6%) | short=1068 (25.6%) | vertical=2038 (48.8%) | coverage=51.2%
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2139/4177 rows | UP=1071 (50.1%), DOWN=1068 (49.9%)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 781 rows → train=624, test=157
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1731, test=435 (20% test)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=4): fit mean=0.998, range=[0.466, 2.376]
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=778, UP(1)=689 → weight range [0.44, 2.53]
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:22[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=1467, val=260, features=45
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: cead4030d057482c806e210bb8fa9bc9
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=55.86%, WR=51.38%, PF=1.1464, sig=41.6%, passes=False
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1114 (26.7%) | short=1585 (38.0%) | vertical=1474 (35.3%) | coverage=64.7%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2699/4173 rows | UP=1114 (41.3%), DOWN=1585 (58.7%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 941 rows → train=752, test=189
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1064 (25.5%) | short=1537 (36.8%) | vertical=1572 (37.7%) | coverage=62.3%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2601/4173 rows | UP=1064 (40.9%), DOWN=1537 (59.1%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 876 rows → train=700, test=176
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1125 (27.0%) | short=1705 (40.9%) | vertical=1343 (32.2%) | coverage=67.8%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2830/4173 rows | UP=1125 (39.8%), DOWN=1705 (60.2%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 1014 rows → train=811, test=203
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=2263, test=568 (20% test)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=8): fit mean=0.987, range=[0.392, 3.542]
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=1219, UP(1)=696 → weight range [0.31, 4.87]
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=1915, val=340, features=45
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: cf4e28baacaf472d8405ca897b75a6b1
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/trend_model_v3.pkl (45 features)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=56.51%, WR=57.43%, PF=1.152, sig=52.1%, passes=False
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.statistical_tests[0m:[36m125[0m | DSR: best_sr=1.2421, E[SR_max]=1.0705, std_sr=0.4172, se_sr=0.4472, z=0.3838, DSR=0.6494
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1361 (32.6%) | short=1539 (36.9%) | vertical=1275 (30.5%) | coverage=69.5%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2900/4175 rows | UP=1361 (46.9%), DOWN=1539 (53.1%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 1005 rows → train=804, test=201
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1303 (31.2%) | short=1528 (36.6%) | vertical=1344 (32.2%) | coverage=67.8%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2831/4175 rows | UP=1303 (46.0%), DOWN=1528 (54.0%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 935 rows → train=748, test=187
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1387 (33.2%) | short=1702 (40.8%) | vertical=1086 (26.0%) | coverage=74.0%
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 3089/4175 rows | UP=1387 (44.9%), DOWN=1702 (55.1%)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 1109 rows → train=887, test=222
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=2439, test=610 (20% test)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.992, range=[0.445, 2.996]
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=1179, UP(1)=888 → weight range [0.39, 3.49]
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:23[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=trend, train=2067, val=366, features=45
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: bae9f885eeef44e2864a24df52d65af2
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/trend_model_v3.pkl (45 features)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [trend]: acc=54.43%, WR=59.01%, PF=1.3786, sig=62.8%, passes=True
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1385 (33.2%) | short=1308 (31.3%) | vertical=1482 (35.5%) | coverage=64.5%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2693/4175 rows | UP=1385 (51.4%), DOWN=1308 (48.6%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 585 rows → train=468, test=117
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1323 (31.7%) | short=1296 (31.0%) | vertical=1556 (37.3%) | coverage=62.7%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2619/4175 rows | UP=1323 (50.5%), DOWN=1296 (49.5%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 557 rows → train=445, test=112
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1419 (34.0%) | short=1421 (34.0%) | vertical=1335 (32.0%) | coverage=68.0%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=6): kept 2840/4175 rows | UP=1419 (50.0%), DOWN=1421 (50.0%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 588 rows → train=470, test=118
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1383, test=347 (20% test)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.991, range=[0.431, 2.910]
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=495, UP(1)=674 → weight range [0.37, 3.44]
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=1169, val=208, features=45
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 7179974e26be435abae4afadfcb9fcbc
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=51.59%, WR=49.38%, PF=0.9235, sig=46.7%, passes=False
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1361 (32.6%) | short=1539 (36.9%) | vertical=1275 (30.5%) | coverage=69.5%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2900/4175 rows | UP=1361 (46.9%), DOWN=1539 (53.1%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 647 rows → train=517, test=130
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1303 (31.2%) | short=1528 (36.6%) | vertical=1344 (32.2%) | coverage=67.8%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 2831/4175 rows | UP=1303 (46.0%), DOWN=1528 (54.0%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 623 rows → train=498, test=125
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1387 (33.2%) | short=1702 (40.8%) | vertical=1086 (26.0%) | coverage=74.0%
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=0.8, h=6): kept 3089/4175 rows | UP=1387 (44.9%), DOWN=1702 (55.1%)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 643 rows → train=514, test=129
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1529, test=384 (20% test)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.992, range=[0.444, 2.963]
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=633, UP(1)=660 → weight range [0.43, 3.03]
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:24[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=1293, val=230, features=45
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: e88b6ccce86044bfacfc437598e3e4c0
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=52.08%, WR=52.94%, PF=1.1175, sig=70.8%, passes=False
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1143 (27.4%) | short=1330 (31.9%) | vertical=1702 (40.8%) | coverage=59.2%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2473/4175 rows | UP=1143 (46.2%), DOWN=1330 (53.8%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 527 rows → train=421, test=106
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1067 (25.6%) | short=1319 (31.6%) | vertical=1789 (42.9%) | coverage=57.1%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2386/4175 rows | UP=1067 (44.7%), DOWN=1319 (55.3%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 503 rows → train=402, test=101
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,175 rows | long=1164 (27.9%) | short=1443 (34.6%) | vertical=1568 (37.6%) | coverage=62.4%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=6): kept 2607/4175 rows | UP=1164 (44.6%), DOWN=1443 (55.4%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 518 rows → train=414, test=104
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1237, test=311 (20% test)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=6): fit mean=0.985, range=[0.419, 2.859]
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=491, UP(1)=554 → weight range [0.40, 3.04]
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=1045, val=186, features=45
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 5c779603b0be482099886ed823c6af7b
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=50.16%, WR=51.03%, PF=0.9336, sig=46.6%, passes=False
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=834 (20.0%) | short=1029 (24.6%) | vertical=2314 (55.4%) | coverage=44.6%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1863/4177 rows | UP=834 (44.8%), DOWN=1029 (55.2%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 381 rows → train=304, test=77
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=764 (18.3%) | short=1010 (24.2%) | vertical=2403 (57.5%) | coverage=42.5%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1774/4177 rows | UP=764 (43.1%), DOWN=1010 (56.9%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 361 rows → train=288, test=73
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=818 (19.6%) | short=1077 (25.8%) | vertical=2282 (54.6%) | coverage=45.4%
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.25, sl=1.0, h=4): kept 1895/4177 rows | UP=818 (43.2%), DOWN=1077 (56.8%)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 350 rows → train=280, test=70
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=872, test=220 (20% test)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=4): fit mean=1.000, range=[0.457, 2.245]
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=361, UP(1)=376 → weight range [0.45, 2.29]
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:25[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=737, val=131, features=45
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 96928187c9b14db19e0936653fa20823
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=50.0%, WR=51.01%, PF=0.9454, sig=67.7%, passes=False
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1071 (25.6%) | short=1022 (24.5%) | vertical=2084 (49.9%) | coverage=50.1%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2093/4177 rows | UP=1071 (51.2%), DOWN=1022 (48.8%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 447 rows → train=357, test=90
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1012 (24.2%) | short=1001 (24.0%) | vertical=2164 (51.8%) | coverage=48.2%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2013/4177 rows | UP=1012 (50.3%), DOWN=1001 (49.7%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 422 rows → train=337, test=85
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,177 rows | long=1071 (25.6%) | short=1068 (25.6%) | vertical=2038 (48.8%) | coverage=51.2%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.0, sl=1.0, h=4): kept 2139/4177 rows | UP=1071 (50.1%), DOWN=1068 (49.9%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 425 rows → train=340, test=85
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1034, test=260 (20% test)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=4): fit mean=0.999, range=[0.488, 2.283]
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=360, UP(1)=514 → weight range [0.41, 2.77]
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=874, val=156, features=45
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: 48bf50d1f05446a5a1cdc58130d2a0e2
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=49.23%, WR=50.0%, PF=0.9043, sig=75.4%, passes=False
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1114 (26.7%) | short=1585 (38.0%) | vertical=1474 (35.3%) | coverage=64.7%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2699/4173 rows | UP=1114 (41.3%), DOWN=1585 (58.7%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 556 rows → train=444, test=112
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1064 (25.5%) | short=1537 (36.8%) | vertical=1572 (37.7%) | coverage=62.3%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2601/4173 rows | UP=1064 (40.9%), DOWN=1537 (59.1%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 539 rows → train=431, test=108
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1125 (27.0%) | short=1705 (40.9%) | vertical=1343 (32.2%) | coverage=67.8%
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2830/4173 rows | UP=1125 (39.8%), DOWN=1705 (60.2%)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 557 rows → train=445, test=112
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1320, test=332 (20% test)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=8): fit mean=0.984, range=[0.370, 3.246]
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=583, UP(1)=531 → weight range [0.35, 3.29]
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:26[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=1114, val=198, features=45
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: a4f6f623498e4912ad52a3a57f5e781d
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/_grid/high_vol_model_v3.pkl (45 features)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=56.93%, WR=54.84%, PF=0.9457, sig=46.7%, passes=False
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.statistical_tests[0m:[36m125[0m | DSR: best_sr=0.4577, E[SR_max]=1.0705, std_sr=0.1989, se_sr=0.4472, z=-1.3701, DSR=0.0853
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded BTCUSDT: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1114 (26.7%) | short=1585 (38.0%) | vertical=1474 (35.3%) | coverage=64.7%
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2699/4173 rows | UP=1114 (41.3%), DOWN=1585 (58.7%)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   BTCUSDT: 556 rows → train=444, test=112
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded ETHUSDT: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1064 (25.5%) | short=1537 (36.8%) | vertical=1572 (37.7%) | coverage=62.3%
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2601/4173 rows | UP=1064 (40.9%), DOWN=1537 (59.1%)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   ETHUSDT: 539 rows → train=431, test=108
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m157[0m | Loaded SOLUSDT: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m165[0m | Combined dataset: 4181 rows, 63 cols
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.features.triple_barrier[0m:[36m169[0m | Triple-barrier: 4,173 rows | long=1125 (27.0%) | short=1705 (40.9%) | vertical=1343 (32.2%) | coverage=67.8%
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.dataset_builder[0m:[36m281[0m | Triple-barrier target (pt=1.5, sl=1.0, h=8): kept 2830/4173 rows | UP=1125 (39.8%), DOWN=1705 (60.2%)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m275[0m |   SOLUSDT: 557 rows → train=445, test=112
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m286[0m | Walk-forward split (per-symbol): train=1320, test=332 (20% test)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m316[0m | Feature columns (45): ['adx', 'atr_pct', 'atr_percentile', 'basis_approx', 'basis_extreme']...
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m365[0m | Uniqueness weights applied (h=8): fit mean=0.984, range=[0.370, 3.246]
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m371[0m | Class balance — train: DOWN(0)=583, UP(1)=531 → weight range [0.35, 3.29]
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m403[0m | Using MTF_LGBM_PARAMS (stricter regularization profile, min_child_samples=30, val_frac=15%, early_stop=100)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m414[0m | Training LightGBM: regime=high_vol, train=1114, val=198, features=45
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m702[0m | MLflow run logged: d89b0b173a094ba28b79132c864b58c8
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m447[0m | Model saved: data/features/models/v3/high_vol_model_v3.pkl (45 features)
+[32m12:00:27[0m | [1mINFO    [0m | [36msrc.models.lgbm_trainer[0m:[36m514[0m | Eval [high_vol]: acc=56.93%, WR=54.84%, PF=0.9457, sig=46.7%, passes=False
+
+==============================================================================
+  GRID — regime=trend
+==============================================================================
+
+--- trend | pt1.0_sl1.0_h6 ---
+  ✓ WR=53.24% PF=1.150 sig=38.2% acc=56.99% proxy=0.373
+
+--- trend | pt1.0_sl0.8_h6 ---
+  ✓ WR=59.01% PF=1.379 sig=62.8% acc=54.43% proxy=1.242
+
+--- trend | pt1.25_sl1.0_h6 ---
+  ✓ WR=55.94% PF=1.378 sig=50.4% acc=50.97% proxy=0.818
+
+--- trend | pt1.25_sl1.0_h4 ---
+  ✓ WR=52.48% PF=1.139 sig=26.0% acc=53.98% proxy=0.282
+
+--- trend | pt1.0_sl1.0_h4 ---
+  ✓ WR=51.38% PF=1.146 sig=41.6% acc=55.86% proxy=0.158
+
+--- trend | pt1.5_sl1.0_h8 ---
+  ✓ WR=57.43% PF=1.152 sig=52.1% acc=56.51% proxy=0.856
+
+  ► BEST trend: pt1.0_sl0.8_h6 | proxy=1.242 | DSR=0.649 (n_trials=6)
+  ► Refit + save → data/features/models/v3/trend_model_v3.pkl
+
+==============================================================================
+  GRID — regime=high_vol
+==============================================================================
+
+--- high_vol | pt1.0_sl1.0_h6 ---
+  ✓ WR=49.38% PF=0.923 sig=46.7% acc=51.59% proxy=-0.057
+
+--- high_vol | pt1.0_sl0.8_h6 ---
+  ✓ WR=52.94% PF=1.117 sig=70.8% acc=52.08% proxy=0.329
+
+--- high_vol | pt1.25_sl1.0_h6 ---
+  ✓ WR=51.03% PF=0.934 sig=46.6% acc=50.16% proxy=0.096
+
+--- high_vol | pt1.25_sl1.0_h4 ---
+  ✓ WR=51.01% PF=0.945 sig=67.7% acc=50.00% proxy=0.095
+
+--- high_vol | pt1.0_sl1.0_h4 ---
+  ✓ WR=50.00% PF=0.904 sig=75.4% acc=49.23% proxy=0.000
+
+--- high_vol | pt1.5_sl1.0_h8 ---
+  ✓ WR=54.84% PF=0.946 sig=46.7% acc=56.93% proxy=0.458
+
+  ► BEST high_vol: pt1.5_sl1.0_h8 | proxy=0.458 | DSR=0.085 (n_trials=6)
+  ► Refit + save → data/features/models/v3/high_vol_model_v3.pkl
+
+==============================================================================
+  v3 RETRAIN SUMMARY
+==============================================================================
+
+[trend] cell={'pt': 1.0, 'sl': 0.8, 'hold': 6}  (DSR=0.649, n_valid=6)
+  WR=59.01%  PF=1.3786  sig=62.8%  acc=54.43%  avg_conf=0.6167
+
+[high_vol] cell={'pt': 1.5, 'sl': 1.0, 'hold': 8}  (DSR=0.085, n_valid=6)
+  WR=54.84%  PF=0.9457  sig=46.7%  acc=56.93%  avg_conf=0.5803
+
+  Models saved to: data/features/models/v3
+==============================================================================
+
