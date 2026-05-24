@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Generator
 
@@ -146,11 +146,17 @@ class WalkForwardValidator:
         train_months: int = 18,
         test_months: int = 6,
         step_months: int | None = None,
+        embargo: timedelta = timedelta(0),
     ) -> None:
         self.train_months = train_months
         self.test_months = test_months
         # Default: step equals test window so windows don't overlap
         self.step_months = step_months if step_months is not None else test_months
+        # AFML Ch.7 embargo: gap between train_end and test_start to prevent
+        # triple-barrier labels from peeking into the test window. Express
+        # as a duration (caller computes max_holding_bars × bar_duration).
+        # Default timedelta(0) preserves the legacy zero-gap behaviour.
+        self.embargo = embargo
 
     def split(
         self,
@@ -164,7 +170,11 @@ class WalkForwardValidator:
         while True:
             train_start = cursor
             train_end = _add_months(cursor, self.train_months)
-            test_start = train_end
+            # Embargo shifts the test window forward so triple-barrier
+            # labels generated in the last bars of train cannot reach
+            # into the test window. With embargo=timedelta(0) this is
+            # a no-op (legacy behaviour).
+            test_start = train_end + self.embargo
             test_end = _add_months(test_start, self.test_months)
 
             if test_end > end:
