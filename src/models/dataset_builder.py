@@ -46,6 +46,8 @@ _EXCLUDE_COLUMNS: set[str] = {
     "future_return",
     "target",
     "label",  # triple-barrier intermediate (renamed → target)
+    "t1_bar",   # AFML Ch.4 exit-bar index (used for uniqueness weights)
+    "_bar_idx", # original per-symbol bar position (used for uniqueness weights)
     # Raw derivatives that are replaced by engineered features
     "quote_volume",
     "trade_count",
@@ -255,6 +257,14 @@ class DatasetBuilder:
             max_holding_bars=max_holding,
         )
 
+        # Stamp each row with its per-symbol bar index BEFORE filtering, so
+        # ``t1_bar`` (also a per-symbol bar index) remains comparable after
+        # timeout rows are dropped. Sample-uniqueness concurrency is
+        # computed in this original bar-index coordinate system.
+        labeled = labeled.with_columns(
+            pl.Series("_bar_idx", np.arange(len(labeled), dtype=np.int64))
+        )
+
         # Rename label → target; keep future_return as-is (already emitted).
         labeled = labeled.rename({"label": "target"}).with_columns(
             pl.col("target").cast(pl.Int64)
@@ -283,30 +293,45 @@ class DatasetBuilder:
     def compute_uniqueness_weights(
         n_samples: int,
         max_holding: int,
+        t1_bars: np.ndarray | None = None,
+        bar_idxs: np.ndarray | None = None,
     ) -> np.ndarray:
         """Sample uniqueness weights for overlapping triple-barrier labels.
 
-        Each label i is "alive" over bars [i, i + max_holding - 1].
+        Two regimes, switched by whether ``t1_bars`` is supplied:
+
+        * **Real exit-bar mode (preferred — AFML Ch.4)**: pass ``t1_bars``
+          from ``apply_triple_barrier`` so each label's span is its
+          ACTUAL exit bar (PT/SL early exits cut the span short). This
+          gives correct concurrency; the legacy mode systematically
+          over-counts concurrent labels for early-exit trades.
+        * **Legacy fixed-span fallback**: when ``t1_bars`` is None each
+          label is assumed to hold the full ``max_holding`` window
+          ``[i, i + max_holding - 1]``. Kept for backward compat.
+
         For each bar t, c_t = number of active labels at t. The
         uniqueness of label i is::
 
-            u_i = mean( 1 / c_t  for t in [i, i + max_holding - 1] )
+            u_i = mean( 1 / c_t  for t in [bar_idx_i, t1_bar_i] )
 
-        Weights are normalized so they sum to n_samples (mean weight = 1)
-        — this preserves LightGBM's effective sample count and keeps the
-        balanced-class weight multiplier interpretable.
-
-        Pure NumPy, no mlfinlab dependency. Assumes labels are ordered by
-        time within each symbol; for multi-symbol concatenations call this
-        per-symbol and stitch.
+        Weights are normalized so the mean weight = 1 — this preserves
+        LightGBM's effective sample count and keeps the balanced-class
+        weight multiplier interpretable.
 
         Parameters
         ----------
         n_samples:
             Number of labels in the (per-symbol) DataFrame.
         max_holding:
-            Vertical-barrier horizon in bars; same value passed to
-            ``apply_triple_barrier``.
+            Vertical-barrier horizon in bars; used by the legacy fallback.
+        t1_bars:
+            Per-label exit-bar indices (in input-df coordinates). Same
+            length as ``bar_idxs`` and corresponds to the surviving labels.
+        bar_idxs:
+            Per-label entry-bar indices (in input-df coordinates). When
+            ``t1_bars`` is given but ``bar_idxs`` is None, defaults to
+            ``arange(n_samples)`` (no rows dropped between labeling and
+            here).
 
         Returns
         -------
@@ -317,22 +342,50 @@ class DatasetBuilder:
         if max_holding < 1:
             raise ValueError("max_holding must be >= 1")
 
-        h = max_holding
-        # Each label i spans bars [i, i + h - 1] in label-index space.
-        # Concurrency at bar t: c_t = #{i : max(0,t-h+1) <= i <= min(t,N-1)}.
-        # For t in [0, N-1] this simplifies to min(t+1, h) — capped at h
-        # once enough history accumulates; no tail decrease (labels at
-        # the very end are still "alive" relative to each other).
-        t = np.arange(n_samples, dtype=np.float64)
-        concur = np.minimum(t + 1.0, float(h))
-        concur = np.maximum(concur, 1.0)
-        inv_c = 1.0 / concur
+        if t1_bars is None:
+            # ---- Legacy fixed-span mode ---------------------------------
+            h = max_holding
+            t = np.arange(n_samples, dtype=np.float64)
+            concur = np.minimum(t + 1.0, float(h))
+            concur = np.maximum(concur, 1.0)
+            inv_c = 1.0 / concur
 
-        # u_i = mean of inv_c over [i, min(i+h, n)-1] via cumulative sum.
-        cum = np.concatenate(([0.0], np.cumsum(inv_c)))
-        end = np.minimum(np.arange(n_samples) + h, n_samples)
-        span = end - np.arange(n_samples)
-        u = (cum[end] - cum[np.arange(n_samples)]) / span
+            cum = np.concatenate(([0.0], np.cumsum(inv_c)))
+            end = np.minimum(np.arange(n_samples) + h, n_samples)
+            span = end - np.arange(n_samples)
+            u = (cum[end] - cum[np.arange(n_samples)]) / span
+        else:
+            # ---- Real exit-bar mode -------------------------------------
+            t1 = np.asarray(t1_bars, dtype=np.int64)
+            if t1.shape[0] != n_samples:
+                raise ValueError(
+                    f"t1_bars length {t1.shape[0]} != n_samples {n_samples}"
+                )
+            if bar_idxs is None:
+                idx = np.arange(n_samples, dtype=np.int64)
+            else:
+                idx = np.asarray(bar_idxs, dtype=np.int64)
+                if idx.shape[0] != n_samples:
+                    raise ValueError(
+                        f"bar_idxs length {idx.shape[0]} != n_samples {n_samples}"
+                    )
+
+            # Work in original-bar coordinates. Difference-array trick:
+            # add +1 at the entry bar, -1 just past the exit bar, cumsum
+            # to get concurrency at every bar in [0, T_max].
+            t_max = int(t1.max()) + 1
+            diff = np.zeros(t_max + 1, dtype=np.int64)
+            np.add.at(diff, idx, 1)
+            np.add.at(diff, np.minimum(t1 + 1, t_max), -1)
+            concur = np.cumsum(diff)[:t_max].astype(np.float64)
+            concur = np.maximum(concur, 1.0)
+            inv_c = 1.0 / concur
+
+            # u_i = mean of inv_c over [idx[i], t1[i]] via cumulative sum.
+            cum = np.concatenate(([0.0], np.cumsum(inv_c)))
+            end = t1 + 1
+            span = np.maximum(end - idx, 1)
+            u = (cum[end] - cum[idx]) / span
 
         # Normalize: mean weight = 1 so balanced class weights still mean
         # what they say when multiplied in.
@@ -346,23 +399,47 @@ class DatasetBuilder:
         df: pl.DataFrame,
         max_holding: int,
         symbol_col: str = "symbol",
+        t1_col: str = "t1_bar",
+        bar_idx_col: str = "_bar_idx",
     ) -> np.ndarray:
         """Per-symbol uniqueness weights aligned with df row order.
 
         Concurrent labels only overlap within a single symbol's time
         series, so weights are computed per-symbol then concatenated in
-        the original row order.
+        the original row order. When ``t1_col`` and ``bar_idx_col`` are
+        both present (added by ``create_target_triple_barrier``), the
+        real exit-bar mode is used — labels that exit early via PT/SL
+        contribute less concurrency, fixing AFML Ch.4 under-counting.
+        Otherwise falls back to the legacy fixed-span mode.
         """
+        has_real_t1 = t1_col in df.columns and bar_idx_col in df.columns
+
         if symbol_col not in df.columns:
+            if has_real_t1:
+                return self.compute_uniqueness_weights(
+                    len(df), max_holding,
+                    t1_bars=df[t1_col].to_numpy(),
+                    bar_idxs=df[bar_idx_col].to_numpy(),
+                )
             return self.compute_uniqueness_weights(len(df), max_holding)
 
         weights = np.zeros(len(df), dtype=np.float64)
         idx = np.arange(len(df))
         symbols = df[symbol_col].to_numpy()
+        t1_all = df[t1_col].to_numpy() if has_real_t1 else None
+        bidx_all = df[bar_idx_col].to_numpy() if has_real_t1 else None
         for sym in np.unique(symbols):
             mask = symbols == sym
             n_sym = int(mask.sum())
-            weights[idx[mask]] = self.compute_uniqueness_weights(n_sym, max_holding)
+            if has_real_t1:
+                w = self.compute_uniqueness_weights(
+                    n_sym, max_holding,
+                    t1_bars=t1_all[mask],
+                    bar_idxs=bidx_all[mask],
+                )
+            else:
+                w = self.compute_uniqueness_weights(n_sym, max_holding)
+            weights[idx[mask]] = w
         return weights
 
     # ------------------------------------------------------------------

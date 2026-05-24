@@ -90,6 +90,10 @@ def apply_triple_barrier(
     n = len(close)
     label = np.full(n, np.nan, dtype=np.float64)
     fret = np.full(n, np.nan, dtype=np.float64)
+    # AFML Ch.4: each label needs its REAL exit bar t1_i for sample
+    # uniqueness weights. Default sentinel -1 marks the tail rows that
+    # never form a forward window (dropped below).
+    t1 = np.full(n, -1, dtype=np.int64)
 
     valid_n = n - max_holding_bars
     if valid_n <= 0:
@@ -97,6 +101,7 @@ def apply_triple_barrier(
         df = df.with_columns([
             pl.Series("label", label),
             pl.Series("future_return", fret),
+            pl.Series("t1_bar", t1),
         ])
         return df.head(0)
 
@@ -108,6 +113,9 @@ def apply_triple_barrier(
     hit = np.zeros(valid_n, dtype=bool)
     lab = np.zeros(valid_n, dtype=np.float64)
     fr = np.zeros(valid_n, dtype=np.float64)
+    # Per-label exit offset (1..max_holding_bars). Initialised to the
+    # vertical-barrier offset; overwritten if PT/SL triggers earlier.
+    exit_k = np.full(valid_n, max_holding_bars, dtype=np.int64)
 
     # Sweep the holding horizon k = 1 .. max_holding_bars. The first
     # bar that breaches a barrier wins (``~hit`` mask freezes earlier
@@ -130,20 +138,29 @@ def apply_triple_barrier(
         # variance. Strictly causal: only close[t+k], k ≤ holding.
         fr[up] = (fut[up] - entry[up]) / entry[up]
         fr[dn] = (fut[dn] - entry[dn]) / entry[dn]
-        hit |= up | dn
+        # Record the actual exit offset for newly-hit labels only.
+        new_hit = up | dn
+        exit_k[new_hit] = k
+        hit |= new_hit
 
     # Vertical barrier: realized return at close[t + max_holding_bars].
     not_hit = ~hit
     vert_close = close[max_holding_bars:max_holding_bars + valid_n]
     lab[not_hit] = 0.0
     fr[not_hit] = (vert_close[not_hit] - entry[not_hit]) / entry[not_hit]
+    # exit_k for not_hit already defaults to max_holding_bars.
 
     label[:valid_n] = lab
     fret[:valid_n] = fr
+    # t1_bar is the input-df bar INDEX where the label exits: entry
+    # index i + exit_offset k. PT/SL fires give k < max_holding;
+    # timeouts give k = max_holding (the vertical barrier).
+    t1[:valid_n] = np.arange(valid_n) + exit_k
 
     df = df.with_columns([
         pl.Series("label", label),
         pl.Series("future_return", fret),
+        pl.Series("t1_bar", t1),
     ])
     # Drop the trailing rows with an undefined forward window.
     df = df.head(valid_n)
