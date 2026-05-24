@@ -82,6 +82,27 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
 # Helper: bar → OHLCV dict
 # ---------------------------------------------------------------------------
 
+def _safe_float(v: Any) -> float:
+    """Convert a feature value to a float that LightGBM treats correctly.
+
+    Returns ``NaN`` for any value LightGBM cannot interpret as a real
+    measurement — ``None``, non-numeric, or ±inf. ``NaN`` is the only
+    "missing" signal the booster understands; ``0.0`` would be read as
+    a real measurement of zero and would erase the distinction between
+    "data unavailable" (e.g. a warm-up rolling feature) and "value is
+    actually zero" (e.g. funding rate genuinely at 0 %).
+    """
+    if v is None:
+        return float("nan")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(f):
+        return float("nan")
+    return f
+
+
 def _bar_to_dict(bar: Bar) -> dict[str, float]:
     """Extract OHLCV from a Nautilus Bar object."""
     return {
@@ -1154,12 +1175,16 @@ class MLTradingStrategy(Strategy):
             base = sym_str.split("-")[0] if "-" in sym_str else sym_str.split(".")[0]
             rd["symbol_encoded"] = float(sym_map.get(base, -1))
 
+            # Preserve NaN for genuinely-missing features; ±inf collapses
+            # to NaN inside _safe_float. LightGBM routes NaN to its
+            # optimal branch — keeps train/serve consistent with the
+            # nan-preserving fit path in lgbm_trainer (Phase 3 Step 3.3).
             vector = np.array(
-                [float(rd.get(f, 0.0) or 0.0) for f in feature_names],
+                [_safe_float(rd.get(f)) for f in feature_names],
                 dtype=np.float64,
             )
             self._consecutive_feature_failures = 0
-            return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+            return vector
 
         except Exception as exc:
             self._consecutive_feature_failures += 1
@@ -1313,12 +1338,14 @@ class MLTradingStrategy(Strategy):
             base = sym_str.split("-")[0] if "-" in sym_str else sym_str.split(".")[0]
             feature_dict["symbol_encoded"] = float(sym_map.get(base, -1))
 
-            # Build vector in correct order
+            # Build vector in correct order. NaN-preserving (see Phase 3
+            # Step 3.3): missing / None / ±inf → NaN so LightGBM handles
+            # them as "missing" rather than as a literal zero measurement.
             vector = np.array(
-                [feature_dict.get(f, 0.0) for f in feature_names],
+                [_safe_float(feature_dict.get(f)) for f in feature_names],
                 dtype=np.float64,
             )
-            return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+            return vector
 
         except Exception as exc:
             self.log.error(f"Feature computation failed: {exc}")

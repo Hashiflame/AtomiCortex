@@ -625,8 +625,15 @@ class LGBMTrainer:
         y = df["target"].to_numpy()
         y_encoded = np.array([LABEL_TO_CLASS[int(v)] for v in y], dtype=np.int32)
 
-        # Replace NaN/inf with 0 in features
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        # Convert ±inf → NaN; KEEP NaN intact. LightGBM natively routes
+        # NaN to the optimal branch of every tree split (and to the same
+        # branch at inference — train/serve consistency). Mapping NaN→0
+        # erases the distinction between "data unavailable" (e.g. a
+        # rolling feature still warming up) and "value really is zero"
+        # (e.g. funding_rate = 0%). ``np.isfinite`` is False for both
+        # NaN and ±inf, so this replaces ±inf with NaN and is a no-op
+        # for already-NaN cells. Finite values pass through unchanged.
+        X = np.where(np.isfinite(X), X, np.nan)
 
         return X, y_encoded, all_cols
 
