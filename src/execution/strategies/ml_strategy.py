@@ -1885,17 +1885,37 @@ class MLTradingStrategy(Strategy):
     # Equity tracking
     # ------------------------------------------------------------------
 
-    def _record_equity(self, ts_ns: int) -> None:
-        """Record equity snapshot for curve plotting."""
+    def _read_nautilus_equity(self) -> float | None:
+        """Read exchange-authoritative equity (balance + unrealized PnL).
+
+        Returns ``None`` when the Nautilus portfolio facade has no account
+        yet (warmup) or the read raises. Split out from ``_record_equity``
+        so unit tests can monkey-patch it on an instance — the underlying
+        ``self.portfolio`` is a Cython property and not patchable.
+        """
         account = self.portfolio.account(self._venue)
         if account is None:
-            return
+            return None
         try:
             balance = account.balance_total(USDT)
             upnl = self.portfolio.unrealized_pnl(self._instrument_id)
-            equity = balance.as_double() + (
+            return balance.as_double() + (
                 upnl.as_double() if upnl is not None else 0.0
             )
+        except Exception:
+            return None
+
+    def _record_equity(self, ts_ns: int) -> None:
+        """Record equity snapshot for curve plotting + sync the tracker."""
+        equity = self._read_nautilus_equity()
+        if equity is None:
+            return
+        try:
             self._equity_curve.append((ts_ns, equity))
+            # H6: Nautilus is the authoritative source for cash balance
+            # (the exchange confirms it). Sync the tracker so risk
+            # decisions (sizing / drawdown / circuit breaker) see the
+            # same equity, not a tracker-local drift.
+            self._tracker.sync_equity(equity)
         except Exception:
             pass

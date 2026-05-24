@@ -163,6 +163,35 @@ class PortfolioTracker:
         if current_eq > self._peak_equity:
             self._peak_equity = current_eq
 
+    def sync_equity(self, nautilus_equity: float) -> None:
+        """H6: align tracker equity with the exchange-authoritative value.
+
+        Adjusts ``_cash`` so that ``_get_equity() == nautilus_equity`` —
+        ``equity = cash + Σ unrealized_pnl`` is the invariant, so
+        ``cash = nautilus_equity - Σ unrealized_pnl``. Funding payments,
+        fee-rounding, and timing drifts between the local tracker and the
+        Nautilus PortfolioFacade are absorbed here.
+
+        Daily/weekly realised PnL counters, day_start_equity, and
+        consecutive-loss state are deliberately untouched — they reflect
+        history independent of the cash balance.
+        """
+        try:
+            target = float(nautilus_equity)
+        except (TypeError, ValueError):
+            return
+        if target != target or target in (float("inf"), float("-inf")):
+            return  # NaN / inf — drop silently
+
+        unrealised = sum(p.unrealized_pnl for p in self._positions.values())
+        self._cash = target - unrealised
+
+        # Bump peak so drawdown gate sees true high-water mark even when
+        # equity moves via Nautilus (funding credits, etc.), not via our
+        # own update_fill / close_position path.
+        if target > self._peak_equity:
+            self._peak_equity = target
+
     def close_position(
         self,
         symbol: str,
