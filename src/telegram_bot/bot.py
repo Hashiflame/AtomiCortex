@@ -142,8 +142,13 @@ class TelegramBot:
 
         # Shared DB — written by the trading bot's SignalBridge (atomicortex.db).
         # Telegram-bot reads signals/metrics from here; user/payment data stays in self._db.
+        # init_schema=False: the trading process owns the schema. DDL from
+        # the reader side races the writer's WAL and pollutes the trading
+        # DB with telegram-only tables (Phase 5 Step 5.1).
         shared_db_path = self._get_shared_db_path()
-        self._app.bot_data["shared_db"] = Database(shared_db_path)
+        self._app.bot_data["shared_db"] = Database(
+            shared_db_path, init_schema=False,
+        )
         # Multi-timeframe: list of every existing isolated trading DB.
         # Backward compatible — if only the 4H DB exists, list has one entry.
         self._app.bot_data["shared_db_paths"] = self._get_shared_db_paths()

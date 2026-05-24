@@ -158,7 +158,10 @@ def _resolve_stat_dbs(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, Dat
         for p in paths:
             name = str(p)
             tf = "15m" if "_15m" in name else "1h" if "_1h" in name else "4h"
-            out.append((tf, Database(p)))
+            # init_schema=False: these are trading DBs owned by the
+            # trading process; DDL from /stats handlers would race the
+            # SignalBridge writer and clutter the DB (Phase 5 Step 5.1).
+            out.append((tf, Database(p, init_schema=False)))
         return out
     shared = context.bot_data.get("shared_db")
     if isinstance(shared, Database):

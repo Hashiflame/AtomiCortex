@@ -32,11 +32,39 @@ class Database:
         Path to the SQLite database file.
     """
 
-    def __init__(self, db_path: str | Path = "data/telegram_bot.db") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = "data/telegram_bot.db",
+        init_schema: bool = True,
+    ) -> None:
+        """Attach to a SQLite database.
+
+        ``init_schema=True`` (default, backward compatible) creates the
+        Telegram-bot schema (users / signals_log / bot_events / payments
+        + indexes) and runs an idempotent ALTER on ``signals_log``.
+
+        ``init_schema=False`` is for *attaching to a database owned by
+        another process* (e.g. the trading bot's ``atomicortex.db``).
+        No CREATE / ALTER fires. This avoids:
+          * cluttering the trading DB with Telegram-only tables;
+          * SQLite WAL lock races between the trading writer and the
+            Telegram-bot ALTER TABLE on every ``/stats`` request.
+
+        Read methods (``get_recent_signals``, ``get_latest_metrics`` …)
+        already swallow ``sqlite3.OperationalError`` for missing tables,
+        so they remain safe in this "schema-free" mode.
+        """
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-        _log.info("Telegram bot DB initialised | path={p}", p=str(self._db_path))
+        self._init_schema = init_schema
+        if init_schema:
+            self._init_db()
+            _log.info("Telegram bot DB initialised | path={p}", p=str(self._db_path))
+        else:
+            _log.info(
+                "Telegram bot DB attached (no-DDL mode) | path={p}",
+                p=str(self._db_path),
+            )
 
     # ------------------------------------------------------------------
     # Connection helper  (TG-007: PRAGMA WAL moved to _init_db only)
