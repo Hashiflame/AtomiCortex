@@ -251,3 +251,136 @@ class TestNoNanToNumCallsLeft:
             "src/execution/strategies/ml_strategy.py", encoding="utf-8",
         ).read()
         assert "nan_to_num" not in src
+
+    def test_ml_strategy_15m_has_no_nan_to_num(self) -> None:
+        src = open(
+            "src/execution/strategies/ml_strategy_15m.py", encoding="utf-8",
+        ).read()
+        assert "nan_to_num" not in src
+
+    def test_meta_strategy_has_no_nan_to_num(self) -> None:
+        src = open(
+            "src/execution/strategies/meta_strategy.py", encoding="utf-8",
+        ).read()
+        assert "nan_to_num" not in src
+
+
+# ---------------------------------------------------------------------------
+# 6. 15m strategy: NaN survives through _vector()
+# ---------------------------------------------------------------------------
+
+class TestStrategy15mPreservesNaN:
+    """Phase 5.6 — mirror the 4H fix in the 15m strategy.
+
+    ``_vector`` is a staticmethod that takes a 1-row polars DataFrame
+    and a feature-name list. We feed it crafted rows containing the
+    same boundary values that broke 4H pre-fix (None, missing column,
+    ±inf) and assert each one becomes NaN at the boundary into the
+    LightGBM predictor.
+    """
+
+    def test_missing_column_becomes_nan(self) -> None:
+        from src.execution.strategies.ml_strategy_15m import (
+            MLTradingStrategy15M,
+        )
+        row = pl.DataFrame({"a": [1.0], "b": [0.0]})
+        vec = MLTradingStrategy15M._vector(row, ["a", "b", "c"])
+        assert vec[0] == 1.0
+        assert vec[1] == 0.0          # real zero survives
+        assert np.isnan(vec[2])       # absent column → NaN, NOT 0.0
+
+    def test_none_value_becomes_nan(self) -> None:
+        from src.execution.strategies.ml_strategy_15m import (
+            MLTradingStrategy15M,
+        )
+        row = pl.DataFrame({"a": [None], "b": [2.5]}, strict=False)
+        vec = MLTradingStrategy15M._vector(row, ["a", "b"])
+        assert np.isnan(vec[0])
+        assert vec[1] == 2.5
+
+    def test_inf_collapses_to_nan(self) -> None:
+        from src.execution.strategies.ml_strategy_15m import (
+            MLTradingStrategy15M,
+        )
+        row = pl.DataFrame({
+            "a": [float("inf")],
+            "b": [float("-inf")],
+            "c": [7.0],
+        })
+        vec = MLTradingStrategy15M._vector(row, ["a", "b", "c"])
+        assert np.isnan(vec[0])
+        assert np.isnan(vec[1])
+        assert vec[2] == 7.0
+        assert not np.any(np.isinf(vec))
+
+    def test_real_nan_passthrough(self) -> None:
+        from src.execution.strategies.ml_strategy_15m import (
+            MLTradingStrategy15M,
+        )
+        row = pl.DataFrame({"a": [float("nan")], "b": [3.0]})
+        vec = MLTradingStrategy15M._vector(row, ["a", "b"])
+        assert np.isnan(vec[0])
+        assert vec[1] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# 7. Meta gate: build_feature_vector preserves NaN
+# ---------------------------------------------------------------------------
+
+class _FakeBooster:
+    """Picklable stand-in for the trained LightGBM booster."""
+
+    def predict(self, X):
+        return np.zeros((X.shape[0],), dtype=np.float64)
+
+
+class TestMetaGatePreservesNaN:
+    """Phase 5.6 — same fix on MetaSignalGate.build_feature_vector.
+
+    Constructs a gate with a hand-built fake bundle so we don't depend
+    on the real meta_model_v3.pkl bytes, only on the vector-assembly
+    code path that previously called ``nan_to_num``.
+    """
+
+    @staticmethod
+    def _gate(feature_columns, tmp_path):
+        import pickle
+        from src.execution.strategies.meta_strategy import MetaSignalGate
+        bundle = {
+            "booster": _FakeBooster(),
+            "feature_columns": feature_columns,
+        }
+        path = tmp_path / "fake_meta.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(bundle, f)
+        return MetaSignalGate(path, threshold=0.6, min_size=0.0)
+
+    def test_missing_key_becomes_nan(self, tmp_path):
+        gate = self._gate(["a", "b", "c"], tmp_path)
+        vec = gate.build_feature_vector({"a": 1.0, "b": 0.0})
+        assert vec.shape == (1, 3)
+        assert vec[0, 0] == 1.0
+        assert vec[0, 1] == 0.0
+        assert np.isnan(vec[0, 2])
+
+    def test_inf_and_none_collapse_to_nan(self, tmp_path):
+        gate = self._gate(["a", "b", "c", "d"], tmp_path)
+        vec = gate.build_feature_vector({
+            "a": None,
+            "b": float("inf"),
+            "c": float("-inf"),
+            "d": 4.2,
+        })
+        assert np.isnan(vec[0, 0])
+        assert np.isnan(vec[0, 1])
+        assert np.isnan(vec[0, 2])
+        assert vec[0, 3] == 4.2
+        assert not np.any(np.isinf(vec))
+
+    def test_real_zero_is_not_treated_as_missing(self, tmp_path):
+        """The whole point: a genuine 0.0 (e.g. funding_rate at 0%)
+        must reach the booster as 0.0, not be silently treated as NaN."""
+        gate = self._gate(["funding_rate"], tmp_path)
+        vec = gate.build_feature_vector({"funding_rate": 0.0})
+        assert vec[0, 0] == 0.0
+        assert not np.isnan(vec[0, 0])

@@ -35,6 +35,7 @@ from src.logger import get_logger
 from src.execution.strategies.ml_strategy import (
     MLStrategyConfig,
     MLTradingStrategy,
+    _safe_float,
 )
 from src.risk.risk_engine import RiskDecision, TradeSignal
 
@@ -112,14 +113,17 @@ class MetaSignalGate:
     def build_feature_vector(self, context: dict[str, float]) -> np.ndarray:
         """Project `context` onto the booster's column order.
 
-        Missing keys default to 0.0 (booster handles by-design via
-        LightGBM's NaN/zero handling). Returns shape (1, n_features).
+        Missing / non-finite keys become NaN so LightGBM uses its
+        native missing-value routing — matching what the trainer saw
+        during fit. Replacing them with 0.0 would inject train/serve
+        skew (booster would read "no data" as a real measurement of
+        zero). Returns shape (1, n_features).
         """
         vec = np.array(
-            [float(context.get(c, 0.0)) for c in self._feature_columns],
+            [_safe_float(context.get(c)) for c in self._feature_columns],
             dtype=np.float64,
         ).reshape(1, -1)
-        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.where(np.isfinite(vec), vec, np.nan)
 
     # ------------------------------------------------------------------
     # Decision

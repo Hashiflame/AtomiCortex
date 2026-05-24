@@ -57,6 +57,7 @@ from src.execution.strategies.ml_strategy import (
     MLStrategyConfig,
     MLTradingStrategy,
     _bar_to_dict,
+    _safe_float,
 )
 from src.logger import get_logger
 from src.risk.risk_engine import TradeSignal
@@ -343,13 +344,19 @@ class MLTradingStrategy15M(MLTradingStrategy):
 
     @staticmethod
     def _vector(row: pl.DataFrame, feature_names: list[str]) -> np.ndarray:
-        """Assemble the model input vector in trained feature order."""
+        """Assemble the model input vector in trained feature order.
+
+        Missing / non-finite features become NaN so LightGBM routes them
+        through its native missing-value handling. Replacing them with
+        0.0 would conflate "data unavailable" with "value is zero" and
+        introduce train/serve skew vs. the trainer (which preserves NaN).
+        """
         rd = {c: row[c][0] for c in row.columns}
         vec = np.array(
-            [float(rd.get(f, 0.0) or 0.0) for f in feature_names],
+            [_safe_float(rd.get(f)) for f in feature_names],
             dtype=np.float64,
         )
-        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.where(np.isfinite(vec), vec, np.nan)
 
     # ------------------------------------------------------------------
     # Bar handler
