@@ -32,6 +32,7 @@ def calculate_dsr(
     n_trials: int,
     skewness: float = 0.0,
     kurtosis: float = 3.0,
+    n_obs: int | None = None,
 ) -> float:
     """Deflated Sharpe Ratio (López de Prado 2014).
 
@@ -58,7 +59,17 @@ def calculate_dsr(
     skewness:
         Skewness of returns (default 0 — normal).
     kurtosis:
-        Excess kurtosis of returns (default 3 — normal).
+        Raw kurtosis of returns (γ4; default 3 — normal).
+        Note: this is RAW kurtosis, not excess. For a normal
+        distribution γ4 = 3, so the kurtosis correction term
+        ``(γ4 - 3)/4`` vanishes (correct per Mertens 2002).
+    n_obs:
+        Total number of return observations T (NOT number of
+        folds). The Mertens / Bailey-López de Prado SE formula
+        requires T-1 in the denominator. If omitted, falls back
+        to ``len(sharpe_ratios)`` — a legacy approximation that
+        massively understates DSR. Pass the real T whenever
+        per-fold daily returns are available.
 
     Returns
     -------
@@ -87,11 +98,21 @@ def calculate_dsr(
         2 * sqrt_2logn
     )
 
-    # Standard error of SR (Lo 2002, with skewness/kurtosis correction)
-    n_obs = len(sharpe_ratios)
+    # Standard error of SR (Mertens 2002 / Bailey-López de Prado 2014 eq. 9):
+    #   SE(SR) = sqrt((1 - γ3·SR + (γ4-3)/4·SR²) / (T-1))
+    # Two bugs were here pre-fix:
+    #   * the denominator used the number of FOLDS (5-15) instead of the
+    #     number of return observations T (hundreds-thousands), inflating
+    #     SE by ~sqrt(T/N_folds) and collapsing DSR to ≈0.5;
+    #   * the kurtosis term was ``(γ4 - 1)/4`` so for a normal distribution
+    #     (γ4 = 3) it added ``0.5·SR²`` of spurious variance instead of
+    #     vanishing.
+    t_obs = n_obs if n_obs is not None else len(sharpe_ratios)
+    if t_obs < 2:
+        return 0.0
     se_sr = math.sqrt(
-        (1 - skewness * best_sr + ((kurtosis - 1) / 4) * best_sr ** 2)
-        / n_obs
+        (1 - skewness * best_sr + ((kurtosis - 3) / 4) * best_sr ** 2)
+        / (t_obs - 1)
     )
 
     if se_sr < 1e-12:
@@ -371,6 +392,7 @@ def run_all_tests(
         sharpe_list: list[float] = []
         skew_list: list[float] = []
         kurt_list: list[float] = []
+        total_t: int = 0  # total return observations across all folds
 
         for daily_rets in per_fold_daily_returns:
             if len(daily_rets) < 5:
@@ -383,15 +405,19 @@ def run_all_tests(
             sharpe_list.append(sr)
             skew_list.append(float(sp_stats.skew(daily_rets)))
             kurt_list.append(float(sp_stats.kurtosis(daily_rets, fisher=False)))
+            total_t += len(daily_rets)
 
         avg_skew = float(np.mean(skew_list)) if skew_list else 0.0
         avg_kurt = float(np.mean(kurt_list)) if kurt_list else 3.0
 
+        # Pass the REAL total observation count so SE(SR) uses (T-1) in
+        # the denominator — the central correction of Phase 3 Step 3.1.
         dsr = calculate_dsr(
             sharpe_list,
             n_trials=n_experiments,
             skewness=avg_skew,
             kurtosis=avg_kurt,
+            n_obs=total_t,
         )
         _log.info(
             "DSR computed from REAL daily returns "
