@@ -10,7 +10,10 @@ Metrics: win_rate, profit_factor, expected_value, total_pnl_pct,
 max_drawdown, sharpe_ratio, sortino_ratio, calmar_ratio, avg_rr_ratio,
 avg_duration_h, plus the daily equity curve.
 
-Formulas follow the spec (annualisation factor 252).
+Formulas follow the project convention: annualisation factor =
+``CRYPTO_ANNUALIZE`` (365), imported from ``src.execution.metrics`` so
+backtest reports and Telegram /stats give identical Sharpe numbers
+(H8 — was 252, which inflated reported Sharpe by ~20.5% vs. metrics.py).
 """
 
 from __future__ import annotations
@@ -21,11 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.execution.metrics import CRYPTO_ANNUALIZE
 from src.logger import get_logger
 
 _log = get_logger(__name__)
 
-_ANNUALIZE = 252
+# Single source of truth shared with backtest_runner / metrics.py.
+_ANNUALIZE = CRYPTO_ANNUALIZE
 _CACHE_TTL_SEC = 3600
 # Minimum closed signals before risk ratios are statistically meaningful.
 _MIN_RATIO_SAMPLE = 10

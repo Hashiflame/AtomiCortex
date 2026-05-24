@@ -18,6 +18,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 from src.execution.cost_model import CostModel, FeeConfig
 from src.execution.data_catalog import AtomiCortexCatalog
+from src.execution.metrics import CRYPTO_ANNUALIZE, NAUTILUS_252_TO_365
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,7 +148,11 @@ class BacktestRunner:
 
         start_equity = cfg.initial_capital
         total_return_pct = (end_equity - start_equity) / start_equity * 100
-        sharpe = stats_returns.get("Sharpe Ratio (252 days)", 0.0) or 0.0
+        # H8: Nautilus reports Sharpe on a 252-day basis (equities
+        # convention); convert to the project-wide 365-day crypto basis
+        # so backtest and Telegram /stats show one number.
+        sharpe_252 = stats_returns.get("Sharpe Ratio (252 days)", 0.0) or 0.0
+        sharpe = sharpe_252 * NAUTILUS_252_TO_365
         profit_factor = stats_returns.get("Profit Factor", 0.0) or 0.0
         win_rate = stats_pnls.get("Win Rate", 0.0) or 0.0
         max_dd = _max_drawdown([e for _, e in equity_curve]) if equity_curve else 0.0
@@ -204,7 +209,7 @@ class BacktestRunner:
         _row("Start Equity", f"${result.start_equity:,.2f}")
         _row("End Equity", f"${result.end_equity:,.2f}")
         print(sep)
-        _row("Sharpe Ratio (252d)", f"{result.sharpe_ratio:.4f}")
+        _row(f"Sharpe Ratio ({CRYPTO_ANNUALIZE}d)", f"{result.sharpe_ratio:.4f}")
         _row("Max Drawdown", f"{result.max_drawdown_pct:.2f}%")
         _row("Profit Factor", f"{result.profit_factor:.4f}")
         _row("Win Rate", f"{result.win_rate:.2%}")

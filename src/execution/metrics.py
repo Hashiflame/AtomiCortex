@@ -52,12 +52,26 @@ class MetricsResult:
 # Individual metric calculators
 # ──────────────────────────────────────────────────────────────────────────────
 
-_CRYPTO_PERIODS_PER_YEAR = 365  # crypto trades every calendar day
+# H8: canonical annualisation factor for crypto Sharpe / Sortino / Calmar.
+# Crypto trades 24/7/365, so 365 — not the equities-market 252 — is the
+# correct number of daily periods per year. Imported by every downstream
+# module that annualises (stats_engine, backtest_runner) so the bot
+# reports a single Sharpe value everywhere.
+CRYPTO_ANNUALIZE: int = 365
+
+# Nautilus-Trader reports Sharpe under the key "Sharpe Ratio (252 days)"
+# and we cannot change its internals. Multiply by this factor to convert
+# the 252-basis number to a 365-basis one consistent with the rest of
+# the project: sharpe_365 = sharpe_252 * sqrt(365 / 252).
+NAUTILUS_252_TO_365: float = math.sqrt(CRYPTO_ANNUALIZE / 252)
+
+# Legacy private alias kept so external imports keep working.
+_CRYPTO_PERIODS_PER_YEAR = CRYPTO_ANNUALIZE
 
 def calculate_sharpe_ratio(
     equity_curve: list[tuple[datetime, float]],
     risk_free_rate: float = 0.0,
-    periods_per_year: int = _CRYPTO_PERIODS_PER_YEAR,
+    periods_per_year: int = CRYPTO_ANNUALIZE,
 ) -> float:
     """Annualised Sharpe ratio computed from *daily* returns.
 
@@ -96,7 +110,7 @@ def calculate_sharpe_ratio(
     mean_r = sum(returns) / n
     # After daily collapse, rf is always annual / 365 regardless of the
     # caller-supplied periods_per_year (which only affects annualisation).
-    rf_per_day = risk_free_rate / _CRYPTO_PERIODS_PER_YEAR
+    rf_per_day = risk_free_rate / CRYPTO_ANNUALIZE
     variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
     std_r = math.sqrt(variance) if variance > 0 else 0.0
 

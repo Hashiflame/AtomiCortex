@@ -77,7 +77,7 @@ def test_sharpe_ratio_formula(tmp_path):
     daily = [x / 100.0 for x in pnls]
     mean = sum(daily) / len(daily)
     var = sum((r - mean) ** 2 for r in daily) / (len(daily) - 1)
-    expected = mean / math.sqrt(var) * math.sqrt(252)
+    expected = mean / math.sqrt(var) * math.sqrt(365)  # H8: crypto annualisation factor
     p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
     assert p["sharpe_ratio"] is not None
     assert abs(p["sharpe_ratio"] - round(expected, 4)) < 1e-3
@@ -94,7 +94,7 @@ def test_sortino_only_downside(tmp_path):
     downs = [r for r in daily if r < 0]
     dmean = sum(downs) / len(downs)
     dvar = sum((r - dmean) ** 2 for r in downs) / (len(downs) - 1)
-    expected = mean / math.sqrt(dvar) * math.sqrt(252)
+    expected = mean / math.sqrt(dvar) * math.sqrt(365)  # H8: crypto annualisation factor
     p = StatsEngine([db]).compute_performance(period_days=30, use_cache=False)
     assert p["sortino_ratio"] is not None
     assert abs(p["sortino_ratio"] - round(expected, 4)) < 1e-3
