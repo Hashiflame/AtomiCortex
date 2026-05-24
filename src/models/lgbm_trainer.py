@@ -320,10 +320,28 @@ class LGBMTrainer:
         # financial features → larger, more stable val); 4H keeps 10%.
         val_frac = 0.85 if self.use_mtf_params else 0.90
         val_split = int(len(X_train) * val_frac)
+
+        # Phase 3 Step 3.4 — AFML Ch.7 embargo for the eval_set boundary.
+        # Triple-barrier / forward-bars labels of the last train rows look
+        # forward into the val window; without a gap early stopping reads
+        # a leaked, falsely-optimistic val loss and halts too early. Drop
+        # one label-horizon worth of train tail rows so no train label
+        # can reach across into val.
+        embargo_rows = (
+            self.config.barrier_max_holding
+            if self.config.use_triple_barrier
+            else max(1, self.config.forward_bars)
+        )
+        # Guard: never shrink train_fit below half its pre-embargo size.
+        # For realistic training sets (≥ thousands of rows) this is a
+        # no-op; it only kicks in on tiny synthetic fixtures.
+        embargo_rows = min(embargo_rows, max(0, val_split // 2))
+        fit_end = val_split - embargo_rows
+
         X_val = X_train[val_split:]
         y_val = y_train[val_split:]
-        X_train_fit = X_train[:val_split]
-        y_train_fit = y_train[:val_split]
+        X_train_fit = X_train[:fit_end]
+        y_train_fit = y_train[:fit_end]
 
         # Balanced sample weights — upweight minority classes (UP/DOWN)
         train_weights = compute_sample_weight("balanced", y_train_fit)
@@ -338,7 +356,9 @@ class LGBMTrainer:
             uniq_all = self._builder.compute_uniqueness_weights_by_symbol(
                 train_df, max_holding=self.config.barrier_max_holding,
             )
-            uniq_fit = uniq_all[:val_split]
+            # Slice uniqueness weights to match the embargoed train_fit
+            # length so train_weights * uniq_fit stays element-aligned.
+            uniq_fit = uniq_all[:fit_end]
             uniq_val = uniq_all[val_split:]
             train_weights = train_weights * uniq_fit
             val_weights = val_weights * uniq_val
