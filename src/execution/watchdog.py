@@ -258,6 +258,19 @@ class Watchdog:
                     side = "SELL" if amt > 0 else "BUY"
                     qty = str(abs(amt))
 
+                    # H16: try a Limit-IOC at markPrice ± 0.3% FIRST so
+                    # the close doesn't eat 1-5% of slippage on a thin
+                    # book (exactly the kind of market that triggered
+                    # the watchdog in the first place). MARKET stays as
+                    # the unconditional fallback so an unfilled IOC
+                    # cannot leave the account exposed.
+                    ioc_filled = await self._try_limit_ioc_close(
+                        session=session, pos=pos, symbol=symbol,
+                        side=side, qty=qty, result=result,
+                    )
+                    if ioc_filled:
+                        continue
+
                     order_result = await self._signed_post(
                         session,
                         self._urls["order"],
@@ -274,10 +287,11 @@ class Watchdog:
                             "symbol": symbol,
                             "side": side,
                             "quantity": qty,
+                            "method": "MARKET",
                             "response": order_result,
                         })
                         _log.warning(
-                            "EMERGENCY CLOSE | {sym} {side} {qty}",
+                            "EMERGENCY CLOSE (MARKET) | {sym} {side} {qty}",
                             sym=symbol, side=side, qty=qty,
                         )
                     else:
@@ -461,6 +475,101 @@ class Watchdog:
     def _auth_headers(self) -> dict[str, str]:
         """Return headers with API key."""
         return {"X-MBX-APIKEY": self._config.binance_api_key}
+
+    # H16: 0.3% slippage tolerance for Limit-IOC emergency close.
+    # Wide enough to fill on a reasonably liquid book; narrow enough
+    # that a thin book rejects the IOC and we fall back to MARKET
+    # rather than ate a 1-5% slip silently.
+    _IOC_SLIPPAGE: float = 0.003
+
+    async def _try_limit_ioc_close(
+        self,
+        session: Any,
+        pos: dict[str, Any],
+        symbol: str,
+        side: str,
+        qty: str,
+        result: dict[str, Any],
+    ) -> bool:
+        """Attempt a Limit-IOC reduceOnly close. Return True iff filled.
+
+        Reads ``markPrice`` from the positionRisk record (already in
+        memory — no extra HTTP). Falls back silently to ``False`` on any
+        error so the caller's MARKET path runs unconditionally.
+        """
+        try:
+            mark_price = float(pos.get("markPrice", 0) or 0)
+        except (TypeError, ValueError):
+            mark_price = 0.0
+        if mark_price <= 0:
+            return False
+
+        # SELL (close LONG) accepts price slightly below mark; BUY
+        # (close SHORT) accepts price slightly above. The IOC times out
+        # if neither makes immediately, so on a thin book the order
+        # cancels itself and we fall through to MARKET.
+        if side == "SELL":
+            limit_price = mark_price * (1.0 - self._IOC_SLIPPAGE)
+        else:
+            limit_price = mark_price * (1.0 + self._IOC_SLIPPAGE)
+
+        try:
+            ioc_result = await self._signed_post(
+                session,
+                self._urls["order"],
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "type": "LIMIT",
+                    "timeInForce": "IOC",
+                    "quantity": qty,
+                    "price": f"{limit_price:.2f}",
+                    "reduceOnly": "true",
+                },
+            )
+        except Exception as exc:
+            _log.warning(
+                "IOC close raised for {sym}: {e} — falling back to MARKET",
+                sym=symbol, e=str(exc),
+            )
+            return False
+
+        if ioc_result is None:
+            return False
+
+        status = str(ioc_result.get("status", "")).upper()
+        try:
+            executed = float(ioc_result.get("executedQty", 0) or 0)
+            requested = float(qty)
+        except (TypeError, ValueError):
+            executed, requested = 0.0, 0.0
+
+        fully_filled = (
+            status == "FILLED"
+            or (requested > 0 and executed + 1e-10 >= requested)
+        )
+        if not fully_filled:
+            # Partial / unfilled IOC — MARKET fallback will close the
+            # remainder. Easier to over-cancel than to under-close.
+            _log.info(
+                "IOC partial/unfilled for {sym}: status={st} executed={ex}/"
+                "{rq} — fallback to MARKET",
+                sym=symbol, st=status, ex=executed, rq=requested,
+            )
+            return False
+
+        result["positions_closed"].append({
+            "symbol": symbol,
+            "side": side,
+            "quantity": qty,
+            "method": "LIMIT_IOC",
+            "response": ioc_result,
+        })
+        _log.warning(
+            "EMERGENCY CLOSE (IOC) | {sym} {side} {qty} @ {px:.2f}",
+            sym=symbol, side=side, qty=qty, px=limit_price,
+        )
+        return True
 
     async def _signed_get(
         self,

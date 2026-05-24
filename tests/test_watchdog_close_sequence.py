@@ -57,6 +57,8 @@ def _install_capture(wd: Watchdog, monkeypatch):
     events: list[str] = []
     controls: dict = {
         "positions": [
+            # H16: markPrice omitted → IOC path short-circuits and
+            # MARKET runs — preserves the original H15 assertions.
             {"symbol": "BTCUSDT", "positionAmt": "0.5"},
             {"symbol": "ETHUSDT", "positionAmt": "-2.0"},
         ],
