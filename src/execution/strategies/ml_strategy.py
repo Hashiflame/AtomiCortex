@@ -157,7 +157,10 @@ class MLTradingStrategy(Strategy):
         self._pending_stops: dict[str, str] = {}  # instrument_id → client_order_id
 
         # Last known funding rate (updated from feature data)
-        self._last_funding_rate: float = 0.0
+        # H4: None = "no real funding reading yet". 0.0 would be
+        # indistinguishable from a legitimate neutral-market funding and
+        # would silently bypass the extreme-funding filter.
+        self._last_funding_rate: float | None = None
 
         # Pending SL params: entry client_order_id -> {decision, signal} for
         # deferred stop-loss submission (placed in on_order_filled, not _open_position)
@@ -1160,12 +1163,14 @@ class MLTradingStrategy(Strategy):
         self,
         feature_vector: np.ndarray | None,
         feature_names: list[str],
-    ) -> float:
+    ) -> float | None:
         """Extract funding rate from feature vector.
 
-        PROD-003 fix: read actual funding_rate from feature data instead
-        of hardcoded 0.0001.  Falls back to 0.0 (safe default that will
-        not bypass the extreme-funding filter).
+        Returns ``None`` when no real reading is available — the upstream
+        risk filter (``RiskEngine._check_funding_rate``) treats ``None``
+        as a hard block (H4 fail-safe). Returning ``0.0`` here would be
+        indistinguishable from a legitimate neutral-market funding and
+        would silently let trades through.
         """
         if feature_vector is not None and "funding_rate" in feature_names:
             idx = feature_names.index("funding_rate")
@@ -1174,7 +1179,8 @@ class MLTradingStrategy(Strategy):
                 self._last_funding_rate = rate
                 return rate
 
-        # Fallback: use last known rate or 0.0 (safe default)
+        # No usable reading from the feature vector — fall back to the
+        # last known good reading (may still be None at startup).
         return self._last_funding_rate
 
     # ------------------------------------------------------------------

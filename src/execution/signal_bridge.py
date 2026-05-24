@@ -160,7 +160,7 @@ class SignalBridge:
         confidence: float,
         regime: str,
         atr: float = 0.0,
-        funding_rate: float = 0.0,
+        funding_rate: float | None = 0.0,
         position_size: float = 0.0,
         notional: float = 0.0,
         leverage: float = 0.0,

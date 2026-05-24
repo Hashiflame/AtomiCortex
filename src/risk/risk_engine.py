@@ -74,7 +74,10 @@ class TradeSignal:
     entry_price: float
     atr: float              # current ATR in $
     atr_pct: float          # ATR / price
-    funding_rate: float
+    # H4: None ≠ 0.0. None means "funding unknown" (pipeline error, pre-
+    # first-settlement) and is treated as fail-safe block by RiskEngine.
+    # 0.0 is a legitimate neutral-market reading and passes through.
+    funding_rate: float | None
     timestamp: datetime
 
 
@@ -362,7 +365,18 @@ class RiskEngine:
         return True, ""
 
     def _check_funding_rate(self, signal: TradeSignal) -> tuple[bool, str]:
-        """Block if |funding| > extreme threshold."""
+        """Block if |funding| > extreme threshold OR funding is unknown.
+
+        Fail-safe: ``signal.funding_rate is None`` means the upstream
+        pipeline could not source a real funding reading (feature build
+        failure or pre-first-settlement state). Treating that as 0.0
+        silently bypasses the extreme-funding filter, so we block instead.
+        """
+        if signal.funding_rate is None:
+            return False, (
+                "Funding rate unknown — blocking signal (fail-safe). "
+                "Will resume once a real funding reading is available."
+            )
         if abs(signal.funding_rate) > self._config.max_funding_rate:
             return False, (
                 f"Extreme funding rate {signal.funding_rate:.4%} "

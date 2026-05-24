@@ -685,16 +685,18 @@ class TestFundingRatePROD003:
         assert rate == pytest.approx(0.0015)
         assert strategy._last_funding_rate == pytest.approx(0.0015)
 
-    def test_get_funding_rate_fallback_zero(
+    def test_get_funding_rate_fallback_none(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
-        """When funding_rate not in features → returns 0.0 (safe default)."""
+        """H4: when funding_rate not in features and no prior reading,
+        return None (RiskEngine treats None as fail-safe block — 0.0 would
+        silently bypass the extreme-funding filter)."""
         strategy = MLTradingStrategy(config=default_strategy_config)
         feature_names = ["returns_1", "adx"]
         feature_vector = np.array([0.01, 25.0])
 
         rate = strategy._get_funding_rate(feature_vector, feature_names)
-        assert rate == 0.0
+        assert rate is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
