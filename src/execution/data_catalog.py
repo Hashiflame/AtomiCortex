@@ -152,6 +152,21 @@ class AtomiCortexCatalog:
         end: datetime,
         sample_size: int = 100_000,
     ) -> list[TradeTick]:
+        """Load aggTrades for *symbol* over [*start*, *end*].
+
+        H23: previously truncated to the FIRST ``sample_size`` rows
+        sorted by ``transact_time`` — on an active BTC day with
+        millions of trades this dropped >90% of the data and biased
+        VPIN / microstructure features to the first few minutes after
+        midnight UTC.
+
+        New behaviour: count rows that fall inside the window first,
+        then take an evenly-spaced stride sample (``gather_every``) so
+        coverage is uniform across the day while peak memory stays
+        bounded by ``sample_size``. When the window already has fewer
+        rows than ``sample_size`` the result is the full set (no
+        sampling needed). Fail-soft: missing files return an empty list.
+        """
         instrument_id = InstrumentId.from_str(f"{symbol}-PERP.BINANCE")
         spec = _SPECS[symbol]
         pp = spec["price_precision"]
@@ -165,19 +180,37 @@ class AtomiCortexCatalog:
         start_ms = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
 
-        df = (
-            pl.scan_parquet(pattern, hive_partitioning=False)
-            .filter(
-                (pl.col("transact_time") >= start_ms)
-                & (pl.col("transact_time") < end_ms)
+        try:
+            lf = (
+                pl.scan_parquet(pattern, hive_partitioning=False)
+                .filter(
+                    (pl.col("transact_time") >= start_ms)
+                    & (pl.col("transact_time") < end_ms)
+                )
+                .select(
+                    ["agg_trade_id", "price", "quantity",
+                     "transact_time", "is_buyer_maker"]
+                )
+                .sort("transact_time")
             )
-            .select(
-                ["agg_trade_id", "price", "quantity", "transact_time", "is_buyer_maker"]
-            )
-            .sort("transact_time")
-            .head(sample_size)
-            .collect()
-        )
+        except Exception:
+            return []
+
+        # Cheap streaming count — does not materialise rows.
+        try:
+            total = int(lf.select(pl.len()).collect().item())
+        except Exception:
+            return []
+        if total == 0:
+            return []
+
+        if sample_size <= 0 or total <= sample_size:
+            df = lf.collect()
+        else:
+            # Stride = ⌈total / sample_size⌉ — picks every Nth row so
+            # coverage spans the full window, bounded by sample_size.
+            stride = (total + sample_size - 1) // sample_size
+            df = lf.gather_every(stride).collect()
 
         ticks: list[TradeTick] = []
         for row in df.iter_rows(named=True):
