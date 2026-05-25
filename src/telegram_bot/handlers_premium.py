@@ -66,22 +66,36 @@ def _collect_recent(
     status: str | None = None,
     result_filter: str | None = None,
 ) -> list[dict]:
+    """Merge recent signals across the isolated trading DBs.
+
+    M6: timeframe + result selectors are now pushed to SQL via
+    ``Database.get_recent_signals``. Each DB returns at most ``limit``
+    rows (down from a flat 200), and we skip a DB entirely when its
+    ``tf_label`` doesn't match the requested timeframe — no more
+    loading and discarding 90 % of the rows in Python.
+    """
     rows: list[dict] = []
+    sql_tf = timeframe if timeframe and timeframe not in ("all", "open") else None
+    sql_filter = (
+        result_filter if result_filter in _RESULT_FILTER_MAP else None
+    )
     for tf_label, db in _resolve_stat_dbs(context):
+        # Skip DBs whose timeframe doesn't match the request.
+        if sql_tf and tf_label != sql_tf:
+            continue
         try:
-            part = db.get_recent_signals(limit=200, status=status)
+            part = db.get_recent_signals(
+                limit=limit,
+                timeframe=sql_tf,
+                status=status,
+                result_filter=sql_filter,
+            )
         except Exception:
             continue
         for s in part:
-            s.setdefault("timeframe", tf_label)
             if not s.get("timeframe"):
                 s["timeframe"] = tf_label
             rows.append(s)
-    if timeframe and timeframe not in ("all", "open"):
-        rows = [s for s in rows if s.get("timeframe") == timeframe]
-    if result_filter in _RESULT_FILTER_MAP:
-        want = _RESULT_FILTER_MAP[result_filter]
-        rows = [s for s in rows if (s.get("result") or "open") == want]
     rows.sort(key=lambda s: str(s.get("created_at") or ""), reverse=True)
     return rows[:limit]
 

@@ -90,7 +90,7 @@ class StatsEngine:
     def __init__(
         self,
         db_paths: list[str],
-        initial_capital: float = 10_000.0,
+        initial_capital: float | None = None,
         cache_db_path: str | Path | None = None,
     ) -> None:
         """Compute Telegram /stats from one or more trading DBs.
@@ -109,7 +109,22 @@ class StatsEngine:
         co-located behaviour.
         """
         self.db_paths = [str(p) for p in db_paths]
-        self.initial_capital = initial_capital
+        # M8: auto-load real INITIAL_CAPITAL from Settings when the
+        # caller didn't pin one explicitly — equity_curve no longer
+        # silently starts at $10k for every premium user regardless of
+        # the bot's actual deposit. Fail-soft → 10_000 fallback so a
+        # missing Settings cannot break /stats.
+        if initial_capital is None:
+            try:
+                from src.config import get_settings
+                initial_capital = float(get_settings().initial_capital)
+            except Exception as exc:
+                _log.debug(
+                    "StatsEngine: Settings.initial_capital unavailable "
+                    "({e}); falling back to 10_000.", e=exc,
+                )
+                initial_capital = 10_000.0
+        self.initial_capital = float(initial_capital)
 
         if cache_db_path is not None:
             self._cache_db = str(cache_db_path)
@@ -321,10 +336,14 @@ class StatsEngine:
                 days_tracked = 0
 
         decided = len(wins) + len(losses)
+        # M7: surface the threshold + current sample so the Telegram
+        # formatter can render "— (нужно 10+, сейчас 3)" instead of a
+        # bare em-dash that gives the operator no progress indicator.
         return {
             "timeframe": timeframe,
             "period_days": period_days,
             "symbol": symbol,
+            "min_ratio_sample": _MIN_RATIO_SAMPLE,
             "win_rate": round(len(wins) / decided, 4) if decided else 0.0,
             "profit_factor": _safe_pf(gross_win, gross_loss),
             "expected_value": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,

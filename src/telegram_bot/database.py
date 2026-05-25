@@ -415,12 +415,19 @@ class Database:
         limit: int = 10,
         timeframe: str | None = None,
         status: str | None = None,
+        result_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         """Recent signals (newest first), any status by default.
 
         Single-DB by design — callers merge across the isolated trading
         DBs (mirrors the /stats pattern). ``timeframe`` is only filtered
         when the column exists; ``status`` is ``open`` or ``closed``.
+
+        M6: ``result_filter`` pushes the wins / losses / open selector
+        from a Python-side post-filter into the SQL ``WHERE`` clause.
+        Accepts ``"wins"`` → ``result='win'``, ``"losses"`` → ``'loss'``,
+        ``"open"`` → ``'open'``. Cuts the per-DB row count from a flat
+        200 down to exactly ``limit`` after filtering.
         """
         conn = self._connect()
         try:
@@ -438,6 +445,10 @@ class Database:
                 where.append("result = 'open'")
             elif status == "closed":
                 where.append("result IN ('win','loss','breakeven')")
+            _RESULT_MAP = {"wins": "win", "losses": "loss", "open": "open"}
+            if result_filter in _RESULT_MAP:
+                where.append("result = ?")
+                params.append(_RESULT_MAP[result_filter])
             sql = "SELECT * FROM signals_log"
             if where:
                 sql += " WHERE " + " AND ".join(where)
