@@ -72,31 +72,53 @@ def calculate_sharpe_ratio(
     equity_curve: list[tuple[datetime, float]],
     risk_free_rate: float = 0.0,
     periods_per_year: int = CRYPTO_ANNUALIZE,
+    bar_duration_minutes: int | None = None,
 ) -> float:
-    """Annualised Sharpe ratio computed from *daily* returns.
+    """Annualised Sharpe ratio.
 
-    Intra-day points (e.g. 4H bars) are collapsed to end-of-day before
-    return computation, so ``periods_per_year`` is always effectively 365
-    regardless of input bar frequency.  ``risk_free_rate`` defaults to 0.0
-    (no risk-free-rate adjustment) which is the standard convention for
-    crypto futures where there is no liquid risk-free instrument.
+    Default mode (``bar_duration_minutes is None``) collapses the equity
+    curve to end-of-day and annualises by ``√CRYPTO_ANNUALIZE`` — the
+    pre-H20 behaviour, preserved for backward compatibility.
 
-    Returns 0.0 when fewer than 2 distinct trading days are present or when
-    the daily-return std is below the numerical noise floor (~1e-8).
+    H20 mode (``bar_duration_minutes`` set, e.g. 240 for 4H, 15 for 15m):
+    skip the daily collapse and compute returns at the native bar
+    cadence, then annualise by ``√(365 × 24 × 60 / bar_duration_minutes)``.
+    Daily collapse hides intraday volatility — for 15m it shrinks 96
+    bars per day into one point, inflating Sharpe 3-5×. Pass the bar
+    duration explicitly to get the correct number.
+
+    ``risk_free_rate`` defaults to 0.0 (crypto convention — there is no
+    liquid risk-free instrument). H21: every caller in the project
+    now defaults to 0.0 so the same equity curve always produces the
+    same Sharpe number.
+
+    Returns 0.0 on insufficient data or when the return std is below
+    the numerical noise floor.
     """
     if len(equity_curve) < 2:
         return 0.0
 
-    # Collapse to end-of-day: intra-day bar frequency does not matter
-    daily: dict = {}
-    for dt, equity in equity_curve:
-        daily[dt.date()] = equity
+    if bar_duration_minutes is not None and bar_duration_minutes > 0:
+        # H20: use every bar — no daily collapse.
+        sorted_curve = sorted(equity_curve, key=lambda p: p[0])
+        equities = [eq for _, eq in sorted_curve]
+        bars_per_year = max(
+            1, 365 * 24 * 60 // int(bar_duration_minutes),
+        )
+        rf_per_period = risk_free_rate / bars_per_year
+        ann_factor = bars_per_year
+    else:
+        # Legacy daily-collapse path.
+        daily: dict = {}
+        for dt, equity in equity_curve:
+            daily[dt.date()] = equity
+        sorted_days = sorted(daily)
+        if len(sorted_days) < 2:
+            return 0.0
+        equities = [daily[d] for d in sorted_days]
+        rf_per_period = risk_free_rate / CRYPTO_ANNUALIZE
+        ann_factor = periods_per_year
 
-    sorted_days = sorted(daily)
-    if len(sorted_days) < 2:
-        return 0.0
-
-    equities = [daily[d] for d in sorted_days]
     returns = [
         (equities[i] - equities[i - 1]) / equities[i - 1]
         for i in range(1, len(equities))
@@ -108,9 +130,6 @@ def calculate_sharpe_ratio(
         return 0.0
 
     mean_r = sum(returns) / n
-    # After daily collapse, rf is always annual / 365 regardless of the
-    # caller-supplied periods_per_year (which only affects annualisation).
-    rf_per_day = risk_free_rate / CRYPTO_ANNUALIZE
     variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
     std_r = math.sqrt(variance) if variance > 0 else 0.0
 
@@ -119,7 +138,7 @@ def calculate_sharpe_ratio(
     if std_r < 1e-8:
         return 0.0
 
-    return (mean_r - rf_per_day) / std_r * math.sqrt(periods_per_year)
+    return (mean_r - rf_per_period) / std_r * math.sqrt(ann_factor)
 
 
 def calculate_max_drawdown(
@@ -188,10 +207,23 @@ def calculate_profit_factor(trades: list[dict]) -> float:
 def calculate_all_metrics(
     equity_curve: list[tuple[datetime, float]],
     trades: list[dict],
-    risk_free_rate: float = 0.05,
+    risk_free_rate: float = 0.0,
+    bar_duration_minutes: int | None = None,
 ) -> MetricsResult:
-    """Compute all metrics and return a MetricsResult."""
-    sharpe = calculate_sharpe_ratio(equity_curve, risk_free_rate)
+    """Compute all metrics and return a MetricsResult.
+
+    H21: default risk_free_rate is now 0.0 (was 0.05), matching
+    ``calculate_sharpe_ratio`` so the same equity curve produces the
+    same Sharpe regardless of which entry point the caller uses.
+
+    H20: ``bar_duration_minutes`` is forwarded to ``calculate_sharpe_ratio``
+    so 4H / 15m callers get correctly-annualised Sharpe on bar-level
+    returns instead of the silently-inflated daily-collapse number.
+    """
+    sharpe = calculate_sharpe_ratio(
+        equity_curve, risk_free_rate,
+        bar_duration_minutes=bar_duration_minutes,
+    )
     calmar = calculate_calmar_ratio(equity_curve)
     max_dd = calculate_max_drawdown(equity_curve)
     win_rate = calculate_win_rate(trades)
