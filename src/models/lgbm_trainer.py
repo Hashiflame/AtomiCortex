@@ -185,6 +185,14 @@ class LGBMTrainer:
         Directory where trained models are saved.
     """
 
+    # H26: canonical importance type — ``"gain"`` (cumulative gain per
+    # feature) is less biased toward high-cardinality features than
+    # the LightGBM default ``"split"`` (raw split count). Use the
+    # ``permutation_importance`` helper below for fully unbiased
+    # (model-agnostic) MDA when doing feature selection — gain MDI
+    # still slightly over-weights continuous features.
+    IMPORTANCE_TYPE: str = "gain"
+
     def __init__(
         self,
         config: ModelConfig,
@@ -570,6 +578,67 @@ class LGBMTrainer:
         return bundle
 
     # ------------------------------------------------------------------
+    # Feature importance — unbiased MDA (López de Prado AFML Ch.8)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def permutation_importance(
+        booster: lgb.Booster,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: list[str],
+        n_repeats: int = 5,
+        random_state: int = 42,
+    ) -> dict[str, float]:
+        """Model-agnostic permutation feature importance (MDA).
+
+        For each feature, permute its column ``n_repeats`` times, run
+        the booster, and measure the resulting accuracy drop relative
+        to the unpermuted baseline. Return ``{name: mean_drop}``.
+
+        Higher drop ⇒ more important feature. Unlike ``booster.
+        feature_importance(importance_type='gain')`` this estimator is
+        unbiased w.r.t. feature cardinality — a binary feature that
+        perfectly determines ``y`` ranks above a continuous noise
+        feature regardless of how many unique values the noise has.
+        Prefer this for feature selection; reserve gain MDI for
+        cheap tiebreaking inside a cluster.
+
+        Fail-soft on degenerate inputs (empty X, n_repeats<=0, shape
+        mismatch) — returns an empty dict.
+        """
+        try:
+            X = np.asarray(X)
+            y = np.asarray(y)
+            if X.ndim != 2 or X.shape[0] == 0:
+                return {}
+            if n_repeats <= 0:
+                return {}
+            if X.shape[1] != len(feature_names):
+                return {}
+            from sklearn.metrics import accuracy_score
+            rng = np.random.RandomState(random_state)
+            baseline_pred = (booster.predict(X) >= 0.5).astype(int)
+            baseline_acc = accuracy_score(y, baseline_pred)
+            out: dict[str, float] = {}
+            n = X.shape[0]
+            for col, name in enumerate(feature_names):
+                drops = np.empty(n_repeats, dtype=np.float64)
+                for r in range(n_repeats):
+                    X_perm = X.copy()
+                    perm = rng.permutation(n)
+                    X_perm[:, col] = X_perm[perm, col]
+                    pred = (booster.predict(X_perm) >= 0.5).astype(int)
+                    drops[r] = baseline_acc - accuracy_score(y, pred)
+                out[name] = float(drops.mean())
+            return out
+        except Exception as exc:  # noqa: BLE001 — selection-side helper
+            _log.warning(
+                "permutation_importance failed (non-fatal): {e}", e=exc,
+            )
+            return {}
+
+    # ------------------------------------------------------------------
     # Signal generation
     # ------------------------------------------------------------------
 
@@ -739,7 +808,9 @@ class LGBMTrainer:
                         mlflow.log_metric(f"{ds_name}_{metric_name}", value)
 
                 # Feature importance (top 10)
-                importance = booster.feature_importance(importance_type="gain")
+                importance = booster.feature_importance(
+                    importance_type=self.IMPORTANCE_TYPE,
+                )
                 if len(importance) > 0:
                     feat_imp = sorted(
                         zip(feature_names, importance),
