@@ -16,6 +16,7 @@ from typing import Any
 import psutil
 from telegram import Update
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -132,11 +133,23 @@ class TelegramBot:
 
     def build(self) -> Application:
         """Build the PTB Application with all handlers."""
-        self._app = (
-            Application.builder()
-            .token(self._token)
-            .build()
-        )
+        # H24: AIORateLimiter throttles outgoing messages so a 100+
+        # subscriber broadcast doesn't trip Telegram's flood control
+        # and drop signal notifications. Requires the
+        # ``python-telegram-bot[rate-limiter]`` extra; if it's missing
+        # at runtime, fall back to the unrate-limited builder rather
+        # than crash on startup.
+        builder = Application.builder().token(self._token)
+        try:
+            builder = builder.rate_limiter(AIORateLimiter())
+        except RuntimeError as exc:
+            _log.warning(
+                "AIORateLimiter unavailable — broadcast traffic will "
+                "not be throttled. Install with `pip install "
+                "'python-telegram-bot[rate-limiter]'`. Detail: {e}",
+                e=exc,
+            )
+        self._app = builder.build()
 
         # Store DB and prices in bot_data
         self._app.bot_data["db"] = self._db
@@ -313,6 +326,26 @@ class TelegramBot:
             if "not modified" not in str(exc).lower():
                 _log.warning("callback edit failed: {e}", e=str(exc))
 
+    # H25: callback prefixes that map to owner-only actions. The
+    # command-level handlers carry ``@require_role("owner")``, but the
+    # inline-keyboard path bypassed every role check — an owner who
+    # forwarded a /health card into a group would let any member press
+    # the restart / logs / users buttons. Gate them here in one place.
+    _OWNER_CALLBACK_PREFIXES: tuple[str, ...] = (
+        "health_refresh",
+        "health_logs_",
+        "health_restart",
+        "users_page_",
+        "stats_period_",
+    )
+
+    @classmethod
+    def _is_owner_callback(cls, data: str) -> bool:
+        return any(
+            data == p or data.startswith(p)
+            for p in cls._OWNER_CALLBACK_PREFIXES
+        )
+
     async def _handle_callback(
         self,
         update: Update,
@@ -326,6 +359,30 @@ class TelegramBot:
 
         data = query.data or ""
         prices = context.bot_data.get("prices", {})
+
+        # H25: enforce owner role for sensitive inline actions.
+        if self._is_owner_callback(data):
+            user = update.effective_user
+            user_id = user.id if user is not None else 0
+            role: str | None = None
+            if user_id:
+                try:
+                    rec = self._db.get_user(user_id)
+                    if rec is not None:
+                        role = rec.get("role")
+                except Exception as exc:
+                    _log.warning(
+                        "owner-callback role lookup failed: %s", exc,
+                    )
+            # Owner ID fallback so a misconfigured DB cannot lock the
+            # owner out of their own bot.
+            if role != "owner" and (
+                OWNER_ID is None or user_id != OWNER_ID
+            ):
+                await query.answer(
+                    "🚫 Недостаточно прав", show_alert=True,
+                )
+                return
 
         # ── Payment callbacks (legacy pay_ prefix) ──
         if data == "pay_stars_30" or data == "buy_stars_30":

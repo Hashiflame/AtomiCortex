@@ -154,7 +154,7 @@ pytest-asyncio==0.23.7
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 python-json-logger==4.1.0
-python-telegram-bot==21.3
+python-telegram-bot[rate-limiter]==21.3
 pytz==2026.1.post1
 PyYAML==6.0.3
 pyzmq==27.1.0
