@@ -237,6 +237,10 @@ class PositionReconciler:
         """Fetch position risk from Binance REST API."""
         import aiohttp
 
+        from src.execution.binance_rate_limiter import BinanceRateLimiter
+        limiter = BinanceRateLimiter.instance()
+        await limiter.acquire(5)  # positionRisk weight = 5
+
         params: dict[str, str] = {}
         params["timestamp"] = str(int(time.time() * 1000))
         params["recvWindow"] = "5000"
@@ -257,6 +261,7 @@ class PositionReconciler:
                     url, params=params, headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
+                    limiter.update_from_headers(getattr(resp, "headers", None))
                     if resp.status != 200:
                         body = await resp.text()
                         _log.error(

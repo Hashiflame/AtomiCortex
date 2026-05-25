@@ -583,6 +583,21 @@ class Watchdog:
         )
         return True
 
+    @staticmethod
+    def _binance_weight_for(path: str) -> int:
+        """Approximate weight per endpoint (Binance Futures docs).
+
+        Token bucket coordinates several callers; the X-MBX-USED-WEIGHT
+        header corrects any per-call misestimate after the fact.
+        """
+        if path.endswith("/positionRisk"):
+            return 5
+        if path.endswith("/allOpenOrders"):
+            return 1
+        if path.endswith("/order"):
+            return 1
+        return 1
+
     async def _signed_get(
         self,
         session: Any,
@@ -592,6 +607,10 @@ class Watchdog:
         """Signed GET request to Binance."""
         import aiohttp
 
+        from src.execution.binance_rate_limiter import BinanceRateLimiter
+        limiter = BinanceRateLimiter.instance()
+        await limiter.acquire(self._binance_weight_for(path))
+
         params = extra_params or {}
         params = self._sign_params(params)
         url = self._base_url + path
@@ -600,6 +619,7 @@ class Watchdog:
                 url, params=params, headers=self._auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                limiter.update_from_headers(getattr(resp, "headers", None))
                 data = await resp.json()
                 if resp.status != 200:
                     _log.error(
@@ -621,6 +641,10 @@ class Watchdog:
         """Signed POST request to Binance."""
         import aiohttp
 
+        from src.execution.binance_rate_limiter import BinanceRateLimiter
+        limiter = BinanceRateLimiter.instance()
+        await limiter.acquire(self._binance_weight_for(path))
+
         params = self._sign_params(params)
         url = self._base_url + path
         try:
@@ -628,6 +652,7 @@ class Watchdog:
                 url, data=params, headers=self._auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                limiter.update_from_headers(getattr(resp, "headers", None))
                 data = await resp.json()
                 if resp.status != 200:
                     _log.error(
@@ -649,6 +674,10 @@ class Watchdog:
         """Signed DELETE request to Binance."""
         import aiohttp
 
+        from src.execution.binance_rate_limiter import BinanceRateLimiter
+        limiter = BinanceRateLimiter.instance()
+        await limiter.acquire(self._binance_weight_for(path))
+
         params = self._sign_params(params)
         url = self._base_url + path
         try:
@@ -656,6 +685,7 @@ class Watchdog:
                 url, params=params, headers=self._auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                limiter.update_from_headers(getattr(resp, "headers", None))
                 data = await resp.json()
                 if resp.status != 200:
                     _log.error(
