@@ -17,7 +17,7 @@ try:
 except ImportError:
     import pysqlite3 as sqlite3  # type: ignore[no-redef]
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.logger import get_logger
 from src.telegram_bot.broadcaster import Broadcaster
@@ -48,6 +48,9 @@ class SignalPoller:
         poll_interval: int = 30,
         *,
         db_paths: list[str] | None = None,
+        discover_callback: Callable[[], list[str]] | None = None,
+        discover_every_cycles: int = 10,
+        recovery_minutes: int = 30,
     ) -> None:
         # Normalise to a list of unique paths
         paths: list[str] = []
@@ -79,6 +82,20 @@ class SignalPoller:
         self._broadcasted_close_ids: dict[str, set[int]] = {
             p: set() for p in paths
         }
+
+        # M1: optional callback that re-discovers trading DB paths each
+        # cycle. Allows a 15m / 1H bot started AFTER the Telegram bot to
+        # appear without restart. None → static path list (legacy).
+        self._discover_callback = discover_callback
+        self._discover_every_cycles = max(1, int(discover_every_cycles))
+        self._cycle_count: int = 0
+
+        # M3: how far back to re-broadcast OPENs after restart.
+        # Closed signals are still deduped via _broadcasted_close_ids
+        # seed (no spammy re-announcements), but ENTRY signals written
+        # in the recovery window before startup are emitted on the
+        # first poll. Set to 0 to keep legacy "skip all prior" behaviour.
+        self._recovery_minutes = max(0, int(recovery_minutes))
 
         # Cached metrics for /health and /stats commands
         self._cached_metrics: dict[str, Any] = {}
@@ -154,82 +171,164 @@ class SignalPoller:
     # ------------------------------------------------------------------
 
     def _init_high_water_marks(self) -> None:
-        """Set per-DB last_signal_id and last_event_id to current max."""
+        """Set per-DB last_signal_id and last_event_id.
+
+        M3: instead of jumping to MAX(id), step back to the highest id
+        whose ``created_at`` is OLDER than the recovery window so any
+        ENTRY signal written in the last ``recovery_minutes`` before
+        startup gets emitted on the first poll. Closed signals stay
+        deduped via the broadcasted-close set (seed includes the full
+        history), so no spammy re-announcements.
+        """
         for db_path in self._db_paths:
+            self._init_marks_for_db(db_path)
+
+    def _init_marks_for_db(self, db_path: str) -> None:
+        try:
+            conn = self._connect(db_path)
             try:
-                conn = self._connect(db_path)
-                try:
+                if self._recovery_minutes > 0:
+                    # Highest id strictly OLDER than the recovery window.
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM signals_log "
+                        "WHERE created_at IS NOT NULL "
+                        "AND datetime(created_at) <= "
+                        "datetime('now', ?)",
+                        (f"-{self._recovery_minutes} minutes",),
+                    ).fetchone()
+                else:
                     row = conn.execute(
                         "SELECT COALESCE(MAX(id), 0) FROM signals_log"
                     ).fetchone()
-                    self._last_signal_ids[db_path] = row[0] if row else 0
+                self._last_signal_ids[db_path] = row[0] if row else 0
 
-                    row = conn.execute(
-                        "SELECT COALESCE(MAX(id), 0) FROM bot_events"
-                    ).fetchone()
-                    self._last_event_ids[db_path] = row[0] if row else 0
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM bot_events"
+                ).fetchone()
+                self._last_event_ids[db_path] = row[0] if row else 0
 
-                    # Seed the broadcasted-close set with every signal
-                    # that is already closed at startup — they were
-                    # either announced in a prior session or are stale,
-                    # and must never be re-announced after a restart.
-                    closed = conn.execute(
-                        "SELECT id FROM signals_log "
-                        "WHERE result IN ('win','loss','breakeven') "
-                        "AND closed_at IS NOT NULL"
-                    ).fetchall()
-                    self._broadcasted_close_ids[db_path] = {
-                        int(r[0]) for r in closed
-                    }
+                # Seed the broadcasted-close set with every signal
+                # that is already closed at startup — they were
+                # either announced in a prior session or are stale,
+                # and must never be re-announced after a restart.
+                closed = conn.execute(
+                    "SELECT id FROM signals_log "
+                    "WHERE result IN ('win','loss','breakeven') "
+                    "AND closed_at IS NOT NULL"
+                ).fetchall()
+                self._broadcasted_close_ids[db_path] = {
+                    int(r[0]) for r in closed
+                }
 
-                    _log.info(
-                        "High-water marks | db={db} signal_id={s} "
-                        "event_id={e} closed_seeded={c}",
-                        db=db_path,
-                        s=self._last_signal_ids[db_path],
-                        e=self._last_event_ids[db_path],
-                        c=len(self._broadcasted_close_ids[db_path]),
-                    )
-                finally:
-                    conn.close()
-            except Exception as exc:
-                _log.error(
-                    "Failed to init high-water marks for {db}: {err}",
-                    db=db_path, err=str(exc),
+                _log.info(
+                    "High-water marks | db={db} signal_id={s} "
+                    "event_id={e} closed_seeded={c} recovery_min={r}",
+                    db=db_path,
+                    s=self._last_signal_ids[db_path],
+                    e=self._last_event_ids[db_path],
+                    c=len(self._broadcasted_close_ids[db_path]),
+                    r=self._recovery_minutes,
                 )
+            finally:
+                conn.close()
+        except Exception as exc:
+            _log.error(
+                "Failed to init high-water marks for {db}: {err}",
+                db=db_path, err=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # Poll loop
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
-        """Main polling loop — polls all DBs each cycle."""
+        """Main polling loop.
+
+        M1: re-discover DB paths every ``_discover_every_cycles`` to
+        pick up isolated trading bots started after this poller.
+        M2: fan out per-DB polls with ``asyncio.gather`` so a slow DB
+        cannot block the others (worst case N×poll_interval drift).
+        """
         while self._running:
-            for db_path in self._db_paths:
-                try:
-                    await self._check_new_signals(db_path)
-                    await self._check_new_events(db_path)
-                    await self._update_cached_metrics(db_path)
-                except Exception as exc:
-                    _log.error(
-                        "Poll cycle error for {db}: {err}",
-                        db=db_path, err=str(exc),
-                    )
+            self._cycle_count += 1
+            if (
+                self._discover_callback is not None
+                and self._cycle_count % self._discover_every_cycles == 0
+            ):
+                self._refresh_db_paths()
+
+            await asyncio.gather(
+                *(self._poll_one(p) for p in list(self._db_paths)),
+                return_exceptions=True,
+            )
 
             await asyncio.sleep(self._poll_interval)
+
+    async def _poll_one(self, db_path: str) -> None:
+        """Per-DB poll bundle. Failures are isolated to this DB."""
+        try:
+            await self._check_new_signals(db_path)
+            await self._check_new_events(db_path)
+            await self._update_cached_metrics(db_path)
+        except Exception as exc:
+            _log.error(
+                "Poll cycle error for {db}: {err}",
+                db=db_path, err=str(exc),
+            )
+
+    def _refresh_db_paths(self) -> None:
+        """Re-run the discovery callback and onboard any new DB paths.
+
+        New paths get their own high-water marks + close-set seeded
+        from the current DB state, so we don't dump every historic
+        signal of a freshly-discovered 15m bot.
+        """
+        if self._discover_callback is None:
+            return
+        try:
+            discovered = [str(p) for p in self._discover_callback()]
+        except Exception as exc:
+            _log.warning(
+                "DB discovery callback failed (non-fatal): {e}", e=exc,
+            )
+            return
+        for path in discovered:
+            if path in self._db_paths:
+                continue
+            _log.info("Discovered new trading DB: {p}", p=path)
+            self._db_paths.append(path)
+            # Initialise high-water marks for the new DB — without
+            # recovery window so the existing backlog is NOT replayed
+            # (it belongs to the strategy that just connected, not us).
+            self._last_signal_ids[path] = 0
+            self._last_event_ids[path] = 0
+            self._broadcasted_close_ids[path] = set()
+            saved_recovery = self._recovery_minutes
+            try:
+                self._recovery_minutes = 0
+                self._init_marks_for_db(path)
+            finally:
+                self._recovery_minutes = saved_recovery
 
     # ------------------------------------------------------------------
     # Check new signals
     # ------------------------------------------------------------------
 
     async def _check_new_signals(self, db_path: str) -> None:
-        """Find signals with id > last_signal_id and broadcast them."""
+        """Find signals with id > last_signal_id and broadcast them.
+
+        M4: drop the ``result='open'`` filter. A signal that opens and
+        closes between two poll cycles (real on 15m with a fast SL hit)
+        used to be skipped entirely as ENTRY because by the time we
+        polled the row's result was already 'win'/'loss'. The close is
+        still announced separately via ``_check_closed_signals``.
+        """
         try:
             conn = self._connect(db_path)
             try:
                 rows = conn.execute(
                     "SELECT * FROM signals_log "
-                    "WHERE id > ? AND result = 'open' "
+                    "WHERE id > ? "
                     "ORDER BY id ASC",
                     (self._last_signal_ids[db_path],),
                 ).fetchall()

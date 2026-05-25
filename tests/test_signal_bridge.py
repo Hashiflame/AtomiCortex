@@ -272,7 +272,13 @@ class TestSignalPollerNewSignals:
         self, shared_bridge, db_path, mock_broadcaster,
     ) -> None:
         """Poller detects new signals and calls broadcast_signal."""
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         # Write a signal AFTER initialising marks
@@ -290,7 +296,13 @@ class TestSignalPollerNewSignals:
         self, shared_bridge, db_path, mock_broadcaster,
     ) -> None:
         """Same signal is NOT broadcast twice."""
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         shared_bridge.log_signal("ETH", "short", 3000, 3100, 2900, 0.6, "high_vol")
@@ -312,7 +324,13 @@ class TestSignalPollerNewEvents:
         self, shared_bridge, db_path, mock_broadcaster,
     ) -> None:
         """Poller parses regime_change event and calls broadcast_regime_change."""
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         shared_bridge.log_regime_change("trend", "high_vol")
@@ -328,7 +346,13 @@ class TestSignalPollerNewEvents:
         self, shared_bridge, db_path, mock_broadcaster,
     ) -> None:
         """Poller parses circuit_breaker event and calls broadcast."""
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         shared_bridge.log_circuit_breaker("Max drawdown")
@@ -350,7 +374,13 @@ class TestSignalPollerMetrics:
         self, shared_bridge, db_path, mock_broadcaster,
     ) -> None:
         """Poller reads bot_metrics and caches them."""
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
 
         shared_bridge.update_metrics(
             equity=12_000, daily_pnl=0.015,
@@ -420,7 +450,13 @@ class TestSignalPollerHighWaterMarks:
         shared_bridge.log_signal("BTC", "long", 100, 90, 110, 0.7, "trend")
         shared_bridge.log_signal("ETH", "short", 3000, 3100, 2900, 0.6, "high_vol")
 
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         await poller._check_new_signals(db_path)
@@ -435,7 +471,13 @@ class TestSignalPollerHighWaterMarks:
         """Only signals written after init are broadcast."""
         shared_bridge.log_signal("BTC", "long", 100, 90, 110, 0.7, "trend")
 
-        poller = SignalPoller(db_path, mock_broadcaster, poll_interval=1)
+        # M3: tests cover the high-water-mark invariant only; opt out
+        # of the 30-min recovery replay so freshly-inserted rows above
+        # don't count as "recent" and get re-broadcast.
+        poller = SignalPoller(
+            db_path, mock_broadcaster, poll_interval=1,
+            recovery_minutes=0,
+        )
         poller._init_high_water_marks()
 
         # This one is new

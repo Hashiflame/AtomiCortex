@@ -303,11 +303,24 @@ def history_keyboard(
     return InlineKeyboardMarkup([nav, tf_row, res_row])
 
 
-def signal_detail_keyboard(signal_id: int) -> InlineKeyboardMarkup:
-    """Actions shown under an individual signal card."""
+def signal_detail_keyboard(
+    signal_id: int, timeframe: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Actions shown under an individual signal card.
+
+    M5: when ``timeframe`` is given, the detail callback carries the
+    composite key ``signal_detail:<tf>:<id>`` so id-collisions between
+    isolated 4H / 15m / 1H DBs cannot point the detail view at the
+    wrong row. Callback parser falls back to the legacy
+    ``signal_detail:<id>`` form when ``timeframe`` is omitted.
+    """
+    detail_cb = (
+        f"signal_detail:{timeframe}:{signal_id}"
+        if timeframe
+        else f"signal_detail:{signal_id}"
+    )
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Обновить", callback_data="signal_refresh"),
-        InlineKeyboardButton(
-            "📋 Детали", callback_data=f"signal_detail:{signal_id}"),
+        InlineKeyboardButton("📋 Детали", callback_data=detail_cb),
         InlineKeyboardButton("🔙 Назад", callback_data="signals_back"),
     ]])

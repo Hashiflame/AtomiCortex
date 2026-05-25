@@ -461,20 +461,30 @@ class TelegramBot:
             await self._safe_edit(query, text, kb)
 
         elif data.startswith("signal_detail:"):
+            # M5: accept both "signal_detail:<tf>:<id>" (composite key)
+            # and the legacy "signal_detail:<id>" form.
+            parts = data.split(":")
+            tf: str | None = None
             try:
-                sid = int(data.split(":", 1)[1])
-            except ValueError:
+                if len(parts) >= 3:
+                    tf = parts[1] or None
+                    sid = int(parts[2])
+                else:
+                    sid = int(parts[1])
+            except (ValueError, IndexError):
                 return
-            sig = find_signal_by_id(context, sid)
+            sig = find_signal_by_id(context, sid, timeframe=tf)
             if sig is None:
                 await self._safe_edit(
                     query, "📭 Сигнал не найден.",
-                    signal_detail_keyboard(sid),
+                    signal_detail_keyboard(sid, timeframe=tf),
                 )
             else:
                 await self._safe_edit(
                     query, format_signal_card(sig, mode="full"),
-                    signal_detail_keyboard(sid),
+                    signal_detail_keyboard(
+                        sid, timeframe=sig.get("timeframe") or tf,
+                    ),
                 )
 
         elif data.startswith("history_page:"):
@@ -684,6 +694,15 @@ class TelegramBot:
                     db_paths=db_paths,
                     broadcaster=broadcaster,
                     poll_interval=30,
+                    # M1: re-discover DB paths every 10 cycles so a
+                    # 15m / 1H bot started after this Telegram bot
+                    # appears without a restart.
+                    discover_callback=bot_ref._get_shared_db_paths,
+                    discover_every_cycles=10,
+                    # M3: re-broadcast ENTRY signals written in the
+                    # last 30 minutes before startup (closes stay
+                    # deduped via the seeded close-set).
+                    recovery_minutes=30,
                 )
                 bot_ref._signal_poller = poller
                 await poller.start()

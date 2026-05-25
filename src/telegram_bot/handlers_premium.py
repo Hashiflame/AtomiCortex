@@ -149,20 +149,27 @@ def render_history_view(
 
 
 def find_signal_by_id(
-    context: ContextTypes.DEFAULT_TYPE, sid: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    sid: int,
+    timeframe: str | None = None,
 ) -> dict | None:
     """Locate a signal by id across the merged trading DBs.
 
-    Note: ``id`` is per-DB autoincrement, so a 4H id can collide with a
-    15m id. First match (newest-first order) wins — acceptable for the
-    detail view; a globally-unique id is a future improvement.
+    M5: ``id`` is per-DB autoincrement so a 4H id=42 and a 15m id=42
+    are different rows. When ``timeframe`` is supplied the search is
+    scoped to rows whose ``timeframe`` matches — the composite
+    ``(timeframe, id)`` is the only globally-unique key without a
+    schema change. ``timeframe=None`` keeps legacy first-match
+    behaviour for backward compat with older callback_data strings.
     """
     for s in _collect_recent(context, limit=10_000):
         try:
-            if int(s.get("id", -1)) == int(sid):
-                return s
+            if int(s.get("id", -1)) != int(sid):
+                continue
         except (TypeError, ValueError):
             continue
+        if timeframe is None or s.get("timeframe") == timeframe:
+            return s
     return None
 
 
