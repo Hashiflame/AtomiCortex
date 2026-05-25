@@ -17,7 +17,17 @@ import pytest
 from src.risk.portfolio_tracker import PortfolioTracker
 
 
-T0 = datetime(2026, 5, 24, 12, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _new_at(t0: datetime, equity: float = 10_000.0):
+    """Build a tracker whose internal day boundary is anchored at *t0*'s
+    UTC midnight — independent of the wall clock so rollover assertions
+    don't depend on whether the test runs today or tomorrow."""
+    pt = PortfolioTracker(initial_equity=equity)
+    pt._day_start = t0.replace(hour=0, minute=0, second=0, microsecond=0)
+    pt._week_start = pt._day_start - timedelta(days=pt._day_start.weekday())
+    return pt
 
 
 def _new(equity=10_000.0):
@@ -110,7 +120,7 @@ class TestDailyPnlDenominator:
         assert pt._day_start_equity == 10_000.0
 
     def test_day_rollover_freezes_new_day_start_equity(self):
-        pt = _new(10_000)
+        pt = _new_at(T0, 10_000)
         # Close a winning trade → cash up to ~11_000
         _open_long(pt, qty=1.0, price=50_000.0, fee=10.0, ts=T0)
         pt.close_position("BTCUSDT", close_price=51_000.0, fee=10.0,
@@ -126,7 +136,7 @@ class TestDailyPnlDenominator:
     def test_daily_pnl_pct_uses_day_start_equity(self):
         """After equity grew to 11k, a +330 daily realised PnL = 3% of 11k
         (not 3.3% of the original 10k deposit)."""
-        pt = _new(10_000)
+        pt = _new_at(T0, 10_000)
         # Day 1: realise +1000 to push equity to ~11k
         _open_long(pt, qty=1.0, price=50_000.0, fee=0.0, ts=T0)
         pt.close_position("BTCUSDT", 51_000.0, fee=0.0, timestamp=T0)

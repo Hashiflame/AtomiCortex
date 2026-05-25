@@ -41,6 +41,16 @@ class BacktestConfig:
     fee_config: FeeConfig = field(default_factory=FeeConfig)
     avg_daily_volume_usdt: float = 30_000_000_000.0  # $30B default for BTC
     realized_volatility: float = 0.60  # 60% annualised
+    # H19: realistic BTC perpetual funding ~0.03% per 8h. Pre-H19 the
+    # hard-coded 0.0001 (0.01%) under-counted funding cost 3-10×.
+    # Override per-run via this knob; loader below pulls the real rate
+    # from parquet when available and falls back to this value otherwise.
+    typical_funding_rate: float = 0.0003
+    # H18: backtest used to bill funding for every hour of the window
+    # whether or not the bot held a position. We now bill only
+    # ``num_round_trips * avg_holding_hours``. Default 24h ≈ 6 bars on 4H
+    # — adjust for faster/slower strategies.
+    avg_holding_hours: float = 24.0
 
 
 @dataclass
@@ -264,7 +274,64 @@ def _avg_price(bars: list) -> float:
     return (bars[0].open.as_double() + bars[-1].close.as_double()) / 2
 
 
-_TYPICAL_FUNDING_RATE = 0.0001  # 0.01% per 8h — typical BTC perpetual
+# H19: kept as a module-level alias so any external imports of the
+# legacy name keep working; the real default lives on BacktestConfig
+# (``typical_funding_rate``) so individual runs can override.
+_TYPICAL_FUNDING_RATE = 0.0003
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Strip venue / -PERP suffix the same way the watchdog does so
+    parquet lookups match Binance's canonical name (e.g. BTCUSDT)."""
+    s = symbol.upper()
+    if "-" in s:
+        s = s.split("-", 1)[0]
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return s
+
+
+def _load_actual_funding_rate(cfg: BacktestConfig) -> float | None:
+    """Return mean |fundingRate| over [cfg.start, cfg.end] from parquet.
+
+    H19: when the user has the funding_rate parquet already on disk,
+    the backtest should use *real* funding numbers rather than a global
+    constant. Fail-soft on every failure path — returns ``None`` so the
+    caller falls back to ``cfg.typical_funding_rate``.
+    """
+    try:
+        import polars as pl
+
+        sym = _normalize_symbol(cfg.symbol)
+        base = (
+            Path(cfg.data_dir)
+            / "exchange=BINANCE_UM"
+            / f"symbol={sym}"
+            / "funding_rate"
+        )
+        if not base.exists():
+            return None
+        files = sorted(str(p) for p in base.rglob("*.parquet"))
+        if not files:
+            return None
+        start_ms = int(cfg.start.timestamp() * 1000)
+        end_ms = int(cfg.end.timestamp() * 1000)
+        df = pl.read_parquet(files)
+        if "fundingTime" not in df.columns or "fundingRate" not in df.columns:
+            return None
+        window = df.filter(
+            (pl.col("fundingTime") >= start_ms)
+            & (pl.col("fundingTime") <= end_ms)
+        )
+        if window.is_empty():
+            return None
+        rates = window["fundingRate"].cast(pl.Float64).abs()
+        rates = rates.drop_nulls().drop_nans()
+        if rates.is_empty():
+            return None
+        return float(rates.mean())
+    except Exception:
+        return None
 
 
 def _estimate_costs(
@@ -292,11 +359,21 @@ def _estimate_costs(
     total_fees = num_rt * fee_per_rt
     total_slippage = num_rt * slippage_per_rt
 
-    total_hours = (cfg.end - cfg.start).total_seconds() / 3600
+    # H19: prefer real funding from parquet, fall back to the config
+    # default (no more silent 0.0001 hard-code).
+    funding_rate = _load_actual_funding_rate(cfg)
+    if funding_rate is None:
+        funding_rate = cfg.typical_funding_rate
+
+    # H18: bill only for time actually spent in a position — not the
+    # full backtest window. Approximation = num_rt × avg_holding_hours
+    # (configurable per-run on BacktestConfig).
+    position_hours = num_rt * cfg.avg_holding_hours
+
     total_funding = cm.calculate_funding_cost(
         position_size=avg_notional,
-        funding_rate=_TYPICAL_FUNDING_RATE,
-        hours_held=total_hours,
+        funding_rate=funding_rate,
+        hours_held=position_hours,
         is_long=True,
     )
     return total_fees, total_slippage, total_funding
