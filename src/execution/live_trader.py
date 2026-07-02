@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
+import src.patches.nautilus_enums  # Hotfix for TRADING_HALT
+
 if TYPE_CHECKING:
     from nautilus_trader.trading.strategy import Strategy
 

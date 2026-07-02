@@ -29,6 +29,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import src.patches.nautilus_enums  # Hotfix for TRADING_HALT
+
 from src.config import get_settings
 from src.execution.live_trader import LiveTrader, LiveTraderConfig
 from src.logger import setup_logging, get_logger
