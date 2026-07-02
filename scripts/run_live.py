@@ -162,6 +162,12 @@ def main() -> None:
     except Exception as exc:
         log.error(f"Fatal error: {exc}", exc_info=True)
 
+    if trader.startup_failed:
+        log.critical(
+            "Engines failed to connect — exiting for systemd restart"
+        )
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

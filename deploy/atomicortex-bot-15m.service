@@ -5,6 +5,8 @@ After=network-online.target redis.service
 Wants=network-online.target
 # Deliberately NOT After/Requires atomicortex-bot.service — full isolation
 # from the 4H bot. Either bot can restart without affecting the other.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -26,8 +28,6 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
 # Restart policy
 Restart=on-failure
 RestartSec=30
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Security hardening (same profile as the 4H bot)
 NoNewPrivileges=true

@@ -35,6 +35,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import TraderId
 
 from src.config import get_settings
+from src.execution.startup_check import EngineConnectionChecker
 from src.execution.strategies.ml_strategy import MLStrategyConfig, MLTradingStrategy
 from src.logger import get_logger, setup_logging
 
@@ -76,6 +77,10 @@ class LiveTraderConfig:
     models_dir: str = "./data/features/models"
     features_dir: str = "./data/features/ml_features"
 
+    # Fail-fast grace period (seconds).  None → read from Settings
+    # (patten H12, same as confidence_threshold).
+    startup_grace_sec: float | None = None
+
     # Strategy injection hook (Phase 5 — multi-timeframe isolation).
     #
     # When None (default) ``build_node`` builds the 4H ``MLStrategyConfig``
@@ -104,6 +109,7 @@ class LiveTrader:
     def __init__(self, config: LiveTraderConfig) -> None:
         self._config = config
         self._node: TradingNode | None = None
+        self._startup_checker: EngineConnectionChecker | None = None
         _log.info(
             f"LiveTrader created | mode={config.trading_mode} | "
             f"symbols={config.symbols} | dry_run={config.dry_run}"
@@ -112,6 +118,13 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def startup_failed(self) -> bool:
+        """Whether the post-startup engine check detected a failure."""
+        if self._startup_checker is None:
+            return False
+        return self._startup_checker.engines_failed
 
     def build_node(self) -> TradingNode:
         """
@@ -257,6 +270,10 @@ class LiveTrader:
         if self._node is None:
             self.build_node()
 
+        # Fail-fast: daemon thread checks engine connectivity after
+        # grace period and sends SIGTERM if engines are disconnected.
+        self._start_connection_checker()
+
         _log.info("Starting TradingNode...")
         try:
             self._node.run()
@@ -285,6 +302,51 @@ class LiveTrader:
                 self._node.stop()
             except Exception as exc:
                 _log.warning(f"Error requesting stop: {exc}")
+
+    def _start_connection_checker(self) -> None:
+        """Create and start the engine connection checker (best-effort).
+
+        If checker creation fails for any reason, log a warning and
+        continue — degraded monitoring is better than blocking startup.
+        """
+        try:
+            settings = get_settings()
+            cfg = self._config
+
+            grace = (
+                cfg.startup_grace_sec
+                if cfg.startup_grace_sec is not None
+                else settings.startup_grace_sec
+            )
+
+            reporter = None
+            if settings.telegram_bot_token and settings.telegram_admin_id:
+                from src.monitoring.telegram_reporter import TelegramReporter
+                reporter = TelegramReporter(
+                    bot_token=settings.telegram_bot_token,
+                    admin_id=settings.telegram_admin_id,
+                )
+            else:
+                _log.debug(
+                    "Telegram not configured — startup checker will "
+                    "skip alert on failure"
+                )
+
+            self._startup_checker = EngineConnectionChecker(
+                node=self._node,
+                grace_sec=grace,
+                reporter=reporter,
+            )
+            self._startup_checker.start()
+            _log.info(
+                "Engine connection checker started | grace={g}s",
+                g=grace,
+            )
+        except Exception as exc:
+            _log.warning(
+                "Failed to start engine connection checker (non-fatal): {err}",
+                err=str(exc),
+            )
 
     def _dispose(self) -> None:
         """Dispose of the node after the event loop has stopped.

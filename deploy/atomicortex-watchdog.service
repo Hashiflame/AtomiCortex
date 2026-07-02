@@ -3,6 +3,8 @@ Description=AtomiCortex External Watchdog
 Documentation=https://github.com/Hashiflame/AtomiCortex
 After=network-online.target redis.service
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -22,8 +24,6 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
 # Restart policy — always restart (watchdog must be running)
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 # Security hardening
 NoNewPrivileges=true

@@ -111,13 +111,15 @@ def main() -> None:
 
     def _sig(_signum: int, _frame: object) -> None:
         nonlocal _stop
-        if not _stop:
-            _stop = True
-            log.info("SIGINT — shutting down 15m paper bot...")
-        else:
+        if _stop:
+            log.warning("Force exit (second signal)")
             sys.exit(1)
+        _stop = True
+        log.info("Signal received — shutting down 15m paper bot...")
+        trader.stop()
 
     signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
 
     print(
         f"\n{'═' * 45}\n"
@@ -138,6 +140,12 @@ def main() -> None:
         log.info("KeyboardInterrupt — stopping 15m paper bot")
     except Exception as exc:
         log.error(f"15m paper bot error: {exc}")
+
+    if trader.startup_failed:
+        log.critical(
+            "Engines failed to connect — exiting for systemd restart"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
