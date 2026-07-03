@@ -40,6 +40,11 @@ def resolve_trading_mode(raw: str) -> str:
     cleaned = (raw or "").strip().lower()
     if cleaned in ("live", "testnet"):
         return cleaned
+    if cleaned == "paper":
+        get_logger("run_reconciler").info(
+            "trading_mode 'paper' mapped to 'testnet' price source (paper bots trade on testnet feed)"
+        )
+        return "testnet"
     if cleaned:
         get_logger("run_reconciler").warning(
             f"Invalid trading mode {raw!r}, falling back to 'testnet'"
@@ -55,7 +60,7 @@ def get_parser() -> argparse.ArgumentParser:
     ap.add_argument("--offline", action="store_true",
                     help="Use only local DataStore (no Binance calls)")
     ap.add_argument("--trading-mode", default="testnet",
-                    choices=["live", "testnet"])
+                    choices=["live", "testnet", "paper"])
     ap.add_argument("--data-dir", default="data/features")
     ap.add_argument("--log-level", default="INFO")
     return ap

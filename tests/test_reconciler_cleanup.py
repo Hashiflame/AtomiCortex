@@ -32,3 +32,12 @@ def test_reconciler_service_no_hardcoded_live():
     env_testnet_idx = next(i for i, line in enumerate(lines) if "Environment=TRADING_MODE=testnet" in line)
     env_file_idx = next(i for i, line in enumerate(lines) if line.startswith("EnvironmentFile="))
     assert env_testnet_idx < env_file_idx
+
+def test_paper_mode_maps_to_testnet():
+    from scripts.run_reconciler import resolve_trading_mode
+    assert resolve_trading_mode("paper") == "testnet"
+
+def test_argparse_accepts_paper():
+    from scripts.run_reconciler import get_parser
+    args = get_parser().parse_args(["--trading-mode", "paper"])
+    assert args.trading_mode == "paper"
