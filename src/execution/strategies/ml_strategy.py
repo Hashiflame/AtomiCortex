@@ -190,11 +190,6 @@ class MLTradingStrategy(Strategy):
         # on_start; stays None in unit tests that never call on_start.
         self._breaker: Any = None
 
-        # Position reconciler — detects orphan positions on the exchange
-        # (entry filled but bot crashed before SL) and ghosts in tracker
-        # state. Report-only (log.critical); operator decides remediation.
-        self._reconciler: Any = None
-
         # Crash-safe mirror of _pending_sl_params. Stays None if the store
         # can't be created; the bot then runs with in-memory only (a
         # degraded but non-fatal mode — same behaviour as before this fix).
@@ -401,12 +396,7 @@ class MLTradingStrategy(Strategy):
         # key and emergency-closes positions if the bot stops writing.
         self._start_heartbeat()
 
-        # 13. Position reconciler — detects orphan / ghost / mismatched
-        # positions between tracker state and the exchange. Runs once at
-        # start (catches leftovers from a previous crash) then every 15 min.
-        self._schedule_reconciliation()
-
-        # 14. Pending-SL crash-safe store. Restore any entries from a
+        # 13. Pending-SL crash-safe store. Restore any entries from a
         # prior run so that fills arriving after restart still trigger
         # SL placement instead of being mis-classified as exits.
         self._init_pending_store()
@@ -487,116 +477,6 @@ class MLTradingStrategy(Strategy):
             self._heartbeat = None
 
     # ------------------------------------------------------------------
-    # Position reconciliation (orphan / ghost detection; report-only)
-    # ------------------------------------------------------------------
-
-    def _schedule_reconciliation(self) -> None:
-        """Create the reconciler + immediate run + 15-min recurring timer.
-
-        Fail-soft: any failure here logs a warning and leaves the bot
-        running without reconciliation (a degraded but non-fatal state).
-        """
-        try:
-            from datetime import timedelta as _td
-
-            from src.config import get_settings
-            from src.execution.reconciler import PositionReconciler
-
-            settings = get_settings()
-            self._reconciler = PositionReconciler(
-                binance_api_key=settings.binance_api_key,
-                binance_api_secret=settings.binance_api_secret,
-                trading_mode=self._config.trading_mode,
-                auto_fix=False,  # report-only: operator decides remediation
-            )
-
-            # Immediate run — main reason the reconciler exists at startup:
-            # catch positions left open on the exchange after a prior crash.
-            self._run_reconciliation()
-
-            # Recurring run — every 15 min, matches reconciler_signals cadence.
-            try:
-                self.clock.set_timer(
-                    name="position_reconcile",
-                    interval=_td(minutes=15),
-                    callback=lambda _ev: self._run_reconciliation(),
-                )
-                self.log.info("Position reconciler scheduled (every 15 min)")
-            except Exception as exc:
-                self.log.warning(
-                    f"Reconciler timer failed (non-fatal): {exc}"
-                )
-        except Exception as exc:
-            self.log.warning(f"Reconciler init failed (non-fatal): {exc}")
-            self._reconciler = None
-
-    def _run_reconciliation(self) -> None:
-        """Sync entry point: schedule the async reconcile coroutine."""
-        if self._reconciler is None:
-            return
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._reconcile_async())
-        except Exception as exc:
-            self.log.warning(
-                f"Reconciler schedule failed (non-fatal): {exc}"
-            )
-
-    async def _reconcile_async(self) -> None:
-        """Compare tracker state with exchange; log CRITICAL on any drift."""
-        if self._reconciler is None:
-            return
-        try:
-            from src.execution.reconciler import InternalPosition
-
-            internal: dict[str, InternalPosition] = {}
-            if self._tracker is not None:
-                # Tracker is keyed by full instrument id ("BTCUSDT-PERP.BINANCE");
-                # Binance positionRisk returns bare "BTCUSDT". Normalise so the
-                # symbol sets line up and our positions don't look like ghosts.
-                for sym_full, pos in self._tracker._positions.items():
-                    norm = (
-                        sym_full.split("-")[0]
-                        if "-" in sym_full
-                        else sym_full.split(".")[0]
-                    )
-                    internal[norm] = InternalPosition(
-                        symbol=norm,
-                        direction=pos.direction,
-                        quantity=pos.quantity,
-                    )
-
-            result = await self._reconciler.reconcile(internal)
-            if result.is_clean:
-                return
-
-            for orphan in result.orphan_positions:
-                self.log.error(
-                    f"ORPHAN POSITION on exchange — manual action required | "
-                    f"sym={orphan['symbol']} dir={orphan['direction']} "
-                    f"qty={orphan['quantity']} entry={orphan.get('entry_price')}"
-                )
-            for ghost in result.ghost_positions:
-                self.log.error(
-                    f"GHOST POSITION in tracker — closed on exchange | "
-                    f"sym={ghost['symbol']} dir={ghost['direction']} "
-                    f"qty={ghost['quantity']}"
-                )
-            for mm in result.mismatched_sizes:
-                self.log.error(
-                    f"POSITION SIZE MISMATCH | sym={mm['symbol']} "
-                    f"internal=({mm['internal_direction']},"
-                    f"{mm['internal_quantity']}) "
-                    f"exchange=({mm['exchange_direction']},"
-                    f"{mm['exchange_quantity']})"
-                )
-        except Exception as exc:
-            self.log.warning(
-                f"Reconciliation failed (non-fatal): {exc}"
-            )
-
-    # ------------------------------------------------------------------
     # Pending-SL persistence (crash-safe mirror of _pending_sl_params)
     # ------------------------------------------------------------------
 
@@ -609,7 +489,7 @@ class MLTradingStrategy(Strategy):
         fill event for the same client_order_id is recognised as an entry
         and goes through the normal SL placement path. The case where the
         fill happened *during* the crash window (Binance does not replay)
-        is covered by the PositionReconciler ORPHAN alert.
+        is covered by the external orphan alert.
         """
         try:
             from src.execution.pending_orders_store import PendingOrdersStore

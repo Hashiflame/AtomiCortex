@@ -12,9 +12,10 @@ User=hashiflame
 Group=hashiflame
 WorkingDirectory=/home/hashiflame/AtomiCortex
 Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TRADING_MODE=testnet
 EnvironmentFile=/home/hashiflame/AtomiCortex/.env
 ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
-    scripts/run_reconciler.py --all --trading-mode live --log-level INFO
+    scripts/run_reconciler.py --all --trading-mode ${TRADING_MODE} --log-level INFO
 
 # Security hardening
 NoNewPrivileges=true

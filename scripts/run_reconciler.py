@@ -36,21 +36,38 @@ def _discover() -> list[str]:
     return sorted(str(p) for p in (_ROOT / "data").glob("atomicortex*.db"))
 
 
-def main() -> None:
+def resolve_trading_mode(raw: str) -> str:
+    cleaned = (raw or "").strip().lower()
+    if cleaned in ("live", "testnet"):
+        return cleaned
+    if cleaned:
+        get_logger("run_reconciler").warning(
+            f"Invalid trading mode {raw!r}, falling back to 'testnet'"
+        )
+    return "testnet"
+
+
+def get_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="AtomiCortex signal reconciler")
     ap.add_argument("--db", default="data/atomicortex.db")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--offline", action="store_true",
                     help="Use only local DataStore (no Binance calls)")
-    ap.add_argument("--trading-mode", default="live",
+    ap.add_argument("--trading-mode", default="testnet",
                     choices=["live", "testnet"])
     ap.add_argument("--data-dir", default="data/features")
     ap.add_argument("--log-level", default="INFO")
+    return ap
+
+def main() -> None:
+    ap = get_parser()
     args = ap.parse_args()
 
     setup_logging(level_console=args.log_level)
     log = get_logger("run_reconciler")
+
+    trading_mode = resolve_trading_mode(args.trading_mode)
 
     targets = _discover() if args.all else [args.db]
     if not targets:
@@ -72,7 +89,7 @@ def main() -> None:
             bar_hours=bar_h,
             dry_run=args.dry_run,
             price_source=src,
-            trading_mode=args.trading_mode,
+            trading_mode=trading_mode,
         )
         res = rec.reconcile()
         for k in grand:
