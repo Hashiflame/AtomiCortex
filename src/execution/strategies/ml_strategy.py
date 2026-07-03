@@ -572,19 +572,19 @@ class MLTradingStrategy(Strategy):
                 return
 
             for orphan in result.orphan_positions:
-                self.log.critical(
+                self.log.error(
                     f"ORPHAN POSITION on exchange — manual action required | "
                     f"sym={orphan['symbol']} dir={orphan['direction']} "
                     f"qty={orphan['quantity']} entry={orphan.get('entry_price')}"
                 )
             for ghost in result.ghost_positions:
-                self.log.critical(
+                self.log.error(
                     f"GHOST POSITION in tracker — closed on exchange | "
                     f"sym={ghost['symbol']} dir={ghost['direction']} "
                     f"qty={ghost['quantity']}"
                 )
             for mm in result.mismatched_sizes:
-                self.log.critical(
+                self.log.error(
                     f"POSITION SIZE MISMATCH | sym={mm['symbol']} "
                     f"internal=({mm['internal_direction']},"
                     f"{mm['internal_quantity']}) "
@@ -1090,13 +1090,8 @@ class MLTradingStrategy(Strategy):
                     f"Pending-SL store put failed (non-fatal): {exc}"
                 )
 
-        self.submit_order(entry_order)
-        self.log.info(
-            f"ENTRY submitted | {entry_side} {qty} | "
-            f"tag={entry_tag} | SL deferred to fill confirmation"
-        )
-
-        # Log signal in bridge for Telegram notification
+        # Log signal in bridge for Telegram notification BEFORE submitting order
+        # to ensure signal_id exists if submit_order fails synchronously.
         if self._signal_bridge:
             try:
                 signal_id = self._signal_bridge.log_signal(
@@ -1117,6 +1112,85 @@ class MLTradingStrategy(Strategy):
             except Exception as exc:
                 self.log.warning(f"SignalBridge log_signal failed: {exc}")
 
+        try:
+            self.submit_order(entry_order)
+            self.log.info(
+                f"ENTRY submitted | {entry_side} {qty} | "
+                f"tag={entry_tag} | SL deferred to fill confirmation"
+            )
+        except Exception as exc:
+            self.log.error(f"Failed to submit entry order: {exc}")
+            self._pending_sl_params.pop(client_oid, None)
+            if self._pending_store is not None:
+                try:
+                    self._pending_store.pop(client_oid)
+                except Exception as store_exc:
+                    self.log.warning(f"Pending-SL store pop failed on submit error: {store_exc}")
+            
+            signal_id = self._pending_signal_ids.pop(signal.symbol, None)
+            if signal_id and self._signal_bridge:
+                try:
+                    self._signal_bridge.mark_rejected(signal_id, str(exc))
+                except Exception as b_exc:
+                    self.log.warning(f"Failed to mark signal rejected on submit error: {b_exc}")
+
+    def on_order_rejected(self, event: Any) -> None:
+        """Handle exchange order rejections."""
+        reason = getattr(event, 'reason', str(event))
+        self._handle_order_reject(
+            client_oid=str(event.client_order_id),
+            reason=str(reason),
+            instrument_id=str(event.instrument_id)
+        )
+
+    def on_order_denied(self, event: Any) -> None:
+        """Handle internal order denials."""
+        reason = getattr(event, 'reason', str(event))
+        self._handle_order_reject(
+            client_oid=str(event.client_order_id),
+            reason=str(reason),
+            instrument_id=str(event.instrument_id)
+        )
+
+    def _handle_order_reject(self, client_oid: str, reason: str, instrument_id: str) -> None:
+        """
+        Process order rejection/denial.
+        
+        _pending_signal_ids is keyed by symbol (e.g. 'BTCUSDT-PERP.BINANCE'),
+        which aligns with str(instrument_id) in this environment.
+        This assumes a max of one open position per symbol.
+        """
+        if client_oid in self._pending_sl_params:
+            # ENTRY order rejected
+            self.log.error(f"Entry order rejected | oid={client_oid} | reason={reason}")
+            self._pending_sl_params.pop(client_oid, None)
+            if self._pending_store is not None:
+                try:
+                    self._pending_store.pop(client_oid)
+                except Exception as exc:
+                    self.log.warning(f"Pending-SL store pop failed on reject: {exc}")
+            
+            signal_id = self._pending_signal_ids.pop(instrument_id, None)
+            if signal_id and signal_id != 0:
+                if self._signal_bridge:
+                    self._signal_bridge.mark_rejected(signal_id, reason)
+            else:
+                self.log.warning(f"Entry reject for unknown signal_id | symbol={instrument_id}")
+        else:
+            # Check if this was a Stop-Loss
+            try:
+                order = self.cache.order(client_oid)
+            except Exception:
+                order = None
+                
+            if order and any(t.startswith("SL-") for t in (order.tags or [])):
+                # TODO(PR-0.2): Route this to Telegram via a watchdog-channel (no asyncio.run here)
+                self.log.error(
+                    f"POSITION UNPROTECTED! Stop-loss order rejected: {reason} | oid={client_oid}"
+                )
+            else:
+                self.log.warning(f"Unknown order rejected | oid={client_oid} | reason={reason}")
+
     def _submit_stop_loss_with_retry(
         self,
         decision: RiskDecision,
@@ -1131,7 +1205,7 @@ class MLTradingStrategy(Strategy):
         """
         instrument = self.cache.instrument(self._instrument_id)
         if instrument is None:
-            self.log.critical(
+            self.log.error(
                 f"CRITICAL: Cannot place SL — instrument {self._instrument_id} "
                 f"not in cache! Position is UNPROTECTED!"
             )
@@ -1165,7 +1239,7 @@ class MLTradingStrategy(Strategy):
                 )
 
         # All retries exhausted
-        self.log.critical(
+        self.log.error(
             f"CRITICAL: Failed to place SL after {max_retries} attempts! "
             f"Position is UNPROTECTED! Manual intervention required."
         )
@@ -1266,7 +1340,7 @@ class MLTradingStrategy(Strategy):
             self._consecutive_feature_failures += 1
             self.log.error(f"_compute_features_unified failed: {exc}")
             if self._consecutive_feature_failures >= 3:
-                self.log.critical(
+                self.log.error(
                     f"ALERT: {self._consecutive_feature_failures} consecutive "
                     f"feature computation failures — bot NOT trading!"
                 )

@@ -270,6 +270,33 @@ class SignalBridge:
                     "SignalBridge.close_signal failed: {err}", err=str(exc),
                 )
 
+    def mark_rejected(self, signal_id: int, reason: str) -> None:
+        """Update a signal that was rejected by the exchange or broker."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        """UPDATE signals_log SET
+                           result = 'rejected',
+                           closed_at = ?,
+                           pnl_pct = NULL
+                           WHERE id = ?""",
+                        (now, signal_id),
+                    )
+                    conn.commit()
+                    _log.info(
+                        "Signal rejected | id={sid} reason={r}",
+                        sid=signal_id, r=reason,
+                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                _log.error(
+                    "SignalBridge.mark_rejected failed: {err}", err=str(exc),
+                )
+
     # ------------------------------------------------------------------
     # Event operations
     # ------------------------------------------------------------------
