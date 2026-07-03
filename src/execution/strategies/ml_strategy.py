@@ -580,6 +580,12 @@ class MLTradingStrategy(Strategy):
         )
 
         try:
+            if self._heartbeat is not None:
+                try:
+                    self._heartbeat.report_bar(bar.ts_event / 1e9)
+                except Exception as exc:
+                    self.log.warning(f"Heartbeat report_bar failed: {exc}")
+
             self.log.info(
                 f"on_bar step 1: adding to buffer, size={len(self._bars)}"
             )

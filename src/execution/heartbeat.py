@@ -11,6 +11,7 @@ Phase 4 — Step 4.6.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -55,6 +56,10 @@ class HeartbeatManager:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_ttl = heartbeat_ttl
 
+        self._started_ts: float = 0.0
+        self._last_bar_ts: float | None = None
+        self._bars_seen: int = 0
+
         self._redis: Any = None  # redis.asyncio.Redis instance
         self._task: asyncio.Task | None = None
         self._running: bool = False
@@ -70,6 +75,7 @@ class HeartbeatManager:
             _log.warning("HeartbeatManager already running")
             return
 
+        self._started_ts = time.time()
         self._redis = await self._connect_redis()
         self._running = True
         self._task = asyncio.create_task(self._heartbeat_loop())
@@ -104,6 +110,11 @@ class HeartbeatManager:
 
         _log.info("HeartbeatManager stopped")
 
+    def report_bar(self, bar_ts: float) -> None:
+        """Called by the strategy to indicate data is flowing."""
+        self._last_bar_ts = bar_ts
+        self._bars_seen += 1
+
     def is_alive(self) -> bool:
         """Check whether the heartbeat loop has written recently.
 
@@ -124,12 +135,19 @@ class HeartbeatManager:
         """Write heartbeat to Redis every ``heartbeat_interval`` seconds."""
         while self._running:
             try:
-                ts = str(time.time())
+                ts = time.time()
+                payload = json.dumps({
+                    "process_ts": ts,
+                    "started_ts": self._started_ts,
+                    "last_bar_ts": self._last_bar_ts,
+                    "bars_seen": self._bars_seen,
+                })
+
                 if self._redis is not None:
                     await self._redis.setex(
                         self._heartbeat_key,
                         self._heartbeat_ttl,
-                        ts,
+                        payload,
                     )
                     self._last_beat_ts = time.time()
                     _log.debug(

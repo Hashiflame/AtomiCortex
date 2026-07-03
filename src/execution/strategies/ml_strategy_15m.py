@@ -367,6 +367,12 @@ class MLTradingStrategy15M(MLTradingStrategy):
         (ORB breakout vs trend) → ML → risk → execute (isolated DB).
         """
         try:
+            if self._heartbeat is not None:
+                try:
+                    self._heartbeat.report_bar(bar.ts_event / 1e9)
+                except Exception as exc:
+                    self.log.warning(f"Heartbeat report_bar failed: {exc}")
+
             self._bars.append(bar)
             if len(self._bars) > self._max_bars:
                 self._bars = self._bars[-self._max_bars:]

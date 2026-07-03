@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -89,6 +90,9 @@ class WatchdogConfig:
     service_name: str = "4h"
     check_interval: int = 15           # seconds
     max_silence_seconds: int = 60
+    max_bar_silence_seconds: int = 0
+    startup_bar_grace_seconds: int = 900
+    alert_cooldown_seconds: int = 900
     telegram_token: str = ""
     telegram_admin_id: str = ""
 
@@ -108,6 +112,11 @@ class Watchdog:
         self._running: bool = False
         self._task: asyncio.Task | None = None
         self._incidents: list[dict[str, Any]] = []
+
+        self._last_alert_ts: float = 0.0
+        self._incident_active: bool = False
+        self._last_close_found_positions: bool = True
+        self._legacy_format_logged: bool = False
 
         # Resolve base URL
         mode = config.trading_mode.lower()
@@ -368,32 +377,55 @@ class Watchdog:
         """Periodically check the heartbeat key in Redis."""
         while self._running:
             try:
-                alive = await self._check_heartbeat()
+                alive, reason = await self._check_heartbeat_detailed()
                 if not alive:
                     _log.warning(
                         "HEARTBEAT MISSING — bot may be down! "
-                        "Triggering emergency close."
+                        "Triggering emergency close. Reason: {reason}",
+                        reason=reason
                     )
                     incident = {
                         "timestamp": time.time(),
                         "action": "emergency_close",
+                        "reason": reason,
                     }
 
-                    # 1. Telegram alert
-                    await self.send_telegram_alert(
-                        "⚠️ Bot heartbeat missing!\n"
-                        f"Silence > {self._config.max_silence_seconds}s\n"
-                        "Emergency closing all positions..."
-                    )
+                    # 1. Telegram alert (cooldown)
+                    now = time.time()
+                    if now - self._last_alert_ts > self._config.alert_cooldown_seconds:
+                        if reason == "data_stale":
+                            msg = (
+                                f"⚠️ DATA STALE (zombie-RUNNING?) | {self._config.service_name}\n"
+                                f"Silence > {self._config.max_bar_silence_seconds}s\n"
+                                "Emergency closing all positions..."
+                            )
+                        else:
+                            msg = (
+                                f"⚠️ Bot heartbeat missing! | {self._config.service_name}\n"
+                                f"Silence > {self._config.max_silence_seconds}s\n"
+                                "Emergency closing all positions..."
+                            )
+                        
+                        await self.send_telegram_alert(msg)
+                        self._last_alert_ts = now
 
-                    # 2. Emergency close
-                    close_result = await self.emergency_close_all()
-                    incident["result"] = close_result
-                    self._incidents.append(incident)
+                    # 2. Emergency close (idempotent)
+                    if not self._incident_active or self._last_close_found_positions:
+                        close_result = await self.emergency_close_all()
+                        incident["result"] = close_result
+                        self._incidents.append(incident)
+                        self._last_close_found_positions = len(close_result.get("positions_closed", [])) > 0
+                    
+                    self._incident_active = True
 
                     # 3. Wait before next check to avoid rapid re-triggers
                     await asyncio.sleep(self._config.max_silence_seconds)
                 else:
+                    if self._incident_active:
+                        _log.info("heartbeat recovered")
+                        self._incident_active = False
+                        self._last_alert_ts = 0.0
+                        self._last_close_found_positions = True
                     _log.debug("Heartbeat OK")
 
             except asyncio.CancelledError:
@@ -408,35 +440,58 @@ class Watchdog:
             except asyncio.CancelledError:
                 break
 
-    async def _check_heartbeat(self) -> bool:
-        """Return True if the heartbeat key exists and is fresh enough."""
+    async def _check_heartbeat_detailed(self) -> tuple[bool, str]:
+        """Return (is_alive, reason) where reason is 'ok', 'process_dead', or 'data_stale'."""
         if self._redis is None:
             self._redis = await self._connect_redis()
             if self._redis is None:
                 _log.warning("Cannot check heartbeat — Redis unavailable")
-                return True  # fail-open: don't trigger if Redis itself is down
+                return True, "ok"  # fail-open
 
         try:
             val = await self._redis.get(self._config.heartbeat_key)
             if val is None:
-                return False  # key expired or never set
+                return False, "process_dead"
 
-            # Check freshness
-            beat_ts = float(val)
-            elapsed = time.time() - beat_ts
-            if elapsed > self._config.max_silence_seconds:
-                _log.warning(
-                    "Heartbeat stale: {elapsed:.1f}s > {limit}s",
-                    elapsed=elapsed,
-                    limit=self._config.max_silence_seconds,
-                )
-                return False
-            return True
+            try:
+                data = json.loads(val)
+                if not isinstance(data, dict):
+                    raise ValueError("Not a dict")
+            except (json.JSONDecodeError, ValueError):
+                if not getattr(self, "_legacy_format_logged", False):
+                    _log.info("legacy heartbeat format")
+                    self._legacy_format_logged = True
+                
+                beat_ts = float(val)
+                if time.time() - beat_ts > self._config.max_silence_seconds:
+                    return False, "process_dead"
+                return True, "ok"
+
+            now = time.time()
+            if "process_ts" not in data:
+                _log.warning("Heartbeat missing process_ts")
+                return True, "ok" # fail-open for invalid JSON payload
+                
+            if now - data["process_ts"] > self._config.max_silence_seconds:
+                return False, "process_dead"
+
+            if self._config.max_bar_silence_seconds > 0:
+                last_bar = data.get("last_bar_ts")
+                if last_bar is None:
+                    if now - data.get("started_ts", now) > self._config.startup_bar_grace_seconds:
+                        return False, "data_stale"
+                elif now - last_bar > self._config.max_bar_silence_seconds:
+                    return False, "data_stale"
+                    
+            return True, "ok"
         except Exception as exc:
-            _log.warning(
-                "Heartbeat check error: {err}", err=str(exc),
-            )
-            return True  # fail-open
+            _log.warning("Heartbeat check error: {err}", err=str(exc))
+            return True, "ok"
+
+    async def _check_heartbeat(self) -> bool:
+        """Wrapper around _check_heartbeat_detailed for backward compatibility."""
+        is_alive, _ = await self._check_heartbeat_detailed()
+        return is_alive
 
     # ------------------------------------------------------------------
     # Internal: Redis

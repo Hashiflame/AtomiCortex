@@ -25,6 +25,8 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
     --trading-mode testnet \
     --check-interval 15 \
     --max-silence 60 \
+    --max-bar-silence 3600 \
+    --startup-bar-grace 1500 \
     --log-level INFO
 
 # Restart policy — always (watchdog must stay up)
