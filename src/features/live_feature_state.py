@@ -20,6 +20,7 @@ from typing import Any
 
 import polars as pl
 
+from src.features.window_sizes import HISTORY_BARS_4H
 from src.logger import get_logger
 
 _log = get_logger(__name__)
@@ -47,7 +48,13 @@ class LiveFeatureState:
     """
 
     # Bar buffers (maxlen keeps memory bounded)
-    bar_buffer_4h: deque = field(default_factory=lambda: deque(maxlen=400))
+    # PR-A — the 4H buffer feeds build_from_buffer(), whose last row is the
+    # feature vector sent to the model. That row is only valid when the buffer
+    # holds WARMUP_ROWS + atr_lookback bars, so the deque must be able to hold
+    # them; at 400 it silently truncated every longer preload. Memory +~0.2 MB.
+    bar_buffer_4h: deque = field(
+        default_factory=lambda: deque(maxlen=HISTORY_BARS_4H)
+    )
     bar_buffer_1h: deque = field(default_factory=lambda: deque(maxlen=500))
     bar_buffer_15m: deque = field(default_factory=lambda: deque(maxlen=600))
 

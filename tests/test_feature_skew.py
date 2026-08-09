@@ -13,6 +13,7 @@ import polars as pl
 import pytest
 
 from src.features.live_feature_state import LiveFeatureState
+from src.features.window_sizes import HISTORY_BARS_4H
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +164,17 @@ class TestLiveFeatureStateBarBuffer:
         assert times == sorted(times)
 
     def test_bar_buffer_maxlen(self):
-        """4H bar buffer respects maxlen=400."""
+        """4H bar buffer stays bounded at the required history window."""
         state = LiveFeatureState()
         base_ns = (1_700_000_000_000 + 4 * 3_600_000) * 1_000_000
-        for i in range(500):
+        for i in range(HISTORY_BARS_4H + 100):
             bar = FakeBar(
                 ts_event=base_ns + i * 4 * 3_600_000 * 1_000_000,
                 o=100.0, h=105.0,
                 l=95.0, c=102.0, v=500.0,
             )
             state.add_bar(bar, interval="4h")
-        assert len(state.bar_buffer_4h) == 400
+        assert len(state.bar_buffer_4h) == HISTORY_BARS_4H
 
     def test_get_bar_df_empty(self):
         """get_bar_df returns empty DataFrame when buffer is empty."""

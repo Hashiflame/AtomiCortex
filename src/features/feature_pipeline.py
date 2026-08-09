@@ -31,6 +31,7 @@ from src.features.microstructure import (
     add_volume_session_features,
 )
 from src.features.regime_detector import RegimeDetector
+from src.features.window_sizes import WARMUP_ROWS, required_history_bars
 from src.logger import get_logger
 
 if TYPE_CHECKING:
@@ -40,7 +41,9 @@ _log = get_logger(__name__)
 
 # Rows to drop at the head of the DataFrame to eliminate NaN from rolling ops.
 # Must exceed the longest rolling window (180 for funding_zscore_30d).
-_WARMUP_ROWS = 200
+# Defined in src.features.window_sizes so live buffers size themselves off the
+# same number; the private alias keeps the existing call sites unchanged.
+_WARMUP_ROWS = WARMUP_ROWS
 
 # Bar duration per interval (minutes). Used to scale time-based rolling
 # windows in add_funding_features / add_oi_features so the named horizons
@@ -218,6 +221,9 @@ class FeaturePipeline:
         self.data_store = data_store
         self.symbol = symbol
         self.interval = interval
+        # One-shot latch for the short-buffer WARNING in build_from_buffer():
+        # live calls it once per bar, and the condition, once true, stays true.
+        self._short_buffer_warned = False
 
     # ------------------------------------------------------------------
     # Public
@@ -410,6 +416,34 @@ class FeaturePipeline:
             return df.rename({"taker_buy_base_vol": "taker_buy_volume"})
         return df.with_columns((pl.col("volume") * 0.5).alias("taker_buy_volume"))
 
+    def _warn_if_buffer_too_short(
+        self, n_rows: int, detector: RegimeDetector,
+    ) -> None:
+        """Warn once when the buffer cannot support a valid last row.
+
+        Fail-soft by design: a short buffer still produces a row (with regime
+        constants or a partial-window percentile), and refusing to compute it
+        would stop the bot over a data-length problem. The operator gets one
+        WARNING instead — nothing downstream is aborted.
+
+        This is the single place the check can live: every interval, every
+        caller and both the live and test paths go through
+        :meth:`build_from_buffer`, and only here are both halves of the
+        requirement in scope (``WARMUP_ROWS`` from the pipeline,
+        ``atr_lookback`` from the detector).
+        """
+        required = required_history_bars(detector.atr_lookback)
+        if n_rows >= required or self._short_buffer_warned:
+            return
+        self._short_buffer_warned = True
+        _log.warning(
+            f"build_from_buffer[{self.interval}]: buffer has {n_rows} bars "
+            f"< {required} required (WARMUP_ROWS={WARMUP_ROWS} + "
+            f"atr_lookback={detector.atr_lookback}) — last row's regime/ATR "
+            f"features are computed on a partial window and may differ from "
+            f"training (train/serve skew)."
+        )
+
     def build_from_buffer(
         self,
         df: pl.DataFrame,
@@ -489,7 +523,6 @@ class FeaturePipeline:
         if self.interval == "4h":
             # 4H uses the standard RegimeDetector (same as build()).
             detector: RegimeDetector = RegimeDetector()
-            df = detector.detect_all(df)
         else:
             from src.features.regime_detector import (
                 RegimeDetector1H,
@@ -499,7 +532,9 @@ class FeaturePipeline:
                 detector = RegimeDetector15M()
             else:
                 detector = RegimeDetector1H()
-            df = detector.detect_all(df, min_bars=detector.hurst_window)
+
+        self._warn_if_buffer_too_short(len(df), detector)
+        df = detector.detect_all(df, min_bars=detector.hurst_window)
 
         # 4H: no MTF/session features — build_mtf() is a no-op for '4h'.
         if self.interval == "4h":

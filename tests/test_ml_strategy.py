@@ -31,6 +31,7 @@ from src.execution.strategies.ml_strategy import (
     _bar_to_dict,
 )
 from src.execution.live_trader import LiveTrader, LiveTraderConfig
+from src.features.window_sizes import HISTORY_BARS_4H
 from src.risk.risk_engine import (
     PortfolioState,
     RiskConfig,
@@ -52,6 +53,7 @@ def default_strategy_config() -> MLStrategyConfig:
         bar_type="BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL",
         initial_equity=10_000.0,
         warmup_bars=10,
+        history_bars=10,
         dry_run=True,
     )
 
@@ -101,6 +103,7 @@ class TestMLStrategyConfig:
         cfg = MLStrategyConfig()
         assert cfg.instrument_id == "BTCUSDT-PERP.BINANCE"
         assert cfg.warmup_bars == 300
+        assert cfg.history_bars == HISTORY_BARS_4H
         assert cfg.dry_run is False
         assert cfg.confidence_threshold == 0.55  # binary, ML-017
 
@@ -814,6 +817,32 @@ class TestPreloadFromBinanceApi:
         assert "testnet.binancefuture.com" in call_kwargs[1].get("url", "") or \
                "testnet.binancefuture.com" in call_kwargs[0][0] if call_kwargs[0] else True
 
+    def test_binance_preload_requests_full_history(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """The REST limit must not clip the requested history window.
+
+        Binance allows up to 1500 klines per call, so the full 4H window fits
+        in a single request; a hard-coded 500 would silently truncate it.
+        """
+        from unittest.mock import patch
+        from src.execution.strategies.ml_strategy import _BINANCE_KLINES_MAX_LIMIT
+        from src.features.window_sizes import HISTORY_BARS_4H
+
+        strategy = MLTradingStrategy(config=default_strategy_config)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_response) as mock_get:
+            strategy._preload_from_binance_api("BTCUSDT", HISTORY_BARS_4H)
+
+        params = mock_get.call_args.kwargs["params"]
+        assert params["limit"] == HISTORY_BARS_4H
+        assert params["limit"] <= _BINANCE_KLINES_MAX_LIMIT
+
     def test_preload_from_parquet(self) -> None:
         """Mock DataStore.get_klines → DataFrame → Bar objects in time order."""
         from unittest.mock import patch
@@ -857,6 +886,54 @@ class TestPreloadFromBinanceApi:
         for i in range(len(bars) - 1):
             assert bars[i].ts_event <= bars[i + 1].ts_event
 
+    def test_parquet_lookback_window_covers_history_bars(self) -> None:
+        """The Parquet lookback window must be able to hold the full history.
+
+        Parquet is preload source #1 and its result is accepted at >= 50 bars,
+        so a window shorter than the requested history wins over the REST
+        fallback while still returning a truncated buffer.
+        """
+        from unittest.mock import patch
+        import polars as pl
+        from src.features.window_sizes import HISTORY_BARS_4H
+
+        cfg = MLStrategyConfig(
+            warmup_bars=10,
+            dry_run=True,
+            features_dir="./data/features/ml_features",
+        )
+        strategy = MLTradingStrategy(config=cfg)
+
+        base_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        df = pl.DataFrame([
+            {
+                "open_time": base_ts + i * 4 * 3600 * 1000,
+                "open": 94_000.0, "high": 94_500.0, "low": 93_500.0,
+                "close": 94_250.0, "volume": 1_000.0,
+            }
+            for i in range(3)
+        ])
+
+        mock_get_klines = MagicMock(return_value=df)
+        now_before = datetime.now(timezone.utc)
+
+        with patch("src.execution.strategies.ml_strategy.Path.resolve",
+                   return_value=Path("/tmp/fake/ml_features")), \
+             patch("src.execution.strategies.ml_strategy.Path.exists",
+                   return_value=True), \
+             patch("src.ingestion.data_store.DataStore.__init__",
+                   return_value=None), \
+             patch("src.ingestion.data_store.DataStore.get_klines",
+                   mock_get_klines), \
+             patch("src.ingestion.data_store.DataStore.close"):
+            strategy._preload_from_parquet("BTCUSDT", HISTORY_BARS_4H)
+
+        start = mock_get_klines.call_args.kwargs["start"]
+        # The strategy's own `now` is >= now_before, so measuring against
+        # now_before is the conservative direction.
+        window_hours = (now_before - start).total_seconds() / 3600.0
+        assert window_hours >= HISTORY_BARS_4H * 4.0
+
     def test_preload_fallback_to_api(
         self, default_strategy_config: MLStrategyConfig,
     ) -> None:
@@ -876,9 +953,9 @@ class TestPreloadFromBinanceApi:
             strategy._preload_historical_bars()
 
         # Should have called API fallback
-        mock_api.assert_called_once_with("BTCUSDT", 10)  # warmup_bars=10 from fixture
+        mock_api.assert_called_once_with("BTCUSDT", 10)  # history_bars=10 from fixture
         assert strategy._warmup_complete is True
-        # _preload_historical_bars takes bars[-n_bars:] where n_bars=10 (warmup_bars)
+        # _preload_historical_bars takes bars[-n_bars:] where n_bars=10 (history_bars)
         assert len(strategy._bars) == 10
 
     def test_preload_all_sources_fail(

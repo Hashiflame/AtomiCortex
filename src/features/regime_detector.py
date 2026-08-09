@@ -20,6 +20,12 @@ import polars as pl
 from ta.trend import ADXIndicator
 from ta.volatility import AverageTrueRange
 
+from src.features.window_sizes import (
+    ATR_LOOKBACK_1H,
+    ATR_LOOKBACK_4H,
+    ATR_LOOKBACK_15M,
+    HURST_WINDOW_4H,
+)
 from src.logger import get_logger
 
 _log = get_logger(__name__)
@@ -238,10 +244,10 @@ class RegimeDetector:
 
     def __init__(
         self,
-        hurst_window: int = 300,
+        hurst_window: int = HURST_WINDOW_4H,
         adx_period: int = 14,
         atr_period: int = 14,
-        atr_lookback: int = 540,       # 90 days × 6 bars
+        atr_lookback: int = ATR_LOOKBACK_4H,
         adx_trend_threshold: float = 20.0,
         atr_vol_threshold: float = 0.80,
         timeframe: str = "4h",
@@ -624,7 +630,7 @@ class RegimeDetector1H(RegimeDetector):
             hurst_window=100,
             adx_period=10,
             atr_period=10,
-            atr_lookback=168,        # 1 week * 24 bars/day
+            atr_lookback=ATR_LOOKBACK_1H,
             adx_trend_threshold=20.0,
             atr_vol_threshold=0.75,
             timeframe="1h",
@@ -649,7 +655,7 @@ class RegimeDetector15M(RegimeDetector):
             hurst_window=50,
             adx_period=7,
             atr_period=7,
-            atr_lookback=672,        # 1 week * 96 bars/day
+            atr_lookback=ATR_LOOKBACK_15M,
             adx_trend_threshold=18.0,
             atr_vol_threshold=0.70,
             timeframe="15m",

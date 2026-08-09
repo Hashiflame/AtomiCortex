@@ -47,8 +47,17 @@ from src.risk.risk_engine import (
     TradeSignal,
 )
 from src.risk.portfolio_tracker import PortfolioTracker
+from src.features.window_sizes import HISTORY_BARS_4H
 
 _log = get_logger(__name__)
+
+# Binance Futures /fapi/v1/klines returns at most this many klines per call —
+# the full 4H history window fits in one request.
+_BINANCE_KLINES_MAX_LIMIT = 1500
+
+# The Parquet store may be missing individual bars, so ask for a window wider
+# than the bar count strictly requires; the tail slice trims it back anyway.
+_PARQUET_GAP_ALLOWANCE = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +77,13 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     max_leverage: int = 10
     max_open_positions: int = 3
     initial_equity: float = 10_000.0
+    # Bars required before the strategy is allowed to trade. Distinct from
+    # history_bars: this is the readiness gate, not the feature window.
     warmup_bars: int = 300
+    # Bars loaded into the feature buffers at preload. Must cover the longest
+    # feature lookback (see src.features.window_sizes), otherwise the row sent
+    # to the model carries neutral regime constants instead of real values.
+    history_bars: int = HISTORY_BARS_4H
     dry_run: bool = False
     rr_ratio: float = 1.5
     preload_enabled: bool = True
@@ -1653,7 +1668,7 @@ class MLTradingStrategy(Strategy):
         All exceptions are caught — preload never crashes the strategy.
         """
         symbol_clean = "BTCUSDT"  # without -PERP
-        n_bars = self._config.warmup_bars  # 300
+        n_bars = self._config.history_bars
 
         bars: list[Bar] = []
         source = "none"
@@ -1730,8 +1745,8 @@ class MLTradingStrategy(Strategy):
     ) -> list[Bar]:
         """Load last *n_bars* from the local Parquet store.
 
-        Uses ``DataStore.get_klines()`` with a generous lookback
-        window (100 days) and returns the tail.
+        Uses ``DataStore.get_klines()`` over a window derived from *n_bars*
+        (widened by ``_PARQUET_GAP_ALLOWANCE``) and returns the tail.
         """
         # Lazy import — avoid crash if DuckDB / data is missing
         from src.ingestion.data_store import DataStore
@@ -1747,7 +1762,9 @@ class MLTradingStrategy(Strategy):
         store = DataStore(data_root)
         try:
             now = datetime.now(timezone.utc)
-            start = now - timedelta(days=100)
+            start = now - timedelta(
+                hours=n_bars * self._bar_period_hours() * _PARQUET_GAP_ALLOWANCE
+            )
             df = store.get_klines(
                 symbol=symbol,
                 interval="4h",
@@ -1802,7 +1819,7 @@ class MLTradingStrategy(Strategy):
         params = {
             "symbol": symbol,
             "interval": "4h",
-            "limit": min(n_bars, 500),
+            "limit": min(n_bars, _BINANCE_KLINES_MAX_LIMIT),
         }
 
         for attempt in range(1, 4):  # 3 retries
