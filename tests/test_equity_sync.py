@@ -131,7 +131,11 @@ class TestRecordEquityCallsSync:
         cfg = MLStrategyConfig(
             instrument_id="BTCUSDT-PERP.BINANCE",
             bar_type="BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL",
-            warmup_bars=10, dry_run=True,
+            # PR-C: "Nautilus is authoritative" is a statement about the
+            # modes that actually send orders. dry_run=True now means
+            # simulated equity (see tests/test_simulated_equity.py), which
+            # would make both tests below vacuous.
+            warmup_bars=10, dry_run=False,
         )
         strat = MLTradingStrategy(config=cfg)
         strat._tracker = PortfolioTracker(initial_equity=10_000.0)

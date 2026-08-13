@@ -1,0 +1,30 @@
+[Unit]
+Description=AtomiCortex Signal Starvation Check (oneshot)
+Documentation=https://github.com/Hashiflame/AtomiCortex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hashiflame
+Group=hashiflame
+WorkingDirectory=/home/hashiflame/AtomiCortex
+Environment=PATH=/home/hashiflame/AtomiCortex/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/hashiflame/AtomiCortex/.env
+ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python scripts/check_signal_freshness.py --log-level INFO
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs
+
+LimitNOFILE=4096
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atomicortex-signal-check
+
+[Install]
+WantedBy=multi-user.target

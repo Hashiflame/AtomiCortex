@@ -59,6 +59,13 @@ _BINANCE_KLINES_MAX_LIMIT = 1500
 # than the bar count strictly requires; the tail slice trims it back anyway.
 _PARQUET_GAP_ALLOWANCE = 1.5
 
+# An effective zero balance, allowing for the float residue that
+# ``balance_total(USDT).as_double() + unrealized_pnl`` can leave behind. An
+# exact ``== 0.0`` would miss a 1e-12 remainder, which still yields a
+# 99.999…% drawdown — i.e. it would stay silent in exactly the case the
+# warning exists for.
+_ZERO_BALANCE_EPSILON = 1e-9
+
 
 # ---------------------------------------------------------------------------
 # Strategy config
@@ -209,6 +216,12 @@ class MLTradingStrategy(Strategy):
         # can't be created; the bot then runs with in-memory only (a
         # degraded but non-fatal mode — same behaviour as before this fix).
         self._pending_store: Any = None
+
+        # PR-C one-shot notice flags. Both notices describe a process-wide
+        # condition, so they must not repeat on every bar (a 4H bot logging
+        # the same line forever buries everything else).
+        self._simulated_equity_logged: bool = False
+        self._zero_balance_logged: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1883,10 +1896,62 @@ class MLTradingStrategy(Strategy):
             return None
 
     def _record_equity(self, ts_ns: int) -> None:
-        """Record equity snapshot for curve plotting + sync the tracker."""
+        """Record equity snapshot for curve plotting + sync the tracker.
+
+        PR-C: ``dry_run`` is the switch. It is the same flag that gates
+        order submission in ``on_bar``, so it is the only honest answer to
+        "can this process move the exchange balance?". When it is True the
+        bot sends nothing, the balance can never respond to its decisions,
+        and letting that balance drive risk is what produced the
+        2026-08-09 incident: a mainnet account holding 0 USDT synced a 0
+        into the tracker while ``peak_equity`` stayed at the configured
+        10_000, yielding a 100% drawdown kill switch on the first bar —
+        before regime detection, before features, before any model
+        confidence was ever measured.
+
+        Note ``trading_mode`` is deliberately NOT part of the condition:
+        ``--mode paper`` without ``--dry-run`` resolves to mainnet keys and
+        mainnet endpoints (``live_trader.build_node``), i.e. it really does
+        submit orders. Simulating equity there would pair real positions
+        with a fantasy portfolio — strictly worse than today.
+        """
+        # --- Simulated mode: the exchange is not consulted at all. ---
+        if self._config.dry_run:
+            if not self._simulated_equity_logged:
+                self._simulated_equity_logged = True
+                self.log.info(
+                    "Equity is SIMULATED (dry-run, no execution) — the "
+                    "exchange balance is not read and does not affect risk "
+                    "decisions. Equity stays at initial_equity; this run "
+                    "measures signals, not PnL."
+                )
+            # Read the tracker's own equity through its public API — this
+            # runs once per 4H bar, so the extra PortfolioState fields cost
+            # nothing and the private _get_equity() stays private.
+            # _tracker is created in on_start, so unit paths that never
+            # call it leave it None — fail-soft, as elsewhere here.
+            tracker = self._tracker
+            if tracker is None:
+                return
+            try:
+                self._equity_curve.append((ts_ns, tracker.get_state().equity))
+            except Exception:
+                pass
+            return
+
+        # --- Real modes (testnet / live): unchanged, exchange is king. ---
         equity = self._read_nautilus_equity()
         if equity is None:
             return
+        if abs(equity) < _ZERO_BALANCE_EPSILON and not self._zero_balance_logged:
+            self._zero_balance_logged = True
+            # Observability, not control flow: without this the operator
+            # only ever sees "KILL SWITCH ... drawdown=100.00%", which
+            # reads as a strategy event rather than a config problem.
+            self.log.error(
+                "exchange futures balance is 0 USDT — risk decisions will "
+                "see 100% drawdown; check API keys / venue / account funding"
+            )
         try:
             self._equity_curve.append((ts_ns, equity))
             # H6: Nautilus is the authoritative source for cash balance

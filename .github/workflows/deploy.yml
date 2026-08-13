@@ -41,4 +41,11 @@ jobs:
             git pull origin master
             source .venv/bin/activate
             pip install -r requirements.txt --quiet
+            if [ -x /usr/local/sbin/atomicortex-install-units ]; then
+                echo "Running unit installation script..."
+                sudo -n /usr/local/sbin/atomicortex-install-units
+            else
+                echo "WARNING: /usr/local/sbin/atomicortex-install-units not found or not executable."
+                echo "Skipping systemd deployment. Manual installation required."
+            fi
             echo "Deploy completed at $(date)"

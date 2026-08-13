@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     weekly_loss_limit: float = Field(default=-0.08, alias="WEEKLY_LOSS_LIMIT")
     max_drawdown_kill: float = Field(default=-0.15, alias="MAX_DRAWDOWN_KILL")
 
+    # ------------------------------------------------------------------
+    # Signal Freshness
+    # ------------------------------------------------------------------
+    signal_stale_hours_4h: float = Field(default=48.0, alias="SIGNAL_STALE_HOURS_4H")
+    signal_stale_hours_15m: float = Field(default=6.0, alias="SIGNAL_STALE_HOURS_15M")
+    signal_stale_hours_default: float = Field(default=48.0, alias="SIGNAL_STALE_HOURS_DEFAULT")
+
     # Fail-fast: grace period (seconds) after node start before checking
     # engine connectivity.  Default 45 = timeout_connection(30) + margin.
     startup_grace_sec: float = Field(default=45.0, alias="STARTUP_GRACE_SEC")

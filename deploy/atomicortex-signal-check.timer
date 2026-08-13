@@ -1,0 +1,13 @@
+[Unit]
+Description=Run AtomiCortex Signal Freshness Check
+Documentation=https://github.com/Hashiflame/AtomiCortex
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=30s
+Persistent=true
+Unit=atomicortex-signal-check.service
+
+[Install]
+WantedBy=timers.target
