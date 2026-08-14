@@ -243,7 +243,8 @@ class FeaturePipeline:
         4-6.  Add CVD, volume, price features (microstructure).
         7-9.  Add funding, OI, basis features (derivatives).
         10.   Detect market regime (Hurst, ADX, ATR).
-        11.   Drop the first ``_WARMUP_ROWS`` rows (NaN from rolling).
+        11.   Trim the unusable head: ``required_history_bars(atr_lookback)``
+              rows, the lookback taken from the step-10 detector (fail-soft).
         12.   Warn if any NaN remains in feature columns.
         13.   Optionally save to Parquet (ZSTD compression).
 
@@ -289,8 +290,32 @@ class FeaturePipeline:
         detector = RegimeDetector()
         df = detector.detect_all(df)
 
-        # 11. Drop warmup rows
-        df = df.slice(_WARMUP_ROWS)
+        # 11. Drop the head that cannot carry valid features. Two windows have
+        # to be behind the first surviving row, and both come from the detector
+        # built at step 10 rather than from a constant, so the number cannot
+        # fork if that detector ever changes: detect_all() gives every row
+        # below min_bars neutral regime constants, and atr_percentile is a
+        # percentile over the trailing atr_lookback rows.
+        n_rows = len(df)
+        required = required_history_bars(detector.atr_lookback)
+        if n_rows > required:
+            offset = required
+        else:
+            # Fail-soft: a short input degrades loudly instead of aborting the
+            # build or returning an empty matrix. WARMUP_ROWS still covers the
+            # pipeline's own rolling contract (the longest rolling is
+            # funding_zscore_30d at 180 4H bars); only when even that would
+            # empty the frame do we fall back to keeping the last row.
+            offset = WARMUP_ROWS if n_rows > WARMUP_ROWS else max(0, n_rows - 1)
+            _log.warning(
+                f"build[{self.interval}]: {n_rows} bars < {required} required "
+                f"(WARMUP_ROWS={WARMUP_ROWS} + "
+                f"atr_lookback={detector.atr_lookback}) — trimming {offset} "
+                f"rows instead, {n_rows - offset} rows remain; the head of this "
+                f"matrix carries neutral regime constants / a partial ATR "
+                f"window (train/serve skew)."
+            )
+        df = df.slice(offset)
         _log.info(f"After warmup trim: {len(df)} rows")
 
         # 12. NaN audit

@@ -25,6 +25,7 @@ from src.features.derivatives import (
     add_oi_features,
 )
 from src.features.feature_pipeline import FEATURE_GROUPS, FeaturePipeline
+from src.features.window_sizes import WARMUP_ROWS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,10 +301,16 @@ class TestFeaturePipeline:
             assert feat in names, f"Feature '{feat}' missing from get_feature_names()"
 
     def test_warmup_rows_removed(self):
-        """build() removes first 200 warmup rows — output row count < input."""
+        """build() trims the head; a short input falls back to WARMUP_ROWS.
+
+        _MockStore serves 500 bars — below the 740 the 4H detector requires
+        (WARMUP_ROWS=200 + atr_lookback=540) — so build() takes its fail-soft
+        branch and trims WARMUP_ROWS instead, leaving 300 rows. Pinned to the
+        exact count: a `>=` bound would not notice the trim silently moving.
+        """
         df = self._build()
-        # MockStore returns 500 kline rows; after warmup=200: ≥ 200 rows remain
-        assert len(df) >= 200
+        assert len(df) == 500 - WARMUP_ROWS
+        assert len(df) == 300
 
     def test_save_to_parquet_creates_file(self, tmp_path: Path):
         """save_to path must produce a readable Parquet file."""
