@@ -38,6 +38,7 @@ from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Venue
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
+from src.features.live_feature_state import bar_open_time_ms
 from src.logger import get_logger
 from src.risk.risk_engine import (
     PortfolioState,
@@ -58,6 +59,29 @@ _BINANCE_KLINES_MAX_LIMIT = 1500
 # The Parquet store may be missing individual bars, so ask for a window wider
 # than the bar count strictly requires; the tail slice trims it back anyway.
 _PARQUET_GAP_ALLOWANCE = 1.5
+
+# Index of taker_buy_base_asset_volume in a Binance kline row, and the row
+# length required to read it. Rows this short still carry OHLCV and
+# close_time (index 6), so they yield a bar without a taker value rather
+# than sinking the whole batch.
+_KLINE_TAKER_BUY_IDX = 9
+_KLINE_TAKER_BUY_MIN_LEN = 10
+
+
+def _kline_taker_buy_volume(k: list) -> float | None:
+    """``taker_buy_base_asset_volume`` from a kline row, ``None`` if absent.
+
+    Fail-soft by design: a missing or unparsable index 9 costs one bar its
+    CVD input, whereas raising here would abort a warmup that has perfectly
+    good OHLCV.
+    """
+    if len(k) < _KLINE_TAKER_BUY_MIN_LEN:
+        return None
+    try:
+        return float(k[_KLINE_TAKER_BUY_IDX])
+    except (TypeError, ValueError):
+        return None
+
 
 # An effective zero balance, allowing for the float residue that
 # ``balance_total(USDT).as_double() + unrealized_pnl`` can leave behind. An
@@ -173,6 +197,13 @@ class MLTradingStrategy(Strategy):
         self._warmup_complete: bool = False
         # One-shot guard for the preload ts_event convention check
         self._preload_ts_checked: bool = False
+        # PR-B: real taker_buy_volume for the preloaded window, keyed by the
+        # bar CLOSE time in ms — the same number preload puts into ts_event,
+        # so the splice point recovers it without re-deriving anything.
+        # Populated by whichever preload source ran; drained right after.
+        self._preload_tbv: dict[int, float | None] = {}
+        # (bars with a real taker value, bars buffered) from the last preload.
+        self._preload_tbv_coverage: tuple[int, int] = (0, 0)
 
         # Equity curve tracking
         self._equity_curve: list[tuple[int, float]] = []
@@ -1421,17 +1452,25 @@ class MLTradingStrategy(Strategy):
     # taker_buy_volume fetch (Step H1c)
     # ------------------------------------------------------------------
 
-    def _fetch_taker_buy_volume_for_bar(self, bar) -> float | None:
+    def _fetch_taker_buy_volume_for_bar(
+        self, bar, *, session=None,
+    ) -> float | None:
         """Fetch real taker_buy_base_asset_volume for *bar* from Binance.
 
         Returns ``None`` on any failure — caller forwards it to
         ``LiveFeatureState.add_bar`` which applies the documented
         volume*0.5 fallback. Synchronous with a 3s timeout to keep
         on_bar responsive.
+
+        ``session`` is forwarded to ``fetch_taker_buy_volume`` (which takes
+        the same parameter) so a test can drive the real request/validation
+        path. Patching ``fetch_taker_buy_volume`` instead only asserts the
+        argument this method computed and never checks that Binance accepts
+        it — which is how the open-time key mismatch stayed invisible.
         """
         try:
             close_ms = bar.ts_event // 1_000_000
-            open_ms = close_ms - 4 * 3_600_000  # 4H bars
+            open_ms = bar_open_time_ms(close_ms, "4h")
             sym = str(self._instrument_id)
             sym_clean = sym.split("-")[0] if "-" in sym else sym.split(".")[0]
             base = (
@@ -1445,6 +1484,7 @@ class MLTradingStrategy(Strategy):
                 open_time_ms=open_ms,
                 base_url=base,
                 timeout=3.0,
+                session=session,
             )
         except Exception as exc:
             self.log.debug(
@@ -1687,6 +1727,9 @@ class MLTradingStrategy(Strategy):
 
         bars: list[Bar] = []
         source = "none"
+        # Nothing from an earlier call may survive into this one.
+        self._preload_tbv = {}
+        self._preload_tbv_coverage = (0, 0)
 
         # Attempt 1: local Parquet
         try:
@@ -1723,6 +1766,9 @@ class MLTradingStrategy(Strategy):
                 )
                 bars = []
                 source = "none"
+                # Drop the Parquet taker map with its bars — otherwise the
+                # REST fallback would read keys belonging to another source.
+                self._preload_tbv = {}
 
         # Attempt 2: Binance REST API
         if len(bars) < 50:
@@ -1740,15 +1786,40 @@ class MLTradingStrategy(Strategy):
 
         # Fill bar buffer + live feature state
         if bars:
-            for bar in bars[-n_bars:]:
+            window = bars[-n_bars:]
+            real_tbv = 0
+            for bar in window:
                 self._bars.append(bar)
-                self._live_state.add_bar(bar, interval="4h")
+                # ts_event was built as close_ms * 1_000_000, so this
+                # division is exact and recovers the very key the source
+                # stored. Deliberately independent of the open_time math.
+                tbv = self._preload_tbv.get(bar.ts_event // 1_000_000)
+                if tbv is not None:
+                    real_tbv += 1
+                self._live_state.add_bar(
+                    bar, interval="4h", taker_buy_volume=tbv,
+                )
+            self._preload_tbv = {}
+            self._preload_tbv_coverage = (real_tbv, len(window))
             self._warmup_complete = True
-            self.log.info(
+            msg = (
                 f"Warmup complete via {source} | "
                 f"bars={len(self._bars)} | "
-                f"live_state_4h={len(self._live_state.bar_buffer_4h)}"
+                f"live_state_4h={len(self._live_state.bar_buffer_4h)} | "
+                f"taker_buy_volume={real_tbv}/{len(window)}"
             )
+            if real_tbv == 0:
+                # No coverage at all is an outage: CVD ≡ 0 and
+                # taker_buy_ratio ≡ 0.5 across the warmed window. Isolated
+                # gaps stay INFO — the ratio is printed either way, and a
+                # WARNING on every 739/740 start is a WARNING nobody reads.
+                self.log.warning(
+                    f"{msg} — no real taker_buy_volume on the preloaded "
+                    f"window; CVD features are degraded until live bars "
+                    f"replace it"
+                )
+            else:
+                self.log.info(msg)
             self._log_preload_timestamp_check(source, bars[-1])
         else:
             self.log.warning(
@@ -1808,6 +1879,12 @@ class MLTradingStrategy(Strategy):
         without that column are refused rather than patched up with
         arithmetic, so the caller falls through to the REST source instead
         of silently mixing conventions.
+
+        ``taker_buy_volume`` is read into ``self._preload_tbv`` when the
+        column is present. Its absence is NOT a reason to refuse the frame:
+        unlike ``close_time``, which invalidates every timestamp, it costs
+        one feature group, and dropping a valid window over that would be
+        the worse trade.
         """
         # Lazy import — avoid crash if DuckDB / data is missing
         from src.ingestion.data_store import DataStore
@@ -1845,8 +1922,17 @@ class MLTradingStrategy(Strategy):
                 )
                 return []
 
+            has_tbv = "taker_buy_volume" in df.columns
+            if not has_tbv:
+                self.log.warning(
+                    "Parquet klines lack the taker_buy_volume column — "
+                    "preloaded bars will fall back to volume*0.5 (CVD ≡ 0) "
+                    "until live bars replace them"
+                )
+
             now_ms = int(now.timestamp() * 1000)
             bars: list[Bar] = []
+            tbv: dict[int, float | None] = {}
             unclosed = 0
             for row in df.iter_rows(named=True):
                 close_ms = int(row["close_time"])
@@ -1868,6 +1954,10 @@ class MLTradingStrategy(Strategy):
                     ts_init=ts_ns,
                 )
                 bars.append(bar)
+                raw_tbv = row.get("taker_buy_volume") if has_tbv else None
+                tbv[close_ms] = (
+                    float(raw_tbv) if raw_tbv is not None else None
+                )
 
             if unclosed:
                 self.log.info(
@@ -1876,6 +1966,7 @@ class MLTradingStrategy(Strategy):
 
             # Sort by timestamp and take last n_bars
             bars.sort(key=lambda b: b.ts_event)
+            self._preload_tbv = tbv
             return bars[-n_bars:]
         finally:
             store.close()
@@ -1894,6 +1985,11 @@ class MLTradingStrategy(Strategy):
         Nautilus ts_event = bar CLOSE time convention. The endpoint returns
         the still-forming candle as its last element (verified against
         mainnet), so any bar whose close time has not passed yet is dropped.
+
+        Index 9 (``taker_buy_base_asset_volume``) travels alongside in
+        ``self._preload_tbv``, keyed by close time. It is published only on
+        success, so a failed attempt can never leave a half-filled map for
+        the next source to read.
         """
         import requests  # lazy — only needed for preload
 
@@ -1940,6 +2036,7 @@ class MLTradingStrategy(Strategy):
 
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 bars: list[Bar] = []
+                tbv: dict[int, float | None] = {}
                 unclosed = 0
                 for k in raw_klines:
                     close_ms = int(k[6])
@@ -1958,12 +2055,15 @@ class MLTradingStrategy(Strategy):
                         ts_init=ts_ns,
                     )
                     bars.append(bar)
+                    # Index 9 is already in this response — no extra request.
+                    tbv[close_ms] = _kline_taker_buy_volume(k)
 
                 self.log.info(
                     f"Binance API: fetched {len(bars)} klines "
                     f"from {base_url} (attempt {attempt}) | "
                     f"dropped {unclosed} not-yet-closed"
                 )
+                self._preload_tbv = tbv
                 return bars
 
             except Exception as exc:

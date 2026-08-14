@@ -1075,7 +1075,7 @@ class TestPreloadFromBinanceApi:
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Nautilus delivers ts_event = bar CLOSE time for external bars, and
-# LiveFeatureState.add_bar() undoes that (open_time = ts_event - duration).
+# LiveFeatureState.add_bar() undoes that (ts_event snapped back to the grid).
 # Preload used to build bars from OPEN time, so every preloaded bar landed
 # in the buffer one full bar too early. These tests pin the convention on
 # both preload sources, on the seam with the first live bar, and on the
@@ -1088,17 +1088,32 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
-def _kline(open_ms: int) -> list:
-    """Binance kline row: [open_time, o, h, l, c, vol, close_time, ...]."""
+def _kline(open_ms: int, tbv: str = "500.0") -> list:
+    """Binance kline row: [open_time, o, h, l, c, vol, close_time, ...].
+
+    ``tbv`` lands at index 9 (taker_buy_base_asset_volume). The default
+    500.0 against a volume of 1000 is deliberately the degenerate case
+    (cvd = 2*500 - 1000 = 0); tests that need a distinguishable CVD pass
+    their own value.
+    """
     return [
         open_ms, "94000.0", "94500.0", "93500.0", "94250.0", "1000.000",
         open_ms + _BAR_MS - 1,   # 6: close_time
-        "1000000.0", 100, "500.0", "500000.0", "0",
+        "1000000.0", 100, tbv, "500000.0", "0",
     ]
 
 
-def _klines_df(open_times: list[int], *, with_close_time: bool = True):
-    """Parquet-shaped kline frame (klines_4h schema subset)."""
+def _klines_df(
+    open_times: list[int],
+    *,
+    with_close_time: bool = True,
+    taker_buy_volume: float | None = None,
+):
+    """Parquet-shaped kline frame (klines_4h schema subset).
+
+    ``taker_buy_volume=None`` omits the column entirely — the legacy
+    store layout.
+    """
     import polars as pl
 
     rows = []
@@ -1111,6 +1126,8 @@ def _klines_df(open_times: list[int], *, with_close_time: bool = True):
         }
         if with_close_time:
             row["close_time"] = ts + _BAR_MS - 1
+        if taker_buy_volume is not None:
+            row["taker_buy_volume"] = taker_buy_volume
         rows.append(row)
     return pl.DataFrame(rows)
 
@@ -1329,7 +1346,7 @@ class TestPreloadTimestampConvention:
         _run_full_preload_via_api(strategy, [_kline(o) for o in opens])
 
         newest = strategy._live_state.bar_buffer_4h[-1]["open_time"]
-        assert newest == opens[-1] - 1              # its own grid slot - 1ms
+        assert newest == opens[-1]                  # its own grid slot
         assert newest != opens[-1] - _BAR_MS        # not one bar too early
 
     def test_preload_live_seam_is_exactly_one_bar_duration(
@@ -1385,3 +1402,178 @@ class TestPreloadTimestampConvention:
         api.assert_called_once_with("BTCUSDT", guard_config.history_bars)
         assert strategy._bars == []
         assert strategy._warmup_complete is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR-B: REAL taker_buy_volume ON THE PRELOADED WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Preload used to call add_bar() without taker_buy_volume, so every warmed
+# bar fell back to volume*0.5 — cvd ≡ 0 and taker_buy_ratio ≡ 0.5 across the
+# whole buffer. Both preload sources already carry the real number
+# (kline index 9 / the taker_buy_volume column), so no extra request is
+# needed; these tests pin that it actually reaches the buffer.
+
+
+@pytest.fixture
+def loguru_warnings():
+    """Capture loguru WARNING records into a list.
+
+    LiveFeatureState logs through loguru (src.logger), unlike the strategy
+    itself, which uses the Nautilus logger.
+    """
+    from loguru import logger as _loguru_logger
+
+    sink: list[str] = []
+    sink_id = _loguru_logger.add(
+        lambda msg: sink.append(str(msg)),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        yield sink
+    finally:
+        _loguru_logger.remove(sink_id)
+
+
+class TestPreloadTakerBuyVolume:
+    """PR-B: the preloaded window must carry real taker_buy_volume."""
+
+    def test_preload_fills_real_taker_buy_volume(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """REST preload: every buffered bar keeps kline index 9, CVD != 0."""
+        from src.features.microstructure import add_cvd_features
+
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(60)
+
+        _run_full_preload_via_api(strategy, [_kline(o, "700.0") for o in opens])
+
+        buf = strategy._live_state.bar_buffer_4h
+        assert len(buf) == default_strategy_config.history_bars
+        assert all(r["taker_buy_volume"] == 700.0 for r in buf)
+
+        cvd = add_cvd_features(
+            strategy._live_state.get_bar_df("4h")
+        )["cvd"].to_list()
+        # volume = 1000, tbv = 700 → cvd = 2*700 - 1000 = 400
+        assert all(v == 400.0 for v in cvd)
+
+    def test_preload_parquet_fills_real_taker_buy_volume(
+        self, guard_config: MLStrategyConfig,
+    ) -> None:
+        """Parquet preload: the taker_buy_volume column reaches the buffer."""
+        strategy = MLTradingStrategy(config=guard_config)
+        df = _klines_df(
+            _opens_ending_closed_ago(60, 6.0), taker_buy_volume=700.0,
+        )
+
+        api = _run_full_preload_via_parquet(strategy, df)
+
+        api.assert_not_called()
+        buf = strategy._live_state.bar_buffer_4h
+        assert len(buf) == guard_config.history_bars
+        assert all(r["taker_buy_volume"] == 700.0 for r in buf)
+
+    def test_preload_parquet_without_taker_column_keeps_bars(
+        self, guard_config: MLStrategyConfig,
+    ) -> None:
+        """A legacy frame without the column must NOT discard the bars.
+
+        Deliberately unlike the close_time guard: a missing close_time
+        breaks every timestamp, a missing taker column costs one feature
+        group. Dropping the whole window would be the worse trade.
+        """
+        strategy = MLTradingStrategy(config=guard_config)
+        df = _klines_df(_opens_ending_closed_ago(60, 6.0))
+
+        api = _run_full_preload_via_parquet(strategy, df)
+
+        api.assert_not_called()
+        buf = strategy._live_state.bar_buffer_4h
+        assert len(buf) == guard_config.history_bars
+        assert all(r["taker_buy_volume"] is None for r in buf)
+
+    def test_preload_short_kline_row_keeps_bar_without_tbv(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """A 9-field row loses only its own tbv — the batch survives.
+
+        Index 6 (close_time) is present, so OHLCV and the timestamp are
+        intact; only index 9 is missing. Refusing the batch here would
+        cost the whole warmup for one absent feature value.
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(4)
+        klines = [_kline(o, "700.0") for o in opens]
+        klines[1] = klines[1][:9]
+
+        _run_full_preload_via_api(strategy, klines)
+
+        tbvs = [r["taker_buy_volume"] for r in strategy._live_state.bar_buffer_4h]
+        assert len(tbvs) == 4
+        assert tbvs[1] is None
+        assert tbvs[0] == 700.0
+        assert tbvs[2] == 700.0
+        assert tbvs[3] == 700.0
+
+    def test_preload_live_seam_key_formula_is_identical(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Preloaded and live bars derive open_time by the same rule.
+
+        Both must land on the absolute 4H grid; the old ts_event - duration
+        produced grid-1ms for a Binance-close timestamp, which is what made
+        the REST lookup miss by exactly one millisecond.
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(60)
+
+        _run_full_preload_via_api(strategy, [_kline(o) for o in opens])
+
+        buf = strategy._live_state.bar_buffer_4h
+        preload_open = buf[-1]["open_time"]
+
+        live_bar = _real_bar(strategy, opens[-1] + 2 * _BAR_MS - 1)
+        strategy._live_state.add_bar(live_bar, interval="4h")
+        live_open = buf[-1]["open_time"]
+
+        assert preload_open == opens[-1]
+        assert preload_open % _BAR_MS == 0
+        assert live_open % _BAR_MS == 0
+        assert live_open - preload_open == _BAR_MS
+
+    def test_warmup_log_reports_taker_coverage(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Coverage is counted per preload and exposed for the warmup log.
+
+        The strategy logs through the Nautilus logger, which pytest cannot
+        capture, so the assertion is on the counter the log line is built
+        from.
+        """
+        n = default_strategy_config.history_bars
+        opens = _grid_open_times(60)
+
+        full = MLTradingStrategy(config=default_strategy_config)
+        _run_full_preload_via_api(full, [_kline(o, "700.0") for o in opens])
+        assert full._preload_tbv_coverage == (n, n)
+
+        none_covered = MLTradingStrategy(config=default_strategy_config)
+        _run_full_preload_via_api(
+            none_covered, [_kline(o)[:9] for o in opens],
+        )
+        assert none_covered._preload_tbv_coverage == (0, n)
+
+    def test_no_tbv_fallback_warning_after_preload(
+        self, default_strategy_config: MLStrategyConfig, loguru_warnings,
+    ) -> None:
+        """A fully covered preload must not trip the volume*0.5 fallback."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(60)
+
+        _run_full_preload_via_api(strategy, [_kline(o, "700.0") for o in opens])
+        strategy._live_state.get_bar_df("4h")
+
+        assert [m for m in loguru_warnings if "missing real" in m] == []

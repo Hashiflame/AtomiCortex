@@ -149,7 +149,7 @@ class TestLiveFeatureStateBarBuffer:
     def test_bar_buffer_maintains_order(self):
         """Bars added to buffer remain sorted by open_time."""
         state = LiveFeatureState()
-        # ts_event = close time; add_bar converts to open_time = close - 4h
+        # ts_event = close time; add_bar snaps it back to the bar's open
         base_ns = (1_700_000_000_000 + 4 * 3_600_000) * 1_000_000  # close of first bar
         for i in range(10):
             bar = FakeBar(

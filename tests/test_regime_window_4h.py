@@ -28,7 +28,11 @@ from src.features.live_feature_state import LiveFeatureState
 from src.features.regime_detector import RegimeDetector
 
 _BAR_MS_4H = 4 * 3_600_000
-_START_CLOSE_MS = 1_600_000_000_000
+# On the absolute 4H grid (1_599_998_400_000 % 14_400_000 == 0), so the
+# open_time add_bar derives is the one these rows were generated with —
+# add_bar snaps to the grid, an off-grid base would drift the live frame
+# away from the offline reference it is compared against.
+_START_CLOSE_MS = 1_599_998_400_000
 
 
 @pytest.fixture
@@ -96,8 +100,8 @@ def _seeded_state(n: int) -> LiveFeatureState:
     """Push *n* synthetic bars through the real live path (add_bar → deque)."""
     state = LiveFeatureState()
     for row in _ohlcv(n):
-        # add_bar derives open_time as ts_event - bar_duration, so feed it the
-        # close time to land on the open_time this row was generated with.
+        # add_bar snaps ts_event back onto the bar grid, so feed it the close
+        # time to land on the open_time this row was generated with.
         bar = _FakeBar(
             row["open_time"] + _BAR_MS_4H,
             row["open"], row["high"], row["low"], row["close"], row["volume"],

@@ -18,6 +18,20 @@ from loguru import logger as _loguru_logger
 from src.features.live_feature_state import LiveFeatureState
 from src.features.microstructure import add_cvd_features
 
+_BAR_MS = 4 * 3_600_000
+# A real 4H grid slot: Binance 4H opens are always multiples of the bar
+# duration in absolute UTC time (1_786_680_000_000 % 14_400_000 == 0).
+_GRID_OPEN_MS = 1_786_680_000_000
+
+
+def _grid_kline(open_ms: int, tbv: str) -> list:
+    """Binance kline row for the candle opening at *open_ms* (12 fields)."""
+    return [
+        open_ms, "94000.0", "94500.0", "93500.0", "94250.0", "1000.000",
+        open_ms + _BAR_MS - 1,          # 6: close_time
+        "1000000.0", 100, tbv, "500000.0", "0",
+    ]
+
 
 @pytest.fixture
 def loguru_warnings():
@@ -46,8 +60,9 @@ class FakeBar:
 
 
 def _seed_bars(state: LiveFeatureState, n: int, *, with_tbv: bool):
-    bar_ms = 4 * 3_600_000
-    start_close_ms = 1_700_000_000_000
+    bar_ms = _BAR_MS
+    # Binance-close convention on the real grid: close = open + duration - 1.
+    start_close_ms = _GRID_OPEN_MS - 1
     for i in range(n):
         close_ms = start_close_ms + (i + 1) * bar_ms
         bar = FakeBar(close_ms, 100.0, 101.0, 99.0, 100.5, 1000.0)
@@ -99,8 +114,8 @@ class TestCvdFromBuffer:
 
     def test_mixed_bars_preserve_per_bar_values(self):
         state = LiveFeatureState()
-        bar_ms = 4 * 3_600_000
-        start_close_ms = 1_700_000_000_000
+        bar_ms = _BAR_MS
+        start_close_ms = _GRID_OPEN_MS - 1
         for i, tbv in enumerate([600.0, None, 800.0]):
             close_ms = start_close_ms + (i + 1) * bar_ms
             state.add_bar(
@@ -117,8 +132,8 @@ class TestTrainServeConsistency:
 
     def test_cvd_matches_offline(self):
         state = LiveFeatureState()
-        bar_ms = 4 * 3_600_000
-        start_close_ms = 1_700_000_000_000
+        bar_ms = _BAR_MS
+        start_close_ms = _GRID_OPEN_MS - 1
         rows = []
         for i in range(20):
             close_ms = start_close_ms + (i + 1) * bar_ms
@@ -134,12 +149,18 @@ class TestTrainServeConsistency:
                 taker_buy_volume=tbv,
             )
             rows.append({
-                "open_time": close_ms - bar_ms,
+                # The grid slot this candle opened on: a Binance close is
+                # open + duration - 1, so the open is close + 1 - duration.
+                "open_time": close_ms + 1 - bar_ms,
                 "open": o, "high": h, "low": l, "close": c,
                 "volume": v, "taker_buy_volume": tbv,
             })
         offline_df = pl.DataFrame(rows).sort("open_time")
         live_df = state.get_bar_df("4h")
+
+        # The two frames must be the same frame — comparing CVD across
+        # differently-stamped rows would pass for the wrong reason.
+        assert offline_df["open_time"].to_list() == live_df["open_time"].to_list()
 
         offline_cvd = add_cvd_features(offline_df)["cvd"].to_list()
         live_cvd = add_cvd_features(live_df)["cvd"].to_list()
@@ -167,7 +188,7 @@ class _MockSession:
 
 
 class TestFetchTakerBuyVolume:
-    OPEN_MS = 1_700_000_000_000
+    OPEN_MS = _GRID_OPEN_MS
 
     def _kline(self, open_ms, tbv):
         # Binance kline array (12 elements).
@@ -242,10 +263,48 @@ class TestMLStrategyWiring:
             ts_event = close_ms * 1_000_000
         return _B()
 
+    def test_live_bar_tbv_key_matches_binance_grid(self):
+        """ts_event = open + duration - 1 must resolve to the grid open.
+
+        Drives the real path end to end (formula -> request params ->
+        row[0] validation -> row[9]) through the injected session, because
+        patching fetch_taker_buy_volume is exactly what hid the key
+        mismatch: it asserts the argument and never checks that Binance
+        accepts it.
+        """
+        strat = self._make_strategy(trading_mode="live")
+        close_ms = _GRID_OPEN_MS + _BAR_MS - 1
+        sess = _MockSession(_MockResp([_grid_kline(_GRID_OPEN_MS, "725.5")]))
+
+        result = strat._fetch_taker_buy_volume_for_bar(
+            self._bar(close_ms), session=sess,
+        )
+
+        assert result == 725.5
+        assert sess.last_params["startTime"] == _GRID_OPEN_MS
+
+    def test_live_bar_tbv_key_matches_exact_boundary_ts(self):
+        """ts_event = open + duration (no -1) must resolve to the same open.
+
+        Guards the other timestamp convention: whichever one Nautilus
+        stamps on a live external bar, the derived key has to land on the
+        grid slot Binance returns in row[0].
+        """
+        strat = self._make_strategy(trading_mode="live")
+        close_ms = _GRID_OPEN_MS + _BAR_MS
+        sess = _MockSession(_MockResp([_grid_kline(_GRID_OPEN_MS, "725.5")]))
+
+        result = strat._fetch_taker_buy_volume_for_bar(
+            self._bar(close_ms), session=sess,
+        )
+
+        assert result == 725.5
+        assert sess.last_params["startTime"] == _GRID_OPEN_MS
+
     def test_fetch_called_with_correct_params_live(self):
         from unittest.mock import patch
         strat = self._make_strategy(trading_mode="live")
-        close_ms = 1_700_000_000_000 + 4 * 3_600_000
+        close_ms = _GRID_OPEN_MS + _BAR_MS - 1
         bar = self._bar(close_ms)
 
         with patch.object(
@@ -258,14 +317,14 @@ class TestMLStrategyWiring:
         kwargs = mock_fetch.call_args.kwargs
         assert kwargs["symbol"] == "BTCUSDT"  # stripped from BTCUSDT-PERP.BINANCE
         assert kwargs["interval"] == "4h"
-        assert kwargs["open_time_ms"] == close_ms - 4 * 3_600_000
+        assert kwargs["open_time_ms"] == _GRID_OPEN_MS
         assert kwargs["base_url"] == "https://fapi.binance.com"
         assert kwargs["timeout"] == 3.0
 
     def test_fetch_called_with_testnet_url(self):
         from unittest.mock import patch
         strat = self._make_strategy(trading_mode="testnet")
-        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+        bar = self._bar(_GRID_OPEN_MS + _BAR_MS - 1)
 
         with patch.object(
             LiveFeatureState, "fetch_taker_buy_volume", return_value=99.0,
@@ -280,7 +339,7 @@ class TestMLStrategyWiring:
     def test_fail_soft_returns_none(self):
         from unittest.mock import patch
         strat = self._make_strategy()
-        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+        bar = self._bar(_GRID_OPEN_MS + _BAR_MS - 1)
 
         with patch.object(
             LiveFeatureState, "fetch_taker_buy_volume", return_value=None,
@@ -291,7 +350,7 @@ class TestMLStrategyWiring:
     def test_fail_soft_on_exception(self):
         from unittest.mock import patch
         strat = self._make_strategy()
-        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+        bar = self._bar(_GRID_OPEN_MS + _BAR_MS - 1)
 
         with patch.object(
             LiveFeatureState,
@@ -303,11 +362,13 @@ class TestMLStrategyWiring:
         assert result is None
 
     def test_open_time_ms_computed_correctly(self):
-        """For 4H bar with close_ms = T, open_ms must be T - 4*3_600_000."""
+        """A 4H close time must resolve to the grid slot it belongs to."""
         from unittest.mock import patch
         strat = self._make_strategy()
-        # Pick a precise UTC-aligned 4H close.
-        close_ms = 1_705_000_000_000  # arbitrary
+        # A genuine UTC-aligned 4H close: open + duration - 1. The previous
+        # fixture (1_705_000_000_000) was not on the grid at all, which is
+        # what let the off-by-one-millisecond key survive.
+        close_ms = _GRID_OPEN_MS + 3 * _BAR_MS - 1
         bar = self._bar(close_ms)
 
         with patch.object(
@@ -317,14 +378,14 @@ class TestMLStrategyWiring:
 
         assert (
             mock_fetch.call_args.kwargs["open_time_ms"]
-            == close_ms - 4 * 3_600_000
+            == _GRID_OPEN_MS + 2 * _BAR_MS
         )
 
     def test_symbol_with_dot_only(self):
         """instrument_id without '-' (e.g. 'BTCUSDT.BINANCE') uses split('.')[0]."""
         from unittest.mock import patch
         strat = self._make_strategy(instrument_id="ETHUSDT.BINANCE")
-        bar = self._bar(1_700_000_000_000 + 4 * 3_600_000)
+        bar = self._bar(_GRID_OPEN_MS + _BAR_MS - 1)
 
         with patch.object(
             LiveFeatureState, "fetch_taker_buy_volume", return_value=1.0,
@@ -339,7 +400,7 @@ class TestBackwardCompatibility:
 
     def test_add_bar_without_kwarg(self):
         state = LiveFeatureState()
-        bar = FakeBar(1_700_000_000_000 + 4 * 3_600_000,
+        bar = FakeBar(_GRID_OPEN_MS + _BAR_MS - 1,
                       100.0, 101.0, 99.0, 100.5, 1000.0)
         state.add_bar(bar, interval="4h")  # no taker_buy_volume kwarg
         df = state.get_bar_df("4h")

@@ -36,6 +36,34 @@ _INTERVAL_MS: dict[str, int] = {
 }
 
 
+def bar_open_time_ms(ts_event_ms: int, interval: str) -> int:
+    """Bar OPEN time (ms) for a bar whose ``ts_event`` is *ts_event_ms*.
+
+    ``ts_event`` is the bar CLOSE time, and two conventions for it are in
+    circulation: Binance stamps ``open + duration - 1`` (its klines close a
+    millisecond before the next candle opens), while a plain boundary stamp
+    is ``open + duration``. Snapping to the absolute bar grid handles both::
+
+        open = ((ts_event + 1) // duration - 1) * duration
+
+    For ``open = k*duration``: a Binance close gives ``ts + 1 = (k+1)*d`` and
+    a boundary close gives ``ts + 1 = (k+1)*d + 1``; both floor to ``k+1``,
+    so both return ``k*d``.
+
+    The naive ``ts_event - duration`` is only correct for the second
+    convention — against Binance data it lands one millisecond before the
+    real open, which is enough for ``/fapi/v1/klines?startTime=`` to return
+    the wrong candle and for an asof join to miss a record sitting exactly
+    on the bar boundary (funding settles on the 4H grid).
+
+    Binance 4H/1H/15m opens are multiples of their duration in absolute UTC
+    time, so the grid assumption holds for every interval in
+    ``_INTERVAL_MS``.
+    """
+    duration_ms = _INTERVAL_MS.get(interval, 4 * 3_600_000)
+    return ((int(ts_event_ms) + 1) // duration_ms - 1) * duration_ms
+
+
 @dataclass
 class LiveFeatureState:
     """Rolling state for live feature computation.
@@ -256,7 +284,10 @@ class LiveFeatureState:
         ------------------
         Nautilus ``bar.ts_event`` = bar **close** time (nanoseconds).
         Parquet ``open_time`` = bar **open** time (milliseconds).
-        We convert: ``open_time = ts_event - bar_duration``.
+        We convert with :func:`bar_open_time_ms`, which snaps to the bar
+        grid instead of subtracting the duration blindly — a Binance close
+        time is ``open + duration - 1``, so the naive subtraction lands one
+        millisecond early.
 
         Parameters
         ----------
@@ -271,9 +302,8 @@ class LiveFeatureState:
             ``get_bar_df()`` will fall back to ``volume*0.5`` so CVD ≡ 0
             (the historical live behavior) — and emit a one-shot WARNING.
         """
-        bar_duration_ms = _INTERVAL_MS.get(interval, 4 * 3_600_000)
         close_time_ms = bar.ts_event // 1_000_000   # ns → ms
-        open_time_ms = close_time_ms - bar_duration_ms
+        open_time_ms = bar_open_time_ms(close_time_ms, interval)
 
         record = {
             "open_time": open_time_ms,
