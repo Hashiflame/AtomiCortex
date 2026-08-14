@@ -35,6 +35,13 @@ from src.config import get_settings
 from src.execution.live_trader import LiveTrader, LiveTraderConfig
 from src.logger import setup_logging, get_logger
 
+# Exit code for a refusal no restart can fix — EX_CONFIG from sysexits.h.
+# Mirrored by RestartPreventExitStatus= in deploy/atomicortex-bot.service so
+# systemd fails the unit once instead of burning all five restarts allowed by
+# StartLimitBurst.  Deliberately NOT 1: the sys.exit(1) at the end of main()
+# signals a *transient* connect failure and must stay restartable.
+_EXIT_CONFIG_ERROR = 78
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -99,7 +106,56 @@ def main() -> None:
     log.info(f"  Duration: {args.duration}s" if args.duration else "  Duration: indefinite")
     log.info("=" * 60)
 
-    # Safety: require explicit confirmation for live mode
+    # ------------------------------------------------------------------
+    # Fail-closed guard
+    # ------------------------------------------------------------------
+    # Authority is args.mode, NOT settings.trading_mode: build_node()
+    # resolves credentials from LiveTraderConfig.trading_mode, which is
+    # args.mode.  settings.trading_mode only drives the startup banner and
+    # the log filename, so a mismatch is reported as a warning and never as
+    # a refusal — an .env edit must not be able to kill a correctly
+    # configured unit.
+    try:
+        env_mode = get_settings().trading_mode
+    except Exception as exc:  # diagnostics only — must never be fatal
+        env_mode = None
+        log.warning(f"Could not read TRADING_MODE for the mode cross-check: {exc}")
+
+    if env_mode is not None and env_mode != args.mode:
+        log.warning(
+            f"Mode divergence: TRADING_MODE in .env is '{env_mode}' but "
+            f"--mode is '{args.mode}'. Orders route as '{args.mode}'; the "
+            f"banner and log filename describe '{env_mode}'."
+        )
+
+    # This guard sits ABOVE the confirmation prompt on purpose.  Under
+    # systemd stdin is /dev/null, where input() raises an unhandled
+    # EOFError instead of protecting anything.
+    interactive = sys.stdin.isatty()
+    refusal: str | None = None
+    if args.mode == "paper" and not args.dry_run:
+        refusal = (
+            "--mode paper resolves to MAINNET credentials and there is no "
+            "confirmation prompt on this path — without --dry-run this "
+            "sends real orders"
+        )
+    elif args.mode == "live" and not args.dry_run and not interactive:
+        refusal = (
+            "--mode live without --dry-run requires interactive "
+            "confirmation, but stdin is not a TTY (systemd sets "
+            "StandardInput=null)"
+        )
+
+    if refusal is not None:
+        log.critical(
+            f"Refusing to start: {refusal} | mode={args.mode} "
+            f"dry_run={args.dry_run} env_trading_mode={env_mode} "
+            f"stdin_isatty={interactive} — add --dry-run to ExecStart"
+        )
+        sys.exit(_EXIT_CONFIG_ERROR)
+
+    # Safety: require explicit confirmation for live mode.
+    # Reachable only with a TTY — the guard above returns 78 otherwise.
     if args.mode == "live" and not args.dry_run:
         confirm = input(
             "\n⚠️  LIVE MODE with REAL ORDERS! Type 'YES' to confirm: "

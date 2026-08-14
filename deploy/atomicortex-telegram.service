@@ -19,6 +19,10 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
 # Restart policy
 Restart=on-failure
 RestartSec=10
+# Same non-retryable exit code as the trading unit (EX_CONFIG). Inert today —
+# run_telegram_bot.py exits 1 on a bad token or admin id — but it keeps the
+# two units' restart semantics identical if that entry point ever adopts it.
+RestartPreventExitStatus=78
 
 # Security hardening
 NoNewPrivileges=true

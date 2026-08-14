@@ -17,9 +17,16 @@ EnvironmentFile=/home/hashiflame/AtomiCortex/.env
 Environment=MPLCONFIGDIR=/home/hashiflame/AtomiCortex/data/.matplotlib
 Environment=MPLBACKEND=Agg
 Environment=TMPDIR=/home/hashiflame/AtomiCortex/data/tmp
+# --mode paper: testnet is unusable here — BINANCE_TESTNET_* are empty by
+# design, so build_node() would raise on every start.  paper resolves keys
+# through the mainnet branch, which is what gives the 4H model real market
+# data, and it matches TRADING_MODE=paper in .env.
+# --dry-run: the only thing standing between "paper" and real mainnet
+# orders.  Removing it is refused at startup (exit 78).
 ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
     scripts/run_live.py \
-    --mode testnet \
+    --mode paper \
+    --dry-run \
     --symbols BTCUSDT-PERP \
     --capital 10000 \
     --log-level INFO
@@ -27,12 +34,20 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
 # Restart policy
 Restart=on-failure
 RestartSec=30
+# 78 = _EXIT_CONFIG_ERROR in scripts/run_live.py (EX_CONFIG). A refusal by
+# the fail-closed guard is not retryable: fail once instead of consuming the
+# whole restart budget declared in [Unit] and leaving it exhausted.
+RestartPreventExitStatus=78
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data /home/hashiflame/AtomiCortex/mlruns
+# mlruns is prefixed with '-': it is empty and cannot be tracked by git, so a
+# fresh clone has no such directory and systemd 255 would abort the unit with
+# 226/NAMESPACE before exec — a failure with zero application output.
+# logs and data stay unprefixed: their absence MUST be fatal.
+ReadWritePaths=/home/hashiflame/AtomiCortex/logs /home/hashiflame/AtomiCortex/data -/home/hashiflame/AtomiCortex/mlruns
 
 # Resource limits
 LimitNOFILE=65536
