@@ -218,6 +218,9 @@ _EXPECTED_MANIFEST_KEYS = {
     "passes",
     "written_despite_failing",
     "data_range",
+    # PR-K: the wall-clock cut prepare_data split on.
+    "oos_start_ms",
+    "oos_start_iso",
     "n_train_rows",
     "n_test_rows",
     "embargo_rows",

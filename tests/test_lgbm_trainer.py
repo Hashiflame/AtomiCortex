@@ -204,22 +204,37 @@ class TestLabelEncoding:
 
 
 class TestWalkForwardSplit:
-    """Test walk-forward split: test after train by time (per-symbol)."""
+    """Test walk-forward split: test after train by time, globally."""
 
-    def test_test_comes_after_train_per_symbol(self, tmp_path: Path):
+    def test_test_comes_after_train_globally(self, tmp_path: Path):
+        """PR-K: one wall-clock cut for every symbol at once.
+
+        The per-symbol form of this check ("test_sym.min >= train_sym.max")
+        passed even while the split was ``head(80%)/tail(20%)`` by rows —
+        a row cut is monotonic *inside* a symbol, so it proved nothing
+        about the frame the booster actually sees. The fixture therefore
+        gives each symbol a different number of rows, which is what made
+        the per-symbol cuts land on different dates in production.
+        """
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-        trainer, _, _ = _make_trainer(tmp_path, regime="all", symbols=symbols)
+        features_dir = tmp_path / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        for i, (sym, n) in enumerate(zip(symbols, (300, 240, 180))):
+            _make_feature_df(n=n, symbol=sym, seed=42 + i).write_parquet(
+                features_dir / f"{sym}_4h_features.parquet"
+            )
+
+        config = ModelConfig(regime="all", symbols=symbols)
+        trainer = LGBMTrainer(
+            config=config,
+            features_dir=features_dir,
+            models_dir=tmp_path / "models",
+        )
         train_df, test_df = trainer.prepare_data()
 
-        # Per-symbol: for each symbol, test times must come after train times
-        for sym in symbols:
-            train_sym = train_df.filter(pl.col("symbol") == sym)
-            test_sym = test_df.filter(pl.col("symbol") == sym)
-            if train_sym.is_empty() or test_sym.is_empty():
-                continue
-            assert test_sym["open_time"].min() >= train_sym["open_time"].max(), (
-                f"{sym}: test data must come after train data"
-            )
+        assert train_df["open_time"].max() < test_df["open_time"].min(), (
+            "train must end strictly before test begins, across all symbols"
+        )
 
 
 class TestSplitContainsAllSymbols:

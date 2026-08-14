@@ -37,6 +37,10 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 from src.logger import get_logger
 from src.models.dataset_builder import DatasetBuilder
+from src.models.temporal_split import (
+    compute_default_oos_start_ms,
+    temporal_split_multi,
+)
 
 _log = get_logger(__name__)
 
@@ -44,6 +48,30 @@ _log = get_logger(__name__)
 # Bump whenever a key is renamed or removed (adding keys is backwards
 # compatible for readers that use .get()).
 MANIFEST_SCHEMA_VERSION: int = 1
+
+# PR-K: below this many OOS rows a symbol's per-symbol WR/PF is noise.
+# A warning, never a skip — dropping the symbol silently would hide the
+# very thing the operator needs to see.
+MIN_TEST_ROWS_WARN: int = 50
+
+# PR-K: bar duration per ModelConfig.interval, used to express the
+# train→val embargo in wall-clock time. An interval that is not listed
+# falls back to the legacy row-count embargo (with a warning) rather than
+# guessing a duration.
+_INTERVAL_MS: dict[str, int] = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 3_600_000,
+    "2h": 2 * 3_600_000,
+    "4h": 4 * 3_600_000,
+    "6h": 6 * 3_600_000,
+    "8h": 8 * 3_600_000,
+    "12h": 12 * 3_600_000,
+    "1d": 24 * 3_600_000,
+}
 
 # Repo root — used only to resolve the git SHA stamped into the manifest.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -329,28 +357,56 @@ class LGBMTrainer:
         self._embargo_rows: int | None = None
         self._train_rows_after_embargo: int | None = None
 
+        # PR-K — the wall-clock instant train/test were cut on. Set by
+        # prepare_data (and reset there), so a bundle records the actual
+        # boundary rather than the first bar that happened to survive
+        # after it. None when prepare_data was never called (1H/15m
+        # scripts feed their frames in directly).
+        self._oos_start_ms: int | None = None
+
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
 
     def prepare_data(self) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Load, filter, create target, and per-symbol walk-forward split.
+        """Load, label, and split train/test on one wall-clock boundary.
 
         Steps
         -----
-        For **each symbol** independently:
-        1. Load features from parquet.
-        2. Filter by regime (if not "all").
-        3. Create target via DatasetBuilder.create_target().
-        4. Walk-forward split: first 80% → train, last 20% → test.
+        1. **Per symbol**: load features from parquet, then create the
+           target on that symbol's own contiguous series — a forward-looking
+           label must never read across a symbol boundary (ML-002).
+        2. Concatenate every labelled symbol into one frame.
+        3. Compute **one** OOS boundary on that combined frame, *before*
+           the regime filter, via ``compute_default_oos_start_ms`` with
+           ``oos_fraction = config.test_size_pct``.
+        4. Apply the regime filter to the combined frame.
+        5. Skip symbols with nothing on one side of the boundary (warning,
+           not an exception); warn about a thin test side.
+        6. Split with ``temporal_split_multi``, embargoing one label
+           horizon off the tail of every symbol's train part.
 
-        Then concat all per-symbol train parts and test parts.
-        This ensures every symbol is represented in both train and test.
+        Why the boundary is computed there (PR-K)
+        -----------------------------------------
+        It used to be a per-symbol ``head(80%) / tail(20%)`` cut **by rows**,
+        taken after the regime filter. Symbols survive the filter in
+        different numbers, so each symbol's cut landed on a different date
+        and the concatenated train frame overlapped test by weeks — WR / PF
+        were scored on rows the booster had already fitted. Cutting once,
+        on the combined frame, fixes that; cutting *before* the filter also
+        keeps the OOS window identical across regimes, so their metrics stay
+        comparable. It is computed *after* the target step because the
+        triple barrier drops the trailing ``max_holding`` bars (and, with
+        ``drop_timeout``, interior rows) — the span that matters is the one
+        that actually reaches the booster.
 
         Returns ``(train_df, test_df)``.
         """
-        train_parts: list[pl.DataFrame] = []
-        test_parts: list[pl.DataFrame] = []
+        # Stale-state guard: a reused trainer must not stamp the previous
+        # run's boundary into the next manifest.
+        self._oos_start_ms = None
+
+        labelled_parts: list[pl.DataFrame] = []
 
         for symbol in self.config.symbols:
             # Load single symbol
@@ -379,39 +435,200 @@ class LGBMTrainer:
                     threshold_atr_multiplier=self.config.threshold_atr_multiplier,
                 )
 
-            # Regime filter AFTER target creation
-            if self.config.regime != "all":
-                sym_df = self._filter_by_regime(sym_df, self.config.regime)
-                if sym_df.is_empty():
-                    _log.warning(
-                        f"No data for {symbol} after regime filter "
-                        f"'{self.config.regime}' — skipping"
-                    )
-                    continue
+            labelled_parts.append(sym_df)
 
-            # Per-symbol temporal split
-            n = len(sym_df)
-            train_n = int(n * (1 - self.config.test_size_pct))
-            train_parts.append(sym_df.head(train_n))
-            test_parts.append(sym_df.tail(n - train_n))
-
-            _log.info(
-                f"  {symbol}: {n} rows → train={train_n}, "
-                f"test={n - train_n}"
-            )
-
-        if not train_parts:
+        if not labelled_parts:
             raise ValueError("No data loaded — check features_dir and symbols")
 
-        train_df = pl.concat(train_parts, how="diagonal")
-        test_df = pl.concat(test_parts, how="diagonal")
+        labelled = pl.concat(labelled_parts, how="diagonal")
+
+        # ---- One boundary for every symbol and every regime -------------
+        oos_start_ms = compute_default_oos_start_ms(
+            labelled,
+            time_col="open_time",
+            oos_fraction=self.config.test_size_pct,
+        )
+        self._oos_start_ms = oos_start_ms
+        oos_start_iso = datetime.fromtimestamp(
+            oos_start_ms / 1000, tz=timezone.utc
+        ).isoformat()
+        _log.info(
+            f"OOS boundary @ {oos_start_iso} ({oos_start_ms}) — "
+            f"one cut for all symbols and regimes, computed on "
+            f"{len(labelled)} labelled rows before the regime filter"
+        )
+
+        # ---- Regime filter ----------------------------------------------
+        if self.config.regime != "all":
+            filtered = self._filter_by_regime(labelled, self.config.regime)
+        else:
+            filtered = labelled
+
+        # ---- Reject unusable symbols BEFORE the splitter sees them ------
+        # temporal_split_multi asserts on an empty test set; those asserts
+        # stay as the last line of defence, but a symbol that simply has no
+        # rows on one side of the cut must degrade to the historic
+        # warning-and-skip, not to an AssertionError.
+        keep: list[str] = []
+        for symbol in self.config.symbols:
+            sym_df = filtered.filter(pl.col("symbol") == symbol)
+            if sym_df.is_empty():
+                _log.warning(
+                    f"No data for {symbol} after regime filter "
+                    f"'{self.config.regime}' — skipping"
+                )
+                continue
+
+            n_train = int((sym_df["open_time"] < oos_start_ms).sum())
+            n_test = len(sym_df) - n_train
+            if n_train == 0 or n_test == 0:
+                empty_side = "train" if n_train == 0 else "test"
+                _log.warning(
+                    f"{symbol}: empty {empty_side} side at the OOS boundary "
+                    f"{oos_start_iso} (regime '{self.config.regime}', "
+                    f"{len(sym_df)} rows) — skipping"
+                )
+                continue
+
+            if n_test < MIN_TEST_ROWS_WARN:
+                _log.warning(
+                    f"{symbol}: only {n_test} test rows after the OOS "
+                    f"boundary (regime '{self.config.regime}') — per-symbol "
+                    f"metrics for it are noise"
+                )
+
+            keep.append(symbol)
+            _log.info(
+                f"  {symbol}: {len(sym_df)} rows → train={n_train}, "
+                f"test={n_test}"
+            )
+
+        if not keep:
+            raise ValueError(
+                "No symbol has data on both sides of the OOS boundary "
+                f"{oos_start_iso} — check features_dir, symbols and regime"
+            )
+
+        split_input = filtered.filter(pl.col("symbol").is_in(keep))
+
+        # One label horizon off the train tail, so no train label can look
+        # across the cut into test (AFML Ch.7). Measured in wall-clock time,
+        # not in rows: ``temporal_split_multi``'s ``embargo_bars`` drops N
+        # *rows*, and after the triple barrier's drop_timeout (or the regime
+        # filter) the surviving rows are far apart — N rows can span
+        # hundreds of bars and delete most of the train side. The cut and
+        # its leakage assertions still come from the splitter; only the
+        # embargo is expressed as a duration here.
+        embargo_bars = (
+            self.config.barrier_max_holding
+            if self.config.use_triple_barrier
+            else max(1, self.config.forward_bars)
+        )
+        bar_ms = _INTERVAL_MS.get(self.config.interval)
+
+        if bar_ms is None:
+            _log.warning(
+                f"Train/test embargo falling back to a row count: unknown "
+                f"bar duration for interval '{self.config.interval}' — on a "
+                f"sparse frame this over-embargoes"
+            )
+            train_df, test_df = temporal_split_multi(
+                split_input,
+                oos_start_ms=oos_start_ms,
+                symbol_col="symbol",
+                time_col="open_time",
+                embargo_bars=embargo_bars,
+            )
+        else:
+            train_df, test_df = temporal_split_multi(
+                split_input,
+                oos_start_ms=oos_start_ms,
+                symbol_col="symbol",
+                time_col="open_time",
+                embargo_bars=0,
+            )
+            # A pure time filter needs no per-symbol loop — the boundary and
+            # the horizon are the same instant for every symbol.
+            embargo_cutoff = oos_start_ms - embargo_bars * bar_ms
+            n_pre_embargo = len(train_df)
+            train_df = train_df.filter(pl.col("open_time") < embargo_cutoff)
+            _log.info(
+                f"Train/test embargo: {embargo_bars} bars "
+                f"({embargo_bars * bar_ms} ms) before the cut — dropped "
+                f"{n_pre_embargo - len(train_df)} train rows"
+            )
+
+        if train_df.is_empty():
+            raise ValueError(
+                f"Train set is empty after the {embargo_bars}-bar embargo "
+                f"before {oos_start_iso} — the labelled data does not reach "
+                f"far enough back"
+            )
 
         _log.info(
-            f"Walk-forward split (per-symbol): "
+            f"Wall-clock split @ {oos_start_iso}: "
             f"train={len(train_df)}, test={len(test_df)} "
-            f"({self.config.test_size_pct*100:.0f}% test)"
+            f"({self.config.test_size_pct*100:.0f}% OOS target), "
+            f"embargo={embargo_bars} bars"
         )
         return train_df, test_df
+
+    def _embargo_fit_end(
+        self,
+        train_df: pl.DataFrame,
+        val_split: int,
+        horizon_bars: int,
+    ) -> int:
+        """Row count LightGBM may fit on before the early-stopping val set.
+
+        The embargo is measured in **wall-clock time**, not in rows (PR-K).
+        ``prepare_data`` now returns a frame sorted by time across all
+        symbols, so ``horizon_bars`` *rows* of a three-symbol frame span
+        only a third of the interval the label horizon actually covers —
+        counting rows would silently under-embargo by that factor. Every
+        row later than ``val_start - horizon_bars × bar_duration`` is
+        dropped instead.
+
+        Falls back to the legacy row-count cut, with a warning, when the
+        frame carries no ``open_time`` or ``config.interval`` is not a
+        known bar duration — the 1H/15m scripts and the unit fixtures feed
+        frames straight into ``train()``.
+
+        The historic guard is kept in both paths: train_fit is never
+        shrunk below half of ``val_split``.
+        """
+        floor_fit_end = val_split - max(0, val_split // 2)
+        bar_ms = _INTERVAL_MS.get(self.config.interval)
+
+        if bar_ms is None or "open_time" not in train_df.columns:
+            reason = (
+                f"unknown bar duration for interval '{self.config.interval}'"
+                if bar_ms is None
+                else "no 'open_time' column in the training frame"
+            )
+            _log.warning(
+                f"Train→val embargo falling back to a row count ({reason}) — "
+                f"on a multi-symbol frame this under-embargoes by roughly "
+                f"the number of symbols"
+            )
+            return max(
+                floor_fit_end, val_split - min(horizon_bars, max(0, val_split // 2))
+            )
+
+        open_times = train_df["open_time"].to_numpy()
+        val_start_ms = int(open_times[val_split:].min())
+        cutoff_ms = val_start_ms - horizon_bars * bar_ms
+
+        # First row whose label horizon reaches into val; everything from
+        # there on is embargoed. The comparison is ``>=``: a row exactly
+        # one horizon before val_start has its label land ON the first val
+        # bar, which is the leak this embargo exists to stop. Taking the
+        # first violation (rather than a count) keeps the prefix slice
+        # honest even if a caller hands in a frame that is not perfectly
+        # time-ordered.
+        violations = np.flatnonzero(open_times[:val_split] >= cutoff_ms)
+        fit_end = int(violations[0]) if violations.size else val_split
+        return max(fit_end, floor_fit_end)
 
     # ------------------------------------------------------------------
     # Training
@@ -464,18 +681,15 @@ class LGBMTrainer:
         # a leaked, falsely-optimistic val loss and halts too early. Drop
         # one label-horizon worth of train tail rows so no train label
         # can reach across into val.
-        embargo_rows = (
+        horizon_bars = (
             self.config.barrier_max_holding
             if self.config.use_triple_barrier
             else max(1, self.config.forward_bars)
         )
-        # Guard: never shrink train_fit below half its pre-embargo size.
-        # For realistic training sets (≥ thousands of rows) this is a
-        # no-op; it only kicks in on tiny synthetic fixtures.
-        embargo_rows = min(embargo_rows, max(0, val_split // 2))
-        fit_end = val_split - embargo_rows
+        fit_end = self._embargo_fit_end(train_df, val_split, horizon_bars)
         # Manifest inputs: n_train_rows counts the frame, these two count
         # what LightGBM actually fitted on.
+        embargo_rows = val_split - fit_end
         self._embargo_rows = embargo_rows
         self._train_rows_after_embargo = fit_end
 
@@ -791,6 +1005,18 @@ class LGBMTrainer:
             "passes": result.passes_minimum_thresholds(),
             "written_despite_failing": written_despite_failing,
             "data_range": self._data_range(train_df, test_df),
+            # PR-K: the cut itself, not the first bar that survived after
+            # it. data_range's test_start_ms can sit days later when the
+            # regime filter removed the bars right after the boundary.
+            # None when the frame did not come from prepare_data.
+            "oos_start_ms": self._oos_start_ms,
+            "oos_start_iso": (
+                datetime.fromtimestamp(
+                    self._oos_start_ms / 1000, tz=timezone.utc
+                ).isoformat()
+                if self._oos_start_ms is not None
+                else None
+            ),
             "n_train_rows": len(train_df),
             "n_test_rows": len(test_df),
             "embargo_rows": self._embargo_rows,
