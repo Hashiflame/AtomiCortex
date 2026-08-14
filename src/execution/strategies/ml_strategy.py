@@ -171,6 +171,8 @@ class MLTradingStrategy(Strategy):
         self._bars: list[Bar] = []
         self._bar_count: int = 0
         self._warmup_complete: bool = False
+        # One-shot guard for the preload ts_event convention check
+        self._preload_ts_checked: bool = False
 
         # Equity curve tracking
         self._equity_curve: list[tuple[int, float]] = []
@@ -1747,11 +1749,50 @@ class MLTradingStrategy(Strategy):
                 f"bars={len(self._bars)} | "
                 f"live_state_4h={len(self._live_state.bar_buffer_4h)}"
             )
+            self._log_preload_timestamp_check(source, bars[-1])
         else:
             self.log.warning(
                 "Preload failed — waiting for live bars warmup"
             )
             self._warmup_complete = False
+
+    def _log_preload_timestamp_check(self, source: str, newest: Bar) -> None:
+        """One-shot convention check for the preloaded window.
+
+        ``ts_event`` must sit on the close-time grid: for a bar period of
+        ``P`` ms the close time is ``k*P - 1``, so ``(ts_event_ms + 1) % P``
+        is 0 exactly when preload honored ts_event = bar CLOSE time.
+
+        This is the only runtime observation of the preload path itself —
+        the TIMESTAMP DIAGNOSTIC in ``on_bar`` compares ``ts_event`` with an
+        ``open_time`` that ``add_bar`` derived from that same ``ts_event``,
+        so it restates its own arithmetic and cannot see a preload skew.
+        Placed where both sources converge, so it covers Parquet and REST
+        alike. Logging only — never changes behavior.
+        """
+        if self._preload_ts_checked:
+            return
+        self._preload_ts_checked = True
+        try:
+            period_ms = int(self._bar_period_hours() * 3_600_000)
+            ts_ms = newest.ts_event // 1_000_000
+            residual = (ts_ms + 1) % period_ms if period_ms else -1
+            msg = (
+                f"PRELOAD TIMESTAMP CHECK: source={source} "
+                f"last_ts_event_ms={ts_ms} "
+                f"derived_open_ms={ts_ms - period_ms} "
+                f"residual_ms={residual} "
+                f"bars={len(self._bars)}"
+            )
+            if residual == 0:
+                self.log.info(msg)
+            else:
+                self.log.warning(
+                    f"{msg} — preloaded ts_event is off the close-time "
+                    f"grid ({period_ms}ms period); features may be shifted"
+                )
+        except Exception as exc:
+            self.log.debug(f"Preload timestamp check failed: {exc}")
 
     def _preload_from_parquet(
         self, symbol: str, n_bars: int,
@@ -1760,6 +1801,13 @@ class MLTradingStrategy(Strategy):
 
         Uses ``DataStore.get_klines()`` over a window derived from *n_bars*
         (widened by ``_PARQUET_GAP_ALLOWANCE``) and returns the tail.
+
+        ``ts_event`` is taken from the store's ``close_time`` column — the
+        Nautilus convention for OHLCV bars is ts_event = bar CLOSE time,
+        the same rule ``AtomiCortexCatalog.load_bar_data`` follows. Frames
+        without that column are refused rather than patched up with
+        arithmetic, so the caller falls through to the REST source instead
+        of silently mixing conventions.
         """
         # Lazy import — avoid crash if DuckDB / data is missing
         from src.ingestion.data_store import DataStore
@@ -1789,9 +1837,26 @@ class MLTradingStrategy(Strategy):
                 self.log.warning("Parquet returned empty DataFrame")
                 return []
 
+            if "close_time" not in df.columns:
+                self.log.warning(
+                    "Parquet klines lack the close_time column — cannot "
+                    "honor the ts_event=close convention; discarding and "
+                    "falling back to Binance REST"
+                )
+                return []
+
+            now_ms = int(now.timestamp() * 1000)
             bars: list[Bar] = []
+            unclosed = 0
             for row in df.iter_rows(named=True):
-                ts_ns = int(row["open_time"]) * 1_000_000  # ms → ns
+                close_ms = int(row["close_time"])
+                # Skip a candle that has not finished forming yet: its OHLCV
+                # is partial and the live bar for the same candle will land
+                # on the identical open_time in LiveFeatureState.
+                if close_ms >= now_ms:
+                    unclosed += 1
+                    continue
+                ts_ns = close_ms * 1_000_000  # close_time ms → ns
                 bar = Bar(
                     bar_type=self._bar_type,
                     open=Price(float(row["open"]), precision=1),
@@ -1803,6 +1868,11 @@ class MLTradingStrategy(Strategy):
                     ts_init=ts_ns,
                 )
                 bars.append(bar)
+
+            if unclosed:
+                self.log.info(
+                    f"Parquet: dropped {unclosed} not-yet-closed bar(s)"
+                )
 
             # Sort by timestamp and take last n_bars
             bars.sort(key=lambda b: b.ts_event)
@@ -1819,6 +1889,11 @@ class MLTradingStrategy(Strategy):
         before the Nautilus event loop starts.
 
         Retries up to 3 times with 2-second delays.
+
+        ``ts_event`` comes from kline index 6 (``close_time``), matching the
+        Nautilus ts_event = bar CLOSE time convention. The endpoint returns
+        the still-forming candle as its last element (verified against
+        mainnet), so any bar whose close time has not passed yet is dropped.
         """
         import requests  # lazy — only needed for preload
 
@@ -1841,9 +1916,37 @@ class MLTradingStrategy(Strategy):
                 resp.raise_for_status()
                 raw_klines = resp.json()
 
+                # A truncated trailing row is the only position where a
+                # half-written record can appear — drop just that one.
+                if raw_klines and len(raw_klines[-1]) < 7:
+                    self.log.warning(
+                        "Binance API: trailing kline row is truncated "
+                        f"({len(raw_klines[-1])} fields) — dropping it"
+                    )
+                    raw_klines = raw_klines[:-1]
+
+                # A truncated row anywhere else would leave a hole in the
+                # series; every rolling window is positional, so a hole
+                # silently shifts them all. Refuse the batch instead — and
+                # do not retry, a short row is a format change, not a
+                # network glitch.
+                short_rows = sum(1 for k in raw_klines if len(k) < 7)
+                if short_rows:
+                    self.log.warning(
+                        f"Binance API: {short_rows} kline row(s) missing "
+                        "close_time (index 6) — refusing partial history"
+                    )
+                    return []
+
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 bars: list[Bar] = []
+                unclosed = 0
                 for k in raw_klines:
-                    ts_ns = int(k[0]) * 1_000_000  # open_time ms → ns
+                    close_ms = int(k[6])
+                    if close_ms >= now_ms:
+                        unclosed += 1
+                        continue
+                    ts_ns = close_ms * 1_000_000  # close_time ms → ns
                     bar = Bar(
                         bar_type=self._bar_type,
                         open=Price(float(k[1]), precision=1),
@@ -1858,7 +1961,8 @@ class MLTradingStrategy(Strategy):
 
                 self.log.info(
                     f"Binance API: fetched {len(bars)} klines "
-                    f"from {base_url} (attempt {attempt})"
+                    f"from {base_url} (attempt {attempt}) | "
+                    f"dropped {unclosed} not-yet-closed"
                 )
                 return bars
 

@@ -809,7 +809,9 @@ class TestPreloadFromBinanceApi:
         # Verify first bar
         assert bars[0].open.as_double() == 94000.0
         assert bars[0].close.as_double() == 94250.0
-        assert bars[0].ts_event == base_ts * 1_000_000  # ms → ns
+        # Nautilus convention: ts_event = bar CLOSE time, i.e. kline index 6
+        assert bars[0].ts_event == int(fake_klines[0][6]) * 1_000_000
+        assert bars[0].ts_init == bars[0].ts_event
 
         # Verify request was made
         mock_get.assert_called_once()
@@ -862,6 +864,7 @@ class TestPreloadFromBinanceApi:
             ts = base_ts + i * 4 * 3600 * 1000
             rows.append({
                 "open_time": ts,
+                "close_time": ts + 4 * 3600 * 1000 - 1,
                 "open": 94000.0 + i * 10,
                 "high": 94500.0 + i * 10,
                 "low": 93500.0 + i * 10,
@@ -908,6 +911,7 @@ class TestPreloadFromBinanceApi:
         df = pl.DataFrame([
             {
                 "open_time": base_ts + i * 4 * 3600 * 1000,
+                "close_time": base_ts + (i + 1) * 4 * 3600 * 1000 - 1,
                 "open": 94_000.0, "high": 94_500.0, "low": 93_500.0,
                 "close": 94_250.0, "volume": 1_000.0,
             }
@@ -1064,3 +1068,320 @@ class TestPreloadFromBinanceApi:
 
         call_url = mock_get.call_args[0][0]
         assert "fapi.binance.com" in call_url
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR-A0: PRELOAD TIMESTAMP CONVENTION (ts_event = bar CLOSE time)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Nautilus delivers ts_event = bar CLOSE time for external bars, and
+# LiveFeatureState.add_bar() undoes that (open_time = ts_event - duration).
+# Preload used to build bars from OPEN time, so every preloaded bar landed
+# in the buffer one full bar too early. These tests pin the convention on
+# both preload sources, on the seam with the first live bar, and on the
+# freshness guard that reads ts_event as an absolute timestamp.
+
+_BAR_MS = 4 * 3_600_000
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _kline(open_ms: int) -> list:
+    """Binance kline row: [open_time, o, h, l, c, vol, close_time, ...]."""
+    return [
+        open_ms, "94000.0", "94500.0", "93500.0", "94250.0", "1000.000",
+        open_ms + _BAR_MS - 1,   # 6: close_time
+        "1000000.0", 100, "500.0", "500000.0", "0",
+    ]
+
+
+def _klines_df(open_times: list[int], *, with_close_time: bool = True):
+    """Parquet-shaped kline frame (klines_4h schema subset)."""
+    import polars as pl
+
+    rows = []
+    for i, ts in enumerate(open_times):
+        row = {
+            "open_time": ts,
+            "open": 94_000.0 + i, "high": 94_500.0 + i,
+            "low": 93_500.0 + i, "close": 94_250.0 + i,
+            "volume": 1_000.0 + i,
+        }
+        if with_close_time:
+            row["close_time"] = ts + _BAR_MS - 1
+        rows.append(row)
+    return pl.DataFrame(rows)
+
+
+def _grid_open_times(n: int, *, last_closed: bool = True) -> list[int]:
+    """*n* consecutive 4H open times ending at the newest candle.
+
+    ``last_closed=False`` makes the last entry the candle that is still
+    forming right now — exactly what /fapi/v1/klines returns as its last
+    element.
+    """
+    last_open = (_now_ms() // _BAR_MS) * _BAR_MS
+    if last_closed:
+        last_open -= _BAR_MS
+    return [last_open - (n - 1 - i) * _BAR_MS for i in range(n)]
+
+
+def _opens_ending_closed_ago(n: int, hours_ago: float) -> list[int]:
+    """*n* 4H open times whose newest candle closed *hours_ago* hours ago."""
+    last_close = _now_ms() - int(hours_ago * 3_600_000)
+    last_open = last_close + 1 - _BAR_MS
+    return [last_open - (n - 1 - i) * _BAR_MS for i in range(n)]
+
+
+def _run_parquet_preload(strategy, df, n_bars: int):
+    from unittest.mock import patch
+
+    with patch("src.execution.strategies.ml_strategy.Path.resolve",
+               return_value=Path("/tmp/fake/ml_features")), \
+         patch("src.execution.strategies.ml_strategy.Path.exists",
+               return_value=True), \
+         patch("src.ingestion.data_store.DataStore.__init__", return_value=None), \
+         patch("src.ingestion.data_store.DataStore.get_klines", return_value=df), \
+         patch("src.ingestion.data_store.DataStore.close"):
+        return strategy._preload_from_parquet("BTCUSDT", n_bars)
+
+
+def _run_api_preload(strategy, klines: list, n_bars: int):
+    from unittest.mock import patch
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = klines
+    resp.raise_for_status = MagicMock()
+    with patch("requests.get", return_value=resp) as mock_get:
+        bars = strategy._preload_from_binance_api("BTCUSDT", n_bars)
+    return bars, mock_get
+
+
+def _run_full_preload_via_api(strategy, klines: list):
+    """_preload_historical_bars() with Parquet absent (the VM's real case)."""
+    from unittest.mock import patch
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = klines
+    resp.raise_for_status = MagicMock()
+    with patch.object(strategy, "_preload_from_parquet", return_value=[]), \
+         patch("requests.get", return_value=resp):
+        strategy._preload_historical_bars()
+
+
+def _run_full_preload_via_parquet(strategy, df):
+    """_preload_historical_bars() driving the real _preload_from_parquet."""
+    from unittest.mock import patch
+
+    api = MagicMock(return_value=[])
+    with patch("src.execution.strategies.ml_strategy.Path.resolve",
+               return_value=Path("/tmp/fake/ml_features")), \
+         patch("src.execution.strategies.ml_strategy.Path.exists",
+               return_value=True), \
+         patch("src.ingestion.data_store.DataStore.__init__", return_value=None), \
+         patch("src.ingestion.data_store.DataStore.get_klines", return_value=df), \
+         patch("src.ingestion.data_store.DataStore.close"), \
+         patch.object(strategy, "_preload_from_binance_api", api):
+        strategy._preload_historical_bars()
+    return api
+
+
+def _real_bar(strategy, ts_event_ms: int):
+    """A genuine Nautilus Bar (not a mock) stamped at *ts_event_ms*."""
+    from nautilus_trader.model.data import Bar
+    from nautilus_trader.model.objects import Price, Quantity
+
+    ts_ns = ts_event_ms * 1_000_000
+    return Bar(
+        bar_type=strategy._bar_type,
+        open=Price(94_000.0, precision=1),
+        high=Price(94_500.0, precision=1),
+        low=Price(93_500.0, precision=1),
+        close=Price(94_250.0, precision=1),
+        volume=Quantity(1_000.0, precision=3),
+        ts_event=ts_ns,
+        ts_init=ts_ns,
+    )
+
+
+@pytest.fixture
+def guard_config() -> MLStrategyConfig:
+    """Config whose history_bars clears the >= 50 Parquet acceptance bar.
+
+    _preload_from_parquet truncates to n_bars, so with the default
+    history_bars=10 the Parquet source can never be accepted and the REST
+    fallback runs regardless of freshness — which would make the guard
+    tests below vacuous.
+    """
+    return MLStrategyConfig(
+        instrument_id="BTCUSDT-PERP.BINANCE",
+        bar_type="BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL",
+        initial_equity=10_000.0,
+        warmup_bars=10,
+        history_bars=60,
+        dry_run=True,
+    )
+
+
+class TestPreloadTimestampConvention:
+    """PR-A0: preload must stamp ts_event with the bar's CLOSE time."""
+
+    def test_preload_parquet_ts_event_is_close_time(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Parquet preload takes ts_event from the close_time column."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(5)
+
+        bars = _run_parquet_preload(strategy, _klines_df(opens), 5)
+
+        assert len(bars) == 5
+        for bar, open_ms in zip(bars, opens):
+            assert bar.ts_event == (open_ms + _BAR_MS - 1) * 1_000_000
+            assert bar.ts_init == bar.ts_event
+
+    def test_preload_binance_ts_event_is_close_time(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """REST preload takes ts_event from kline index 6 (close_time)."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(5)
+        klines = [_kline(o) for o in opens]
+
+        bars, _ = _run_api_preload(strategy, klines, 5)
+
+        assert len(bars) == 5
+        for bar, k in zip(bars, klines):
+            assert bar.ts_event == int(k[6]) * 1_000_000
+            assert bar.ts_init == bar.ts_event
+
+    def test_preload_parquet_without_close_time_returns_empty(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Legacy Parquet without close_time → fail soft to the REST source.
+
+        Deriving close_time arithmetically would hide the schema drift; an
+        empty result drops below the >= 50 acceptance bar and lets
+        _preload_historical_bars fall through to Binance REST.
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        df = _klines_df(_grid_open_times(60), with_close_time=False)
+
+        bars = _run_parquet_preload(strategy, df, 60)
+
+        assert bars == []
+
+    def test_preload_binance_short_kline_row_handling(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Truncated rows: tail row is dropped, an interior one aborts.
+
+        An interior gap would silently shift every positional rolling
+        window (CVD, volume, funding/OI z-scores, regime detection), which
+        is worse than warming up from live bars.
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(4)
+        klines = [_kline(o) for o in opens]
+
+        interior = [list(k) for k in klines]
+        interior[1] = interior[1][:6]
+        bars, mock_get = _run_api_preload(strategy, interior, 4)
+        assert bars == []
+        assert mock_get.call_count == 1          # no pointless retries
+
+        tail = [list(k) for k in klines]
+        tail[-1] = tail[-1][:6]
+        bars_tail, _ = _run_api_preload(strategy, tail, 4)
+        assert len(bars_tail) == 3
+        assert bars_tail[-1].ts_event == (opens[-2] + _BAR_MS - 1) * 1_000_000
+
+    def test_preload_drops_unclosed_last_kline(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """The still-forming candle must not enter the buffer.
+
+        Verified against mainnet: /fapi/v1/klines returns the in-progress
+        candle as its last element, with close_time in the future.
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(4, last_closed=False)
+
+        bars, _ = _run_api_preload(strategy, [_kline(o) for o in opens], 4)
+        assert len(bars) == 3
+        assert bars[-1].ts_event // 1_000_000 < _now_ms()
+
+        bars_pq = _run_parquet_preload(strategy, _klines_df(opens), 4)
+        assert len(bars_pq) == 3
+        assert bars_pq[-1].ts_event // 1_000_000 < _now_ms()
+
+    def test_preload_bar_lands_on_its_own_open_time_in_live_state(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """A preloaded candle keeps its own open_time in the 4H buffer."""
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(60)
+
+        _run_full_preload_via_api(strategy, [_kline(o) for o in opens])
+
+        newest = strategy._live_state.bar_buffer_4h[-1]["open_time"]
+        assert newest == opens[-1] - 1              # its own grid slot - 1ms
+        assert newest != opens[-1] - _BAR_MS        # not one bar too early
+
+    def test_preload_live_seam_is_exactly_one_bar_duration(
+        self, default_strategy_config: MLStrategyConfig,
+    ) -> None:
+        """Last preloaded bar and first live bar: no gap, no overlap.
+
+        on_bar() cannot run outside a Nautilus engine, so the live side is
+        modelled by its only timestamp-bearing step — add_bar().
+        """
+        strategy = MLTradingStrategy(config=default_strategy_config)
+        opens = _grid_open_times(60)
+        _run_full_preload_via_api(strategy, [_kline(o) for o in opens])
+
+        buf = strategy._live_state.bar_buffer_4h
+        before = len(buf)
+        last_preload_bar = strategy._bars[-1]
+
+        live_open = opens[-1] + _BAR_MS
+        live_bar = _real_bar(strategy, live_open + _BAR_MS - 1)
+        strategy._live_state.add_bar(live_bar, interval="4h")
+
+        assert len(buf) == before + 1
+        assert buf[-1]["open_time"] - buf[-2]["open_time"] == _BAR_MS
+        times = [r["open_time"] for r in buf]
+        assert len(set(times)) == len(times)       # no duplicate slot
+        assert live_bar.ts_event - last_preload_bar.ts_event == (
+            _BAR_MS * 1_000_000
+        )
+
+    def test_freshness_guard_keeps_bars_closed_within_two_periods(
+        self, guard_config: MLStrategyConfig,
+    ) -> None:
+        """Parquet closing 6h ago is fresh (threshold = 2 x 4h = 8h)."""
+        strategy = MLTradingStrategy(config=guard_config)
+        df = _klines_df(_opens_ending_closed_ago(60, 6.0))
+
+        api = _run_full_preload_via_parquet(strategy, df)
+
+        api.assert_not_called()
+        assert strategy._warmup_complete is True
+        assert len(strategy._bars) == guard_config.history_bars
+
+    def test_freshness_guard_discards_bars_closed_beyond_two_periods(
+        self, guard_config: MLStrategyConfig,
+    ) -> None:
+        """Parquet closing 9h ago is stale → REST fallback runs."""
+        strategy = MLTradingStrategy(config=guard_config)
+        df = _klines_df(_opens_ending_closed_ago(60, 9.0))
+
+        api = _run_full_preload_via_parquet(strategy, df)
+
+        api.assert_called_once_with("BTCUSDT", guard_config.history_bars)
+        assert strategy._bars == []
+        assert strategy._warmup_complete is False
