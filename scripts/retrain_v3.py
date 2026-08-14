@@ -144,6 +144,9 @@ def run_best_only(
         pos_frac = n_pos / len(train_df) if len(train_df) else 0.0
         model = trainer.train(train_df)
         result = trainer.evaluate(model, test_df)
+        # PR-G: train() no longer writes — save after the eval so the
+        # bundle carries barriers, metrics and the data window.
+        trainer.save_bundle(model, result, train_df, test_df)
         summary[regime] = {
             "cell": cell,
             "pos_frac": pos_frac,
@@ -264,6 +267,10 @@ def run_grid(
 
                 model = trainer.train(train_df)
                 result = trainer.evaluate(model, test_df)
+                # Grid cells all share one filename in v3/_grid/, so this
+                # keeps overwriting — manifest included. Unique per-cell
+                # names are deliberately out of PR-G scope.
+                trainer.save_bundle(model, result, train_df, test_df)
                 proxy = _sharpe_proxy(result)
                 proxies.append(proxy)
                 cells.append({
@@ -304,6 +311,7 @@ def run_grid(
         train_df, test_df = winner.prepare_data()
         model = winner.train(train_df)
         final_result = winner.evaluate(model, test_df)
+        winner.save_bundle(model, final_result, train_df, test_df)
 
         summary[regime] = {
             "best_cell": best["cell"],

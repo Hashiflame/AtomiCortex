@@ -139,15 +139,14 @@ def train_regime_model(
         # Evaluate
         result = trainer.evaluate(model, test_df)
 
-        # Rename model file to 15m convention
-        old_path = models_dir / f"{config.regime}_model.pkl"
-        new_path = models_dir / f"{model_type}_model_15m.pkl"
-        if old_path.exists():
-            old_path.rename(new_path)
-            _log.info(f"  Model saved: {new_path}")
-        elif not new_path.exists():
-            # If LGBMTrainer saved with a different name, find it
-            _log.warning(f"  Expected {old_path} not found, check models_dir")
+        # Save under the 15m convention. PR-G: save_bundle names the
+        # artifact directly, so there is no generic "{regime}_model.pkl"
+        # to rename (and nothing to guess about if it is missing).
+        new_path = trainer.save_bundle(
+            model, result, train_df, test_df,
+            filename=f"{model_type}_model_15m.pkl",
+        )
+        _log.info(f"  Model saved: {new_path}")
 
         return result, new_path
 

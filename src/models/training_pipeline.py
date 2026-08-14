@@ -73,9 +73,14 @@ class TrainingPipeline:
                 train_df, test_df = trainer.prepare_data()
                 model = trainer.train(train_df)
                 result = trainer.evaluate(model, test_df)
+                # PR-G: train() no longer writes — the bundle (with its
+                # manifest) is saved here, after the eval exists.
+                trainer.save_bundle(model, result, train_df, test_df)
                 results[regime] = result
             except Exception as exc:
-                _log.error(f"Training failed for regime '{regime}': {exc}")
+                # Includes save failures: a swallowed write error would
+                # look exactly like a successful run with no model.
+                _log.exception(f"Training failed for regime '{regime}': {exc}")
                 continue
 
         return results

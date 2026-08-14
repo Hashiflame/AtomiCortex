@@ -483,8 +483,11 @@ class TestModelSavesPkl:
 
     def test_pkl_file_created(self, tmp_path: Path):
         trainer, _, models_dir = _make_trainer(tmp_path, regime="all")
-        train_df, _ = trainer.prepare_data()
-        trainer.train(train_df)
+        train_df, test_df = trainer.prepare_data()
+        # PR-G: train() no longer writes; save_bundle does, after eval.
+        model = trainer.train(train_df)
+        result = trainer.evaluate(model, test_df)
+        trainer.save_bundle(model, result, train_df, test_df)
 
         pkl_path = models_dir / "all_model.pkl"
         assert pkl_path.exists()
@@ -497,7 +500,9 @@ class TestModelLoadsAndPredicts:
     def test_load_and_predict(self, tmp_path: Path):
         trainer, _, models_dir = _make_trainer(tmp_path, regime="all")
         train_df, test_df = trainer.prepare_data()
-        trainer.train(train_df)
+        model = trainer.train(train_df)
+        result = trainer.evaluate(model, test_df)
+        trainer.save_bundle(model, result, train_df, test_df)
 
         pkl_path = models_dir / "all_model.pkl"
         with open(pkl_path, "rb") as f:

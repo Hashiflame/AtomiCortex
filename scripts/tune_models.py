@@ -481,6 +481,10 @@ class OptunaTrainer:
         full_train = pl.concat([train_df, test_df], how="diagonal")
         model = trainer.train(full_train)
         result = trainer.evaluate(model, test_df)
+        # PR-G: train() no longer writes. The manifest's data_range
+        # therefore covers full_train (train+test) — matching what the
+        # booster actually saw, in-sample eval and all.
+        trainer.save_bundle(model, result, full_train, test_df)
 
         _log.info(
             f"Retrained [{regime}]: WR={result.win_rate}%, "

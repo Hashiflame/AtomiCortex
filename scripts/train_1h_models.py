@@ -140,12 +140,14 @@ def train_regime_model(
         # Evaluate
         result = trainer.evaluate(model, test_df)
 
-        # Rename model file to 1H convention
-        old_path = models_dir / f"{regime}_model.pkl"
-        new_path = models_dir / f"{regime}_model_1h.pkl"
-        if old_path.exists():
-            old_path.rename(new_path)
-            _log.info(f"  Model saved: {new_path}")
+        # Save under the 1H convention. PR-G: save_bundle names the
+        # artifact directly, so there is no longer a generic
+        # "{regime}_model.pkl" to rename away.
+        new_path = trainer.save_bundle(
+            model, result, train_df, test_df,
+            filename=f"{regime}_model_1h.pkl",
+        )
+        _log.info(f"  Model saved: {new_path}")
 
         return result, new_path
 

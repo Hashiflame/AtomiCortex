@@ -18,9 +18,14 @@ Phase 3 — Step 3.4.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import pickle
+import subprocess
+import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +39,19 @@ from src.logger import get_logger
 from src.models.dataset_builder import DatasetBuilder
 
 _log = get_logger(__name__)
+
+# PR-G: version of the ``manifest`` dict embedded in every model bundle.
+# Bump whenever a key is renamed or removed (adding keys is backwards
+# compatible for readers that use .get()).
+MANIFEST_SCHEMA_VERSION: int = 1
+
+# Repo root — used only to resolve the git SHA stamped into the manifest.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Paths already warned about for a missing manifest. Strategies reload
+# bundles (MetaSignalGate is constructed per strategy instance), and one
+# WARNING per load would drown the log.
+_MANIFEST_WARNED_PATHS: set[str] = set()
 
 # Symbol → integer encoding (deterministic)
 SYMBOL_ENCODING: dict[str, int] = {
@@ -84,6 +102,29 @@ MTF_LGBM_PARAMS: dict[str, Any] = {
 }
 
 
+def _git_commit() -> str | None:
+    """Short SHA of the working tree, or None if it cannot be determined.
+
+    Best-effort provenance only: no git, no repo, a timeout or any other
+    failure must never take a training run down.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001 — provenance is optional
+        _log.debug(f"git_commit unavailable: {exc}")
+        return None
+    if proc.returncode != 0:
+        _log.debug(f"git_commit unavailable: git exited {proc.returncode}")
+        return None
+    return proc.stdout.strip() or None
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -94,6 +135,10 @@ class ModelConfig:
 
     regime: str  # "trend", "range", "high_vol", "all"
     symbols: list[str]
+    # Bar interval the features were built on. Not used by training —
+    # it exists so the model bundle's manifest records which timeframe
+    # the weights belong to (PR-G). 4H is the production default.
+    interval: str = "4h"
     forward_bars: int = 1
     threshold_atr_multiplier: float = 0.5  # unused (binary target ignores it)
     test_size_pct: float = 0.2
@@ -220,6 +265,14 @@ class LGBMTrainer:
         )
         self._feature_columns: list[str] = []
 
+        # PR-G — training facts the manifest needs but that only exist
+        # inside train(). Reset at the top of every train() so a reused
+        # trainer instance can never stamp a previous run's values into
+        # the next bundle.
+        self._effective_lgbm_params: dict[str, Any] = {}
+        self._embargo_rows: int | None = None
+        self._train_rows_after_embargo: int | None = None
+
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
@@ -321,10 +374,24 @@ class LGBMTrainer:
         3. Split last 10% of training data for validation (early stopping).
         4. Train with ``lgb.train`` + early stopping (50 rounds).
         5. Log to MLflow (parameters, losses, feature importance).
-        6. Save model to ``models_dir/{regime}_model.pkl``.
 
         Returns the trained Booster.
+
+        PR-G: this method no longer writes anything to disk. The bundle
+        is written by :meth:`save_bundle`, which is the first point where
+        the evaluation exists — a model file with no provenance was the
+        whole problem. Callers must therefore do::
+
+            booster = trainer.train(train_df)
+            result  = trainer.evaluate(booster, test_df)
+            trainer.save_bundle(booster, result, train_df, test_df)
         """
+        # Stale-state guard: a reused trainer must never carry the
+        # previous run's params/embargo into the next manifest.
+        self._effective_lgbm_params = {}
+        self._embargo_rows = None
+        self._train_rows_after_embargo = None
+
         X_train, y_train, feature_names = self._prepare_xy(train_df)
         self._feature_columns = feature_names
         _log.info(f"Feature columns ({len(feature_names)}): {feature_names[:5]}...")
@@ -351,6 +418,10 @@ class LGBMTrainer:
         # no-op; it only kicks in on tiny synthetic fixtures.
         embargo_rows = min(embargo_rows, max(0, val_split // 2))
         fit_end = val_split - embargo_rows
+        # Manifest inputs: n_train_rows counts the frame, these two count
+        # what LightGBM actually fitted on.
+        self._embargo_rows = embargo_rows
+        self._train_rows_after_embargo = fit_end
 
         X_val = X_train[val_split:]
         y_val = y_train[val_split:]
@@ -420,6 +491,11 @@ class LGBMTrainer:
                 f"val_frac={1 - val_frac:.0%}, early_stop={stopping_rounds})"
             )
 
+        # Snapshot what lgb.train actually receives — after the MTF swap
+        # and the min_child_samples override — so the manifest records
+        # the real hyperparameters, not ModelConfig's defaults.
+        self._effective_lgbm_params = dict(params)
+
         callbacks = [
             lgb.early_stopping(stopping_rounds=stopping_rounds, verbose=False),
             lgb.log_evaluation(period=0),  # suppress per-iteration output
@@ -443,15 +519,71 @@ class LGBMTrainer:
         # --- MLflow logging ---
         self._log_to_mlflow(booster, feature_names)
 
-        # --- Save model + feature columns ---
+        # NOTE: no disk write here — see save_bundle().
+        return booster
+
+    # ------------------------------------------------------------------
+    # Persistence — bundle + manifest (PR-G)
+    # ------------------------------------------------------------------
+
+    def save_bundle(
+        self,
+        booster: lgb.Booster,
+        result: EvaluationResult,
+        train_df: pl.DataFrame,
+        test_df: pl.DataFrame,
+        *,
+        filename: str | None = None,
+    ) -> Path:
+        """Write the model bundle, stamped with a provenance manifest.
+
+        Called after ``evaluate()`` — that is the earliest moment the
+        eval metrics exist, and a bundle without them is exactly the
+        artifact whose lineage could not be reconstructed.
+
+        Parameters
+        ----------
+        booster:
+            The booster returned by :meth:`train`.
+        result:
+            The evaluation returned by :meth:`evaluate`. Required: the
+            manifest is not worth writing without it.
+        train_df / test_df:
+            The exact frames used for training and evaluation. Row counts
+            and the ``open_time`` data window are read from them.
+        filename:
+            Override the artifact name (e.g. ``"trend_model_1h.pkl"``).
+            Defaults to ``"{regime}_model{model_suffix}.pkl"``.
+
+        Returns the path written.
+        """
         # model_suffix lets v3 retrains coexist with production weights
         # (empty string → legacy "{regime}_model.pkl"; "_v3" → "_v3.pkl").
-        model_path = (
-            self.models_dir
-            / f"{self.config.regime}_model{self.config.model_suffix}.pkl"
+        name = filename or (
+            f"{self.config.regime}_model{self.config.model_suffix}.pkl"
         )
+        model_path = self.models_dir / name
+
+        if not self._effective_lgbm_params:
+            _log.warning(
+                f"save_bundle({name}): no training state on this trainer — "
+                "lgbm_params / embargo fields will be empty in the manifest "
+                "(was train() called on this instance?)"
+            )
+        if not self._feature_columns:
+            # The booster still predicts, but nothing records WHICH
+            # columns to feed it in which order — every consumer
+            # (ml_strategy, MetaSignalGate) builds its vector from this
+            # list. Written anyway; refusing is PR-I.
+            _log.warning(
+                f"save_bundle({name}): feature_columns is empty — the "
+                "bundle cannot be used for inference"
+            )
+
+        manifest = self._build_manifest(booster, result, train_df, test_df)
+
         # H13: native ``.lgb`` text save is opt-in. Default behaviour
-        # (use_native_save=False) is byte-for-byte identical to pre-H13:
+        # (use_native_save=False) keeps the historic artifact shape:
         # a single pickle bundle containing the live booster object.
         if self.config.use_native_save:
             lgb_path = model_path.with_suffix(".lgb")
@@ -459,22 +591,145 @@ class LGBMTrainer:
             model_bundle = {
                 "booster": None,                 # legacy slot kept for shape compat
                 "booster_file": lgb_path.name,   # sidecar reference for new loaders
-                "feature_columns": feature_names,
+                "feature_columns": self._feature_columns,
                 "regime": self.config.regime,
                 "symbols": self.config.symbols,
+                "manifest": manifest,
             }
         else:
             model_bundle = {
                 "booster": booster,
-                "feature_columns": feature_names,
+                "feature_columns": self._feature_columns,
                 "regime": self.config.regime,
                 "symbols": self.config.symbols,
+                "manifest": manifest,
             }
         with open(model_path, "wb") as f:
             pickle.dump(model_bundle, f)
-        _log.info(f"Model saved: {model_path} ({len(feature_names)} features)")
+        _log.info(
+            f"Model saved: {model_path} "
+            f"({manifest['n_features']} features, "
+            f"WR={result.win_rate}%, PF={result.profit_factor}, "
+            f"passes={manifest['passes']})"
+        )
+        return model_path
 
-        return booster
+    def _build_manifest(
+        self,
+        booster: lgb.Booster,
+        result: EvaluationResult,
+        train_df: pl.DataFrame,
+        test_df: pl.DataFrame,
+    ) -> dict[str, Any]:
+        """Assemble the provenance record embedded in the bundle."""
+        cfg = self.config
+
+        class_balance: float | None = None
+        if "target" in train_df.columns and len(train_df) > 0:
+            class_balance = float((train_df["target"] == 1).sum()) / len(train_df)
+
+        # What the data actually contains — a symbol whose feature file
+        # is missing is skipped with a warning upstream, so config.symbols
+        # can overstate the training set.
+        symbols_in_train: list[str] = []
+        if "symbol" in train_df.columns:
+            symbols_in_train = sorted(train_df["symbol"].unique().to_list())
+
+        return {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "regime": cfg.regime,
+            "interval": cfg.interval,
+            "symbols": list(cfg.symbols),
+            "symbols_in_train": symbols_in_train,
+            "n_features": len(self._feature_columns),
+            "feature_columns_hash": hashlib.sha256(
+                json.dumps(sorted(self._feature_columns)).encode()
+            ).hexdigest(),
+            "barriers": {
+                "pt": cfg.barrier_pt_multiplier,
+                "sl": cfg.barrier_sl_multiplier,
+                "max_holding": cfg.barrier_max_holding,
+                "use_triple_barrier": cfg.use_triple_barrier,
+            },
+            "target_kind": (
+                "triple_barrier" if cfg.use_triple_barrier else "sign_return"
+            ),
+            "forward_bars": cfg.forward_bars,
+            # The threshold eval actually ran at — NOT any production
+            # signal threshold applied later at inference.
+            "confidence_threshold": cfg.confidence_threshold,
+            "eval": {
+                "accuracy": result.accuracy,
+                "win_rate": result.win_rate,
+                "profit_factor": result.profit_factor,
+                "signal_rate": result.signal_rate,
+                "avg_confidence": result.avg_confidence,
+            },
+            # Informational in PR-G: a failing model is still written.
+            "passes": result.passes_minimum_thresholds(),
+            "data_range": self._data_range(train_df, test_df),
+            "n_train_rows": len(train_df),
+            "n_test_rows": len(test_df),
+            "embargo_rows": self._embargo_rows,
+            "train_rows_after_embargo": self._train_rows_after_embargo,
+            "class_balance": class_balance,
+            "lgbm_params": dict(self._effective_lgbm_params),
+            "use_mtf_params": self.use_mtf_params,
+            "use_uniqueness_weights": cfg.use_uniqueness_weights,
+            "feature_whitelist_size": (
+                len(cfg.feature_whitelist) if cfg.feature_whitelist else None
+            ),
+            "best_iteration": int(booster.best_iteration),
+            "num_trees": int(booster.num_trees()),
+            "git_commit": _git_commit(),
+            "lightgbm_version": lgb.__version__,
+            "python_version": sys.version.split()[0],
+        }
+
+    @staticmethod
+    def _data_range(
+        train_df: pl.DataFrame,
+        test_df: pl.DataFrame,
+    ) -> dict[str, int | str | None]:
+        """Train/test window bounds from ``open_time`` (epoch ms, UTC).
+
+        ``open_time`` is the key DataStore.get_klines filters and sorts
+        on. Frames fed in by the 1H/15m scripts are not guaranteed to
+        carry it, so a missing column degrades to None + a warning
+        instead of taking the whole save down.
+        """
+        empty: dict[str, int | str | None] = {
+            f"{side}_{suffix}": None
+            for side in ("train_start", "train_end", "test_start", "test_end")
+            for suffix in ("ms", "iso")
+        }
+        if "open_time" not in train_df.columns or "open_time" not in test_df.columns:
+            _log.warning(
+                "Manifest data_range unavailable: no 'open_time' column in "
+                "the training frames — recording nulls"
+            )
+            return empty
+        if len(train_df) == 0 or len(test_df) == 0:
+            _log.warning(
+                "Manifest data_range unavailable: empty train/test frame "
+                "(no 'open_time' values) — recording nulls"
+            )
+            return empty
+
+        bounds = {
+            "train_start": int(train_df["open_time"].min()),
+            "train_end": int(train_df["open_time"].max()),
+            "test_start": int(test_df["open_time"].min()),
+            "test_end": int(test_df["open_time"].max()),
+        }
+        out: dict[str, int | str | None] = {}
+        for key, ms in bounds.items():
+            out[f"{key}_ms"] = ms
+            out[f"{key}_iso"] = datetime.fromtimestamp(
+                ms / 1000, tz=timezone.utc
+            ).isoformat()
+        return out
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -566,6 +821,10 @@ class LGBMTrainer:
         The sidecar path is resolved relative to the pickle file's
         directory, so models can be moved as a (``.pkl`` + ``.lgb``)
         pair without breaking the link.
+
+        PR-G: bundles written before the manifest existed still load —
+        they only get a WARNING, once per path per process. Refusing to
+        load them is PR-I; VMs are running manifest-less bundles today.
         """
         pkl_path = Path(pkl_path)
         with open(pkl_path, "rb") as f:
@@ -575,6 +834,16 @@ class LGBMTrainer:
         if sidecar and booster is None:
             lgb_path = pkl_path.parent / sidecar
             bundle["booster"] = lgb.Booster(model_file=str(lgb_path))
+
+        if "manifest" not in bundle:
+            key = str(pkl_path)
+            if key not in _MANIFEST_WARNED_PATHS:
+                _MANIFEST_WARNED_PATHS.add(key)
+                _log.warning(
+                    f"Model bundle without manifest: {pkl_path} — pre-PR-G "
+                    "bundle, provenance unknown (barriers, eval metrics and "
+                    "data window cannot be recovered). Loading anyway."
+                )
         return bundle
 
     # ------------------------------------------------------------------
