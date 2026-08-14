@@ -450,9 +450,17 @@ class TestBestParamsKeys:
 class TestRetrainWithBestParams:
     """Test retrain_with_best_params saves a model."""
 
-    def test_saves_model(self, tmp_path: Path):
+    def test_saves_model(self, tmp_path: Path, monkeypatch):
         features_dir = _save_features(tmp_path, ["BTCUSDT"], n=300)
         models_dir = tmp_path / "models"
+
+        # PR-H: retrain_with_best_params saves through the armed gate,
+        # and synthetic data never clears the thresholds. Force a passing
+        # verdict so this test keeps testing what it was written for —
+        # that the retrained model reaches disk under the expected name.
+        monkeypatch.setattr(
+            EvaluationResult, "passes_minimum_thresholds", lambda self: True,
+        )
 
         tuner = OptunaTrainer(n_trials=3, n_jobs=1, timeout=120)
         optuna_result = tuner.tune_regime(

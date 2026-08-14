@@ -270,7 +270,14 @@ def run_grid(
                 # Grid cells all share one filename in v3/_grid/, so this
                 # keeps overwriting — manifest included. Unique per-cell
                 # names are deliberately out of PR-G scope.
-                trainer.save_bundle(model, result, train_df, test_df)
+                # PR-H: research artifact — allow_failing keeps a cell
+                # that misses the go-live thresholds. Rejecting it here
+                # would `continue` past cells.append() below, dropping the
+                # trial from the ranking AND from n_trials in the DSR
+                # correction, which must count every trial run.
+                trainer.save_bundle(
+                    model, result, train_df, test_df, allow_failing=True,
+                )
                 proxy = _sharpe_proxy(result)
                 proxies.append(proxy)
                 cells.append({

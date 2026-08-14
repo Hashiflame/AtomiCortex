@@ -53,6 +53,62 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # WARNING per load would drown the log.
 _MANIFEST_WARNED_PATHS: set[str] = set()
 
+
+class ModelRejectedError(Exception):
+    """PR-H: ``save_bundle`` refused to put this artifact on disk.
+
+    Its own class, not a bare ``Exception``, so a caller can tell "the
+    model is bad" apart from "the disk is unwritable" — the two need
+    opposite responses.
+
+    Attributes
+    ----------
+    reason:
+        ``"thresholds"`` — failed the go-live gate;
+        ``"no_feature_columns"`` — the bundle would be unusable for
+        inference. The latter is not waivable by ``allow_failing``.
+    path:
+        The file that was NOT written.
+    regime:
+        Regime of the rejected model (callers loop over regimes).
+    result:
+        The evaluation behind the verdict, or None when none was given.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        path: Path,
+        regime: str,
+        result: EvaluationResult | None = None,
+        detail: str = "",
+    ) -> None:
+        self.reason = reason
+        self.path = Path(path)
+        self.regime = regime
+        self.result = result
+
+        if detail:
+            body = detail
+        elif result is not None:
+            # Thresholds are quoted here for the operator's benefit only —
+            # the verdict itself comes solely from
+            # EvaluationResult.passes_minimum_thresholds().
+            body = (
+                f"failed go-live thresholds: "
+                f"WR={result.win_rate} (need >= 52.0), "
+                f"PF={result.profit_factor} (need >= 1.3), "
+                f"sig={result.signal_rate} (need >= 0.10)"
+            )
+        else:
+            body = "no EvaluationResult was supplied — nothing to verify"
+
+        super().__init__(
+            f"[{regime}] model rejected ({reason}): {body}; "
+            f"not written: {self.path}"
+        )
+
+
 # Symbol → integer encoding (deterministic)
 SYMBOL_ENCODING: dict[str, int] = {
     "BTCUSDT": 0,
@@ -534,6 +590,7 @@ class LGBMTrainer:
         test_df: pl.DataFrame,
         *,
         filename: str | None = None,
+        allow_failing: bool = False,
     ) -> Path:
         """Write the model bundle, stamped with a provenance manifest.
 
@@ -554,8 +611,25 @@ class LGBMTrainer:
         filename:
             Override the artifact name (e.g. ``"trend_model_1h.pkl"``).
             Defaults to ``"{regime}_model{model_suffix}.pkl"``.
+        allow_failing:
+            PR-H escape hatch. False (default) keeps the go-live gate
+            armed. True writes a model that failed the thresholds and
+            stamps ``written_despite_failing`` into its manifest — for
+            research runs such as the barrier grid, whose cells must all
+            be kept so the DSR multiple-testing correction still counts
+            every trial. It does NOT waive the feature-columns check.
 
         Returns the path written.
+
+        Raises
+        ------
+        ModelRejectedError
+            ``reason="no_feature_columns"`` when the bundle would carry
+            no feature list, or ``reason="thresholds"`` when the model
+            failed :meth:`EvaluationResult.passes_minimum_thresholds`
+            (or no result was supplied at all). Both checks run before
+            any file is touched, so the bundle already on disk survives
+            a rejected save untouched.
         """
         # model_suffix lets v3 retrains coexist with production weights
         # (empty string → legacy "{regime}_model.pkl"; "_v3" → "_v3.pkl").
@@ -570,17 +644,60 @@ class LGBMTrainer:
                 "lgbm_params / embargo fields will be empty in the manifest "
                 "(was train() called on this instance?)"
             )
+        # --- Gate 1: broken artifact (PR-H) ---------------------------
+        # The booster still predicts, but nothing records WHICH columns
+        # to feed it in which order — every consumer (ml_strategy,
+        # MetaSignalGate) builds its vector from this list. That is a
+        # broken artifact rather than a weak model, so allow_failing
+        # deliberately does NOT waive it. Checked first: a broken bundle
+        # outranks bad metrics as a reason.
         if not self._feature_columns:
-            # The booster still predicts, but nothing records WHICH
-            # columns to feed it in which order — every consumer
-            # (ml_strategy, MetaSignalGate) builds its vector from this
-            # list. Written anyway; refusing is PR-I.
-            _log.warning(
-                f"save_bundle({name}): feature_columns is empty — the "
-                "bundle cannot be used for inference"
+            raise ModelRejectedError(
+                reason="no_feature_columns",
+                path=model_path,
+                regime=self.config.regime,
+                result=result,
+                detail=(
+                    "feature_columns is empty — the bundle could not be "
+                    "used for inference (was train() called on this "
+                    "trainer?)"
+                ),
             )
 
-        manifest = self._build_manifest(booster, result, train_df, test_df)
+        # --- Gate 2: go-live thresholds (PR-H) ------------------------
+        # Both checks sit above _build_manifest and above the
+        # use_native_save branch on purpose: nothing may touch the
+        # filesystem before the verdict, or a rejected save would leave
+        # an orphan .lgb beside an untouched .pkl.
+        if result is None:
+            raise ModelRejectedError(
+                reason="thresholds",
+                path=model_path,
+                regime=self.config.regime,
+                result=None,
+            )
+        if not allow_failing and not result.passes_minimum_thresholds():
+            raise ModelRejectedError(
+                reason="thresholds",
+                path=model_path,
+                regime=self.config.regime,
+                result=result,
+            )
+
+        written_despite_failing = not result.passes_minimum_thresholds()
+        if written_despite_failing:
+            _log.warning(
+                f"save_bundle({name}): writing a model that FAILED the "
+                f"go-live thresholds (allow_failing=True) — "
+                f"WR={result.win_rate}%, PF={result.profit_factor}, "
+                f"sig={result.signal_rate}. Research artifact, not for "
+                "production."
+            )
+
+        manifest = self._build_manifest(
+            booster, result, train_df, test_df,
+            written_despite_failing=written_despite_failing,
+        )
 
         # H13: native ``.lgb`` text save is opt-in. Default behaviour
         # (use_native_save=False) keeps the historic artifact shape:
@@ -620,6 +737,8 @@ class LGBMTrainer:
         result: EvaluationResult,
         train_df: pl.DataFrame,
         test_df: pl.DataFrame,
+        *,
+        written_despite_failing: bool = False,
     ) -> dict[str, Any]:
         """Assemble the provenance record embedded in the bundle."""
         cfg = self.config
@@ -666,8 +785,11 @@ class LGBMTrainer:
                 "signal_rate": result.signal_rate,
                 "avg_confidence": result.avg_confidence,
             },
-            # Informational in PR-G: a failing model is still written.
+            # PR-H: the gate's verdict. A False here can only reach disk
+            # via allow_failing, which is recorded on the next line — so
+            # a research artifact is never mistaken for a vetted one.
             "passes": result.passes_minimum_thresholds(),
+            "written_despite_failing": written_despite_failing,
             "data_range": self._data_range(train_df, test_df),
             "n_train_rows": len(train_df),
             "n_test_rows": len(test_df),

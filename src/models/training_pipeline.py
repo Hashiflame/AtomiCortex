@@ -12,7 +12,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.logger import get_logger
-from src.models.lgbm_trainer import EvaluationResult, LGBMTrainer, ModelConfig
+from src.models.lgbm_trainer import (
+    EvaluationResult,
+    LGBMTrainer,
+    ModelConfig,
+    ModelRejectedError,
+)
 
 _log = get_logger(__name__)
 
@@ -77,6 +82,15 @@ class TrainingPipeline:
                 # manifest) is saved here, after the eval exists.
                 trainer.save_bundle(model, result, train_df, test_df)
                 results[regime] = result
+            except ModelRejectedError as exc:
+                # PR-H: the model trained fine and was deliberately not
+                # written. No stack trace — nothing crashed, the gate did
+                # its job. Must read differently from a real failure.
+                _log.error(
+                    f"Model rejected for regime '{regime}', nothing written: "
+                    f"{exc}"
+                )
+                continue
             except Exception as exc:
                 # Includes save failures: a swallowed write error would
                 # look exactly like a successful run with no model.

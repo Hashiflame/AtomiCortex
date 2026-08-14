@@ -485,9 +485,11 @@ class TestModelSavesPkl:
         trainer, _, models_dir = _make_trainer(tmp_path, regime="all")
         train_df, test_df = trainer.prepare_data()
         # PR-G: train() no longer writes; save_bundle does, after eval.
+        # PR-H: synthetic data never clears the go-live thresholds, and
+        # this test is about the file, not the gate.
         model = trainer.train(train_df)
         result = trainer.evaluate(model, test_df)
-        trainer.save_bundle(model, result, train_df, test_df)
+        trainer.save_bundle(model, result, train_df, test_df, allow_failing=True)
 
         pkl_path = models_dir / "all_model.pkl"
         assert pkl_path.exists()
@@ -502,7 +504,7 @@ class TestModelLoadsAndPredicts:
         train_df, test_df = trainer.prepare_data()
         model = trainer.train(train_df)
         result = trainer.evaluate(model, test_df)
-        trainer.save_bundle(model, result, train_df, test_df)
+        trainer.save_bundle(model, result, train_df, test_df, allow_failing=True)
 
         pkl_path = models_dir / "all_model.pkl"
         with open(pkl_path, "rb") as f:
@@ -543,10 +545,19 @@ class TestRegimeFilter:
 class TestTrainingPipeline:
     """Test TrainingPipeline.run across regimes."""
 
-    def test_pipeline_runs(self, tmp_path: Path):
+    def test_pipeline_runs(self, tmp_path: Path, monkeypatch):
         symbols = ["BTCUSDT"]
         features_dir = _save_features(tmp_path, symbols, n=300)
         models_dir = tmp_path / "models"
+
+        # PR-H: the pipeline saves through the armed gate, and synthetic
+        # data never clears the thresholds. Force a passing verdict so
+        # this test keeps testing what it was written for — that the
+        # pipeline runs end to end and returns a result per regime.
+        # (Rejection behaviour is covered in tests/test_model_gate.py.)
+        monkeypatch.setattr(
+            EvaluationResult, "passes_minimum_thresholds", lambda self: True,
+        )
 
         pipeline = TrainingPipeline()
         results = pipeline.run(

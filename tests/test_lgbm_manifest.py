@@ -178,6 +178,9 @@ def default_manifest(default_run: SimpleNamespace) -> dict:
         default_run.train_df,
         default_run.test_df,
         filename="manifest_probe.pkl",
+        # PR-H: synthetic fixtures never clear the go-live thresholds,
+        # and this file tests the manifest, not the gate.
+        allow_failing=True,
     )
     with open(path, "rb") as f:
         return pickle.load(f)["manifest"]
@@ -213,6 +216,7 @@ _EXPECTED_MANIFEST_KEYS = {
     "confidence_threshold",
     "eval",
     "passes",
+    "written_despite_failing",
     "data_range",
     "n_train_rows",
     "n_test_rows",
@@ -270,6 +274,7 @@ class TestSaveBundleWrites:
 
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
 
         assert path == models_dir / "all_model.pkl"
@@ -285,6 +290,7 @@ class TestSaveBundleWrites:
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
             filename="trend_model_1h.pkl",
+            allow_failing=True,
         )
 
         assert path == models_dir / "trend_model_1h.pkl"
@@ -317,6 +323,7 @@ class TestLegacyBundleHasNoManifest:
         # ---- PR-G shape: manifest present and non-empty ----
         new_path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(new_path, "rb") as f:
             new_raw = pickle.load(f)
@@ -363,6 +370,7 @@ class TestManifestContents:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -380,6 +388,7 @@ class TestManifestContents:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -414,6 +423,7 @@ class TestManifestContents:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -466,6 +476,7 @@ class TestDataRange:
             run.train_df.drop("open_time"),
             run.test_df.drop("open_time"),
             filename="no_time.pkl",
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -498,6 +509,7 @@ class TestRowsParamsFlags:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -523,6 +535,7 @@ class TestRowsParamsFlags:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -550,6 +563,7 @@ class TestRowsParamsFlags:
         path = trainer.save_bundle(
             run.booster, failing, run.train_df, run.test_df,
             filename="failing.pkl",
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -614,6 +628,7 @@ class TestLoadBundleWithoutManifest:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
 
         bundle = LGBMTrainer.load_model_bundle(path)
@@ -664,6 +679,7 @@ class TestManifestProvenance:
         run = _run(trainer)
         path = trainer.save_bundle(
             run.booster, run.result, run.train_df, run.test_df,
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             legacy_manifest = pickle.load(f)["manifest"]
@@ -678,6 +694,7 @@ class TestManifestProvenance:
         tb_run = _run(tb_trainer)
         tb_path = tb_trainer.save_bundle(
             tb_run.booster, tb_run.result, tb_run.train_df, tb_run.test_df,
+            allow_failing=True,
         )
         with open(tb_path, "rb") as f:
             tb_manifest = pickle.load(f)["manifest"]
@@ -705,6 +722,7 @@ class TestManifestProvenance:
             train_df.drop("target"),
             default_run.test_df,
             filename="no_target.pkl",
+            allow_failing=True,
         )
         with open(path, "rb") as f:
             manifest = pickle.load(f)["manifest"]
@@ -734,16 +752,58 @@ class TestEffectiveParamsState:
     def test_save_bundle_without_train_has_empty_params(
         self, tmp_path: Path, default_run: SimpleNamespace, loguru_warnings,
     ):
-        """A fresh trainer that never ran train() has nothing to report:
-        empty params + a warning, not stale values from another run."""
-        trainer, _ = _make_trainer(tmp_path)
+        """Two halves of one stale-state guard.
 
-        path = trainer.save_bundle(
-            default_run.booster,
-            default_run.result,
-            default_run.train_df,
-            default_run.test_df,
+        A trainer that never ran train() has no feature list, and PR-H
+        refuses that bundle outright — a broken artifact is not covered
+        by the escape hatch. So the manifest half of the guard (no stale
+        params bleeding in from a previous run) has to be exercised on a
+        trainer that DID train, with its captured state wiped by hand.
+        """
+        from src.models.lgbm_trainer import ModelRejectedError
+
+        # --- half 1: no feature columns → rejected, nothing written ---
+        fresh, models_dir = _make_trainer(tmp_path)
+        assert fresh._feature_columns == []
+
+        with pytest.raises(ModelRejectedError) as excinfo:
+            fresh.save_bundle(
+                default_run.booster,
+                default_run.result,
+                default_run.train_df,
+                default_run.test_df,
+                allow_failing=True,   # does not waive a broken artifact
+            )
+        assert excinfo.value.reason == "no_feature_columns"
+        assert list(models_dir.glob("*")) == []
+
+        # --- half 2: trained trainer, captured training state cleared ---
+        trainer = default_run.trainer
+        keep = (
+            dict(trainer._effective_lgbm_params),
+            trainer._embargo_rows,
+            trainer._train_rows_after_embargo,
         )
+        trainer._effective_lgbm_params = {}
+        trainer._embargo_rows = None
+        trainer._train_rows_after_embargo = None
+        try:
+            path = trainer.save_bundle(
+                default_run.booster,
+                default_run.result,
+                default_run.train_df,
+                default_run.test_df,
+                filename="stale_state.pkl",
+                allow_failing=True,
+            )
+        finally:
+            # Module-scoped fixture — leave it as we found it.
+            (
+                trainer._effective_lgbm_params,
+                trainer._embargo_rows,
+                trainer._train_rows_after_embargo,
+            ) = keep
+
         with open(path, "rb") as f:
             raw = pickle.load(f)
         manifest = raw["manifest"]
@@ -752,13 +812,9 @@ class TestEffectiveParamsState:
         assert manifest["embargo_rows"] is None
         assert manifest["train_rows_after_embargo"] is None
         assert any("save_bundle" in m for m in loguru_warnings)
-
-        # Without train() there is no feature list either: the bundle is
-        # written (fail-closed is PR-I) but is unusable for inference,
-        # and that has to be loud rather than silent.
-        assert raw["feature_columns"] == []
-        assert manifest["n_features"] == 0
-        assert any("feature_columns" in m for m in loguru_warnings)
+        # The feature list is real here — only the training state was wiped.
+        assert raw["feature_columns"] == trainer._feature_columns
+        assert manifest["n_features"] == len(trainer._feature_columns)
 
 
 # ===========================================================================
