@@ -1,0 +1,15 @@
+# AtomiCortex — systemd units that are actually deployed.
+#
+# install_units.sh installs, starts, enables and health-checks EXACTLY the
+# units listed here. Everything else in deploy/ stays in the repository but
+# is not touched on the VM: the 15m bot, the watchdogs, the REST API and the
+# reconciler are kept for reference and for the unit linters, and are not
+# part of the current paper --dry-run deployment.
+#
+# One unit name per line. Blank lines and #-comments are ignored. A name
+# with no matching file in deploy/ aborts the install.
+
+atomicortex-bot.service
+atomicortex-telegram.service
+atomicortex-signal-check.service
+atomicortex-signal-check.timer

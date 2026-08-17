@@ -1,10 +1,11 @@
 import pytest
 import sqlite3
+import sys
 from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone, timedelta
 
 from src.monitoring.telegram_reporter import TelegramReporter
-from scripts.check_signal_freshness import check_freshness
+from scripts.check_signal_freshness import check_freshness, get_parser, main
 
 
 @pytest.fixture
@@ -85,13 +86,19 @@ def test_no_table_triggers_alert(tmp_path, mock_reporter, now_fn):
     assert "signals_log" in mock_reporter.send_alert.call_args[0][0]
 
 
-def test_missing_db_skipped_with_warning(tmp_path, mock_reporter, now_fn):
+def test_missing_db_file_triggers_alert(tmp_path, mock_reporter, now_fn):
+    """R7: a DB file that is not on disk is a monitoring failure, not a skip.
+
+    Replaces test_missing_db_skipped_with_warning, whose assertions were the
+    exact opposite: silence was the bug PR-0.6 exists to remove.
+    """
     db_path = str(tmp_path / "missing.db")
     thresholds = {"missing.db": 48.0}
     alerts = check_freshness([db_path], thresholds, mock_reporter, now_fn)
 
-    assert alerts == 0
-    mock_reporter.send_alert.assert_not_called()
+    assert alerts == 1
+    mock_reporter.send_alert.assert_called_once()
+    assert "missing.db" in mock_reporter.send_alert.call_args[0][0]
 
 
 def test_per_db_thresholds(tmp_path, mock_reporter, now_fn):
@@ -152,3 +159,338 @@ def test_null_reporter_still_counts_alerts(tmp_path, now_fn):
     
     alerts = check_freshness([db_path], thresholds, reporter, now_fn)
     assert alerts == 1
+
+
+# ===========================================================================
+# PR-0.6
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the PR-0.6 blocks
+# ---------------------------------------------------------------------------
+
+class _StubSettings:
+    """Just the fields main() reads — no .env, no pydantic, no banner."""
+
+    telegram_bot_token = "stub-token"
+    telegram_admin_id = "42"
+    signal_stale_hours_4h = 48.0
+    signal_stale_hours_15m = 6.0
+    signal_stale_hours_default = 48.0
+    signal_alert_cooldown_hours = 24.0
+
+
+@pytest.fixture
+def main_env(tmp_path, monkeypatch):
+    """main() rooted at tmp_path, with Telegram and logging stubbed out.
+
+    Returns ``(module, reporter)``.  ``data/`` exists but is empty, which is
+    the P3 case; tests that need a database create one inside it.
+    """
+    import scripts.check_signal_freshness as mod
+
+    reporter = MagicMock()
+    reporter.send_alert = AsyncMock(return_value=True)
+
+    monkeypatch.setattr(mod, "_ROOT", tmp_path)
+    monkeypatch.setattr(mod, "get_settings", lambda: _StubSettings())
+    monkeypatch.setattr(mod, "setup_logging", lambda *a, **kw: None)
+    monkeypatch.setattr(mod, "TelegramReporter", lambda *a, **kw: reporter)
+    monkeypatch.setattr(sys, "argv", ["check_signal_freshness.py"])
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "logs").mkdir()
+    return mod, reporter
+
+
+def _capture_error_logs():
+    """Context-manager-free loguru ERROR sink: returns (records, remove_fn)."""
+    from loguru import logger as _loguru_logger
+
+    records: list[str] = []
+    sink_id = _loguru_logger.add(records.append, level="ERROR")
+    return records, lambda: _loguru_logger.remove(sink_id)
+
+
+def _messages(reporter):
+    """Every message passed to send_alert, in call order."""
+    return [call.args[0] for call in reporter.send_alert.call_args_list]
+
+
+# ---------------------------------------------------------------------------
+# P3 / R6 — main(): no database at all is a monitoring failure
+# ---------------------------------------------------------------------------
+
+def test_main_exits_1_when_no_db(main_env):
+    """R6: absence of any atomicortex*.db must leave the unit failed."""
+    mod, _reporter = main_env
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_main_alerts_when_no_db(main_env):
+    """P3: the checker must shout, not return silently."""
+    mod, reporter = main_env
+
+    with pytest.raises(SystemExit):
+        mod.main()
+
+    reporter.send_alert.assert_called_once()
+    assert "data" in reporter.send_alert.call_args[0][0]
+
+
+def test_main_logs_error_not_warning_when_no_db(main_env):
+    """A monitoring outage belongs at ERROR; WARNING scrolls past unread."""
+    mod, _reporter = main_env
+    records, remove = _capture_error_logs()
+    try:
+        with pytest.raises(SystemExit):
+            mod.main()
+    finally:
+        remove()
+
+    assert records, "no ERROR record emitted for a missing database"
+
+
+def test_main_exits_0_when_db_present(main_env):
+    """R6 is scoped to the no-database case; a healthy run still returns 0."""
+    mod, reporter = main_env
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    setup_db(str(mod._ROOT / "data" / "atomicortex.db"), created_at=fresh)
+
+    mod.main()  # must not raise SystemExit
+
+    reporter.send_alert.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# R8 — argument parser
+# ---------------------------------------------------------------------------
+
+def test_parser_threshold_flags_default_to_none():
+    """The existing overrides mean 'take it from Settings', not 'zero'."""
+    args = get_parser().parse_args([])
+    assert args.threshold_4h is None
+    assert args.threshold_15m is None
+    assert args.threshold_default is None
+
+
+def test_parser_accepts_alert_cooldown_hours():
+    """R8: the de-duplication window is overridable from the command line."""
+    args = get_parser().parse_args(["--alert-cooldown-hours", "6"])
+    assert args.alert_cooldown_hours == 6.0
+    assert isinstance(args.alert_cooldown_hours, float)
+
+
+def test_parser_alert_cooldown_defaults_to_none():
+    """Same convention as the thresholds: None means 'use Settings'."""
+    args = get_parser().parse_args([])
+    assert args.alert_cooldown_hours is None
+
+
+# ---------------------------------------------------------------------------
+# P4 — de-duplication
+# ---------------------------------------------------------------------------
+
+def test_repeated_call_alerts_twice_without_store(tmp_path, mock_reporter, now_fn):
+    """CONTROL for the whole de-duplication block.
+
+    Without a store the same starvation alerts on every call.  If this ever
+    goes green for the wrong reason — a cached connection, a memoised
+    result, a reused mock — the suppression tests below would pass without
+    the store doing anything.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn)
+
+    assert first == 1
+    assert second == 1
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_cooldown_suppresses_second_alert(tmp_path, mock_reporter, now_fn):
+    """P4: the same event on the same DB stays quiet inside the window."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+
+    assert first == 1
+    assert second == 0
+    assert mock_reporter.send_alert.call_count == 1
+
+
+def test_cooldown_expires_after_window(tmp_path, mock_reporter, now_fn):
+    """Past the window the alert fires again — suppression is not a mute."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+    later = lambda: now_fn() + timedelta(hours=25)  # noqa: E731
+    second = check_freshness([db_path], thresholds, mock_reporter, later, state, 24.0)
+
+    assert second == 1
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_event_type_change_breaks_window(tmp_path, mock_reporter, now_fn):
+    """R10: the key is (db, event) — a different failure gets through at once."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, create_table=False)          # event: no signals_log table
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+    setup_db(db_path, created_at=None)             # event: table exists, empty
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+
+    assert first == 1
+    assert second == 1
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_same_event_suppressed_across_store_instances(tmp_path, mock_reporter, now_fn):
+    """The unit is oneshot: suppression must survive process exit."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    path = tmp_path / "signal_check_state.json"
+
+    check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                    SignalAlertState(path), 24.0)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                             SignalAlertState(path), 24.0)
+
+    assert second == 0
+    assert mock_reporter.send_alert.call_count == 1
+
+
+def test_recovery_clears_state(tmp_path, mock_reporter, now_fn):
+    """R11: freshness restored drops the record, so a relapse alerts at once."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 1
+
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 0
+    assert state.load() == {}, "recovery must clear the ledger entry"
+
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 1
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_future_timestamp_does_not_suppress_forever(tmp_path, mock_reporter, now_fn):
+    """A clock that jumped backwards must not mute alerts indefinitely."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    state.record("atomicortex.db", "stale", now_fn() + timedelta(days=365))
+
+    alerts = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+
+    assert alerts == 1
+
+
+# ---------------------------------------------------------------------------
+# R9 — the alert texts must be tellable apart without reading the code
+# ---------------------------------------------------------------------------
+
+def _build_four_dbs(tmp_path, now_fn):
+    """One DB per failure mode, in a fixed order, plus a path that does not exist."""
+    no_table = str(tmp_path / "atomicortex_a.db")
+    never = str(tmp_path / "atomicortex_b.db")
+    stale = str(tmp_path / "atomicortex_c.db")
+    no_file = str(tmp_path / "atomicortex_d.db")
+
+    setup_db(no_table, create_table=False)
+    setup_db(never, created_at=None)
+    setup_db(stale, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    return [no_table, never, stale, no_file]
+
+
+def test_no_table_text_names_the_schema(tmp_path, mock_reporter, now_fn):
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, create_table=False)
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "atomicortex.db" in msg
+    assert "signals_log" in msg
+
+
+def test_never_recorded_text_is_distinct(tmp_path, mock_reporter, now_fn):
+    """R9/V8: keeps 'no signals ever recorded' and adds its own context."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=None)
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "no signals ever recorded" in msg
+    assert "has no signals_log table" not in msg
+
+
+def test_stale_text_carries_hours_and_threshold(tmp_path, mock_reporter, now_fn):
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "72.0" in msg
+    assert "48.0" in msg
+
+
+def test_four_event_texts_are_pairwise_distinct(tmp_path, mock_reporter, now_fn):
+    """No two failure modes may produce the same, or a nested, message."""
+    paths = _build_four_dbs(tmp_path, now_fn)
+    thresholds = {"default": 48.0}
+
+    alerts = check_freshness(paths, thresholds, mock_reporter, now_fn)
+    assert alerts == 4
+
+    msgs = _messages(mock_reporter)
+    assert len(set(msgs)) == 4, f"duplicate alert texts: {msgs}"
+    for i, a in enumerate(msgs):
+        for j, b in enumerate(msgs):
+            if i != j:
+                assert a not in b, f"message {i} is a substring of message {j}"
+
+
+def test_no_file_text_differs_from_all_three(tmp_path, mock_reporter, now_fn):
+    """R7's missing-file text is its own event, not a reused starvation text."""
+    paths = _build_four_dbs(tmp_path, now_fn)
+    check_freshness(paths, {"default": 48.0}, mock_reporter, now_fn)
+
+    msgs = _messages(mock_reporter)
+    no_file_msg = msgs[-1]
+    assert "atomicortex_d.db" in no_file_msg
+    assert "no signals ever recorded" not in no_file_msg
+    assert "has no signals_log table" not in no_file_msg

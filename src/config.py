@@ -100,6 +100,14 @@ class Settings(BaseSettings):
     signal_stale_hours_15m: float = Field(default=6.0, alias="SIGNAL_STALE_HOURS_15M")
     signal_stale_hours_default: float = Field(default=48.0, alias="SIGNAL_STALE_HOURS_DEFAULT")
 
+    # How long the freshness checker stays quiet after reporting the same
+    # (database, failure mode) pair.  The check runs hourly from a timer;
+    # without this window a starving database produces 24 identical
+    # Telegram messages a day.  0 disables de-duplication.
+    signal_alert_cooldown_hours: float = Field(
+        default=24.0, alias="SIGNAL_ALERT_COOLDOWN_HOURS"
+    )
+
     # Fail-fast: grace period (seconds) after node start before checking
     # engine connectivity.  Default 45 = timeout_connection(30) + margin.
     startup_grace_sec: float = Field(default=45.0, alias="STARTUP_GRACE_SEC")
