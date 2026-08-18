@@ -6,7 +6,7 @@ Reads MAX(created_at) from SQLite DBs in readonly mode and sends a
 Telegram alert if any DB has not recorded a signal for a prolonged
 period (starvation).
 
-Five distinct failure modes are reported separately, because the repair
+Six distinct failure modes are reported separately, because the repair
 is different for each one:
 
   no_file     the expected .db is not on disk at all
@@ -14,10 +14,19 @@ is different for each one:
   never       signals_log exists and has never held a row
   stale       rows exist, but the newest is older than the threshold
   no_database data/ contains no atomicortex*.db whatsoever
+  read_error  the file is there but could not be opened or queried
 
-The last one is not a starvation report but a failure of monitoring
-itself: there is nothing to watch, so the check exits non-zero and the
-oneshot unit is left in ``failed`` where ``systemctl status`` shows it.
+Three of them mean the state of a database is UNKNOWN — the check could
+not do its job — and those exit non-zero, leaving the oneshot unit in
+``failed`` where ``systemctl status`` shows it:
+
+  no_file, read_error, no_database   ->  exit 1
+
+The other three mean the state is known and bad: the check worked, the
+bot did not. They alert, but the unit still succeeds, because failing it
+would hide a real monitoring outage behind an ordinary starvation:
+
+  no_table, never, stale             ->  exit 0
 
 Because the unit is ``Type=oneshot`` fired hourly by a timer, repeat
 alerts are suppressed per (database, failure mode) through an on-disk
@@ -49,11 +58,17 @@ _log = get_logger("signal_freshness")
 # Failure modes.  Each is its own de-duplication key, so a database that
 # moves from one mode to another is reported at once instead of being
 # muted by the window opened for the previous mode.
+#
+# Three of the six say the state of a database is unknown and make main()
+# exit 1: _EVENT_NO_FILE, _EVENT_READ_ERROR and _EVENT_NO_DB.  The other
+# three — _EVENT_NO_TABLE, _EVENT_NEVER, _EVENT_STALE — say the state is
+# known and bad, which is a starvation report, not a monitoring outage.
 _EVENT_NO_FILE = "no_file"
 _EVENT_NO_TABLE = "no_table"
 _EVENT_NEVER = "never"
 _EVENT_STALE = "stale"
 _EVENT_NO_DB = "no_database"
+_EVENT_READ_ERROR = "read_error"
 
 # Ledger key for the "no database at all" event.  Not a filename — there
 # is no file to name — so it is bracketed to keep it out of the namespace
@@ -156,6 +171,7 @@ def check_freshness(
     now_fn: Callable[[], datetime],
     state: "SignalAlertState | None" = None,
     cooldown_hours: float = 0.0,
+    failures: list[str] | None = None,
 ) -> int:
     """Core logic to check freshness of signals in given DBs.
 
@@ -164,6 +180,13 @@ def check_freshness(
     delivery, which is what the caller reports.
 
     ``state`` defaults to None, which disables de-duplication entirely.
+
+    ``failures`` collects ``"<db>: <event>"`` for the modes that mean the
+    state of a database is unknown — ``no_file`` and ``read_error``.  The
+    caller turns a non-empty list into a non-zero exit.  It is filled
+    before de-duplication is consulted: suppression is about Telegram
+    traffic, never about whether the unit failed.  Defaults to None,
+    which records nothing.
     """
     alerts = 0
     now = now_fn()
@@ -182,6 +205,8 @@ def check_freshness(
                 f"for it — this check is blind, not reassuring."
             )
             _log.error(msg)
+            if failures is not None:
+                failures.append(f"{path.name}: {_EVENT_NO_FILE}")
             if _send_if_due(reporter, state, cooldown_hours, path.name,
                             _EVENT_NO_FILE, msg, now):
                 alerts += 1
@@ -190,8 +215,23 @@ def check_freshness(
         try:
             finding = _inspect_db(path, threshold_hours, now)
         except Exception as e:
-            _log.error(f"Error checking DB '{path.name}': {e}")
-            # Fail-soft
+            # R12: the read failed, so freshness is unknown — and unknown
+            # is not the same as fine.  Swallowing this was the hole PR-0.6
+            # left: the journal got an ERROR, the operator got nothing, and
+            # the unit reported success.
+            msg = (
+                f"🚨 Monitoring Failure: DB '{path.name}' could not be read!\n"
+                f"{type(e).__name__}: {e}\n"
+                f"Freshness is UNKNOWN for this database — the check reached "
+                f"the file but could not open or query it, so starvation here "
+                f"would go unnoticed."
+            )
+            _log.error(msg)
+            if failures is not None:
+                failures.append(f"{path.name}: {_EVENT_READ_ERROR}")
+            if _send_if_due(reporter, state, cooldown_hours, path.name,
+                            _EVENT_READ_ERROR, msg, now):
+                alerts += 1
             continue
 
         if finding is None:
@@ -281,8 +321,24 @@ def main() -> None:
         "default": args.threshold_default if args.threshold_default is not None else settings.signal_stale_hours_default
     }
 
-    alerts = check_freshness(db_paths, thresholds, reporter, _now, state, cooldown_hours)
+    failures: list[str] = []
+    alerts = check_freshness(db_paths, thresholds, reporter, _now, state,
+                             cooldown_hours, failures)
     _log.info(f"Freshness check completed. Alerts generated: {alerts}")
+
+    if failures:
+        # R12: same reasoning as the no-database branch above, one level
+        # down — a database whose state could not be established leaves
+        # this check blind, and blind must be visible in `systemctl
+        # status`.  The INFO line above is emitted first so the journal
+        # always carries the alert count, failed run or not.  Delivery is
+        # de-duplicated; the non-zero exit is not.
+        _log.error(
+            "Monitoring failure(s): "
+            + "; ".join(failures)
+            + " — the check could not confirm freshness"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

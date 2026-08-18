@@ -494,3 +494,257 @@ def test_no_file_text_differs_from_all_three(tmp_path, mock_reporter, now_fn):
     assert "atomicortex_d.db" in no_file_msg
     assert "no signals ever recorded" not in no_file_msg
     assert "has no signals_log table" not in no_file_msg
+
+
+# ===========================================================================
+# PR-0.7
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the PR-0.7 blocks
+# ---------------------------------------------------------------------------
+
+def _break_db_reads(monkeypatch, exc=None):
+    """Make the checker's readonly open fail, leaving setup_db working.
+
+    Only the ``uri=True`` connect — the one _inspect_db uses — is broken,
+    so a test can still build and repair databases around the failure.
+    Returns a one-element list: set ``flag[0] = False`` to let readonly
+    opens succeed again inside the same test.
+    """
+    import scripts.check_signal_freshness as mod
+
+    broken = [True]
+    real_connect = sqlite3.connect
+    failure = exc if exc is not None else sqlite3.OperationalError(
+        "unable to open database file"
+    )
+
+    def _connect(*args, **kwargs):
+        if broken[0] and kwargs.get("uri"):
+            raise failure
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(mod.sqlite3, "connect", _connect)
+    return broken
+
+
+# ---------------------------------------------------------------------------
+# R12 — a database that cannot be read is its own event, not a silent skip
+# ---------------------------------------------------------------------------
+
+def test_read_error_triggers_alert(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """The defect this PR closes: the read failed, so the check must shout.
+
+    Before the fix check_freshness logged the exception and continued, so
+    this asserted `assert 0 == 1` — nothing was sent and nothing counted.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _break_db_reads(monkeypatch)
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    assert alerts == 1
+    assert mock_reporter.send_alert.call_count == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "atomicortex.db" in msg
+    assert "could not be read" in msg
+    assert "OperationalError" in msg
+    assert "unable to open database file" in msg
+
+
+def test_read_error_control_inspect_db_really_raises(tmp_path, now_fn, monkeypatch):
+    """CONTROL for the whole read_error block.
+
+    Green before the fix and after it.  It proves the scenario really does
+    reach the `except` in check_freshness: _inspect_db raises rather than
+    returning a finding.  Without it, a zero alert count in the test above
+    could be blamed on a broken monkeypatch instead of the defect.
+    """
+    from scripts.check_signal_freshness import _inspect_db
+
+    db_path = tmp_path / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _break_db_reads(monkeypatch)
+
+    with pytest.raises(sqlite3.OperationalError):
+        _inspect_db(db_path, 48.0, now_fn())
+
+
+def test_read_error_suppressed_by_cooldown(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R12: read_error de-duplicates on (db, event) like the other five."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    _break_db_reads(monkeypatch)
+
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+
+    assert first == 1
+    assert second == 0
+    assert mock_reporter.send_alert.call_count == 1
+
+
+def test_read_error_lands_in_failures(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R12: an unreadable DB is a monitoring failure, so main() must see it."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _break_db_reads(monkeypatch)
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures)
+
+    assert alerts == 1
+    assert failures == ["atomicortex.db: read_error"]
+
+
+def test_no_file_lands_in_failures(tmp_path, mock_reporter, now_fn):
+    """R7's event joins read_error in the exit-code list: state unknown."""
+    db_path = str(tmp_path / "missing.db")
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"missing.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures)
+
+    assert alerts == 1
+    assert failures == ["missing.db: no_file"]
+
+
+def test_starvation_events_stay_out_of_failures(tmp_path, mock_reporter, now_fn):
+    """The boundary: no_table/never/stale are known-bad, not unknown.
+
+    They alert, but they must not fail the unit — the check did its job.
+    """
+    no_table = str(tmp_path / "atomicortex_a.db")
+    never = str(tmp_path / "atomicortex_b.db")
+    stale = str(tmp_path / "atomicortex_c.db")
+    setup_db(no_table, create_table=False)
+    setup_db(never, created_at=None)
+    setup_db(stale, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    failures: list[str] = []
+
+    alerts = check_freshness([no_table, never, stale], {"default": 48.0},
+                             mock_reporter, now_fn, failures=failures)
+
+    assert alerts == 3
+    assert failures == []
+
+
+def test_read_error_recorded_in_failures_even_when_alert_suppressed(
+    tmp_path, mock_reporter, now_fn, monkeypatch
+):
+    """Suppression is about Telegram traffic, never about the exit code.
+
+    A DB unreadable for days sends one message per window but must leave
+    the unit failed on every single run.
+    """
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    _break_db_reads(monkeypatch)
+
+    check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0)
+    failures: list[str] = []
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                             state, 24.0, failures)
+
+    assert second == 0
+    assert failures == ["atomicortex.db: read_error"]
+
+
+def test_main_exits_1_when_read_error(main_env, monkeypatch):
+    """R12: an unreadable DB has to leave the oneshot unit failed."""
+    mod, _reporter = main_env
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    setup_db(str(mod._ROOT / "data" / "atomicortex.db"), created_at=fresh)
+    _break_db_reads(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_main_exits_1_when_db_file_vanishes(main_env, monkeypatch):
+    """The no_file half of the same rule, through the real check_freshness.
+
+    main() globs data/, so the file exists by construction; the proxy adds
+    a path that does not, which is the TOCTOU the glob cannot rule out.
+    """
+    mod, _reporter = main_env
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    setup_db(str(mod._ROOT / "data" / "atomicortex.db"), created_at=fresh)
+
+    real_check = mod.check_freshness
+    vanished = str(mod._ROOT / "data" / "atomicortex_gone.db")
+
+    def _proxy(db_paths, *args, **kwargs):
+        return real_check([*db_paths, vanished], *args, **kwargs)
+
+    monkeypatch.setattr(mod, "check_freshness", _proxy)
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_read_error_state_cleared_after_successful_read(
+    tmp_path, mock_reporter, now_fn, monkeypatch
+):
+    """R11 covers the sixth event too: a repaired DB forgets the read_error."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    broken = _break_db_reads(monkeypatch)
+
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 1
+
+    broken[0] = False
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 0
+    assert state.load() == {}, "a readable DB must clear its read_error record"
+
+    broken[0] = True
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state, 24.0) == 1
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_read_error_text_distinct_from_all_five(tmp_path, mock_reporter, now_fn,
+                                                monkeypatch):
+    """R9 extended to six: the sixth text carries none of the other markers.
+
+    Pure string comparison against the literal markers of the five existing
+    texts — no four-database fixture is rebuilt for it.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _break_db_reads(monkeypatch)
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    msgs = _messages(mock_reporter)
+    assert len(msgs) == 1
+    read_error_msg = msgs[0]
+
+    assert "could not be read" in read_error_msg
+    for marker in (
+        "Starvation Alert",                  # no_table, never and stale
+        "has no signals_log table",          # no_table
+        "has no signals ever recorded",      # never
+        "has not had a signal",              # stale
+        "is missing from disk",              # no_file
+        "no atomicortex*.db found",          # no_database
+    ):
+        assert marker not in read_error_msg, f"read_error reuses '{marker}'"
