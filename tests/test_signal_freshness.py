@@ -209,12 +209,23 @@ def main_env(tmp_path, monkeypatch):
     # that care about the heartbeat re-stub it via _stub_heartbeat().
     # raising defaults to True: if the name ever moves, every main() test
     # fails loudly instead of quietly talking to a real Redis.
+    #
+    # PR-0.10: "not authoritative" is now expressed by the ABSENCE of
+    # last_signal_ts.  A key holding null became a claim the bot makes
+    # about itself, so leaving one here would silently change what these
+    # tests exercise and make the paragraph above untrue.  started_ts is
+    # a real recent stamp for the same reason — the old 0.0 meant 1970,
+    # which would hand any future test an age of half a century.
+    _stub_now = datetime.now(timezone.utc)
     monkeypatch.setattr(
         mod,
         "_read_heartbeat",
-        lambda url, key: ("ok", {"process_ts": 0.0, "started_ts": 0.0,
-                                 "last_bar_ts": None, "bars_seen": 0,
-                                 "last_signal_ts": None}),
+        lambda url, key: ("ok", {
+            "process_ts": _stub_now.timestamp(),
+            "started_ts": (_stub_now - timedelta(hours=10)).timestamp(),
+            "last_bar_ts": None,
+            "bars_seen": 0,
+        }),
     )
 
     (tmp_path / "data").mkdir()
@@ -792,16 +803,28 @@ def _stub_heartbeat(monkeypatch, status: str, payload: dict | None = None):
     monkeypatch.setattr(mod, "_read_heartbeat", lambda url, key: (status, payload))
 
 
+_UNSET = object()
+
+
 def _hb(now, *, last_signal_delta=None, started_delta=timedelta(hours=10),
-        omit_last_signal=False) -> dict:
-    """Build a heartbeat payload with epoch-second floats (P5)."""
+        omit_last_signal=False, last_signal_raw=_UNSET) -> dict:
+    """Build a heartbeat payload with epoch-second floats (P5).
+
+    ``last_signal_raw`` writes an arbitrary value into the field, skipping
+    the epoch conversion.  It is the only way to build the third case
+    PR-0.10 has to tell apart: the key is present and holds something that
+    is not a number.  A sentinel and not ``None``, because ``None`` is
+    itself one of the three cases.
+    """
     payload = {
         "process_ts": now.timestamp(),
         "started_ts": (now - started_delta).timestamp(),
         "last_bar_ts": (now - timedelta(minutes=5)).timestamp(),
         "bars_seen": 42,
     }
-    if not omit_last_signal:
+    if last_signal_raw is not _UNSET:
+        payload["last_signal_ts"] = last_signal_raw
+    elif not omit_last_signal:
         payload["last_signal_ts"] = (
             None if last_signal_delta is None
             else (now - last_signal_delta).timestamp()
@@ -1138,10 +1161,17 @@ def test_sqlite_read_error_not_fatal_when_redis_fresh(tmp_path, mock_reporter,
 
 def test_sqlite_read_error_still_fatal_when_redis_silent(tmp_path, mock_reporter,
                                                          now_fn, monkeypatch):
-    """CONTROL for the case above: without a first source, blind is fatal again."""
+    """CONTROL for the case above: without a first source, blind is fatal again.
+
+    PR-0.10 moved which payload means "no first source": a null
+    last_signal_ts became a claim of its own, so the absence of the key
+    is now the only shape that says the heartbeat has nothing to offer.
+    The assertion below is unchanged — only the literal expressing "no
+    first source" moved with the definition.
+    """
     db_path = str(tmp_path / "atomicortex.db")
     setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
-    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_delta=None))
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), omit_last_signal=True))
     _break_db_reads(monkeypatch)
     failures: list[str] = []
 
@@ -1341,3 +1371,434 @@ def test_main_passes_cli_redis_url_through(main_env, monkeypatch):
     mod.main()
 
     assert seen == [("redis://10.0.0.5:6380/1", "bot_15m_heartbeat")]
+
+
+# ===========================================================================
+# PR-0.10 — a present-but-null last_signal_ts is a claim, not a gap
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the PR-0.10 blocks
+# ---------------------------------------------------------------------------
+
+def _spy_db_opens(monkeypatch):
+    """Record every readonly open, without changing whether it succeeds.
+
+    Only the ``uri=True`` connect is counted — the one _inspect_db uses —
+    so ``setup_db`` and the repairs around it stay invisible.  Returns the
+    list the spy appends to.
+
+    Install it AFTER ``_break_db_reads`` when both are needed: the spy then
+    wraps the breaker and records the attempt the breaker turns into an
+    error, which is what "the ledger was not even touched" has to be
+    distinguished from.
+    """
+    import scripts.check_signal_freshness as mod
+
+    opens: list[str] = []
+    real_connect = sqlite3.connect
+
+    def _connect(*args, **kwargs):
+        if kwargs.get("uri"):
+            opens.append(str(args[0]) if args else "")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(mod.sqlite3, "connect", _connect)
+    return opens
+
+
+# Every marker of the eight events that existed before PR-0.10.
+_EIGHT_MARKERS = (
+    "has no signals_log table",      # no_table
+    "has no signals ever recorded",  # never
+    "has not had a signal",          # stale
+    "is missing from disk",          # no_file
+    "no atomicortex*.db found",      # no_database
+    "could not be read",             # read_error
+    "is not in Redis",               # no_heartbeat
+    "Bridge Lag",                    # bridge_lag
+)
+
+_NEVER_SINCE_START_MARKER = "has emitted nothing since it started"
+_BAD_PAYLOAD_MARKER = "carries an unusable last_signal_ts"
+
+
+# ---------------------------------------------------------------------------
+# The claim itself
+# ---------------------------------------------------------------------------
+
+def test_null_last_signal_ts_is_a_claim_not_a_gap(tmp_path, mock_reporter, now_fn,
+                                                  monkeypatch):
+    """A present-but-null field is the bot reporting silence, not absence of news.
+
+    The process has been up 26 hours against a 24-hour threshold and says
+    it has emitted nothing in all that time.  The ledger holds a row from
+    an hour ago — a leftover from a previous process — and must not be
+    allowed to overrule the bot's own report.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert failures == [], "a known-and-bad state must not fail the unit"
+    msg = _messages(mock_reporter)[0]
+    assert _NEVER_SINCE_START_MARKER in msg
+    assert "26.0" in msg
+    assert "24.0" in msg
+
+
+def test_null_last_signal_ts_below_threshold_is_silent(tmp_path, mock_reporter,
+                                                       now_fn, monkeypatch):
+    """CONTROL for the test above: the alert comes from the age, not from the null.
+
+    Same payload shape, same database, only the process is two hours old
+    against the same 24-hour threshold.  Without this, an alert fired for
+    every present-but-null field would pass the test above unnoticed.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=2)))
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 0
+    assert failures == []
+    assert mock_reporter.send_alert.call_count == 0
+
+
+def test_null_last_signal_ts_does_not_open_the_ledger(tmp_path, mock_reporter,
+                                                      now_fn, monkeypatch):
+    """The claim is decided on its own: the second source is never queried.
+
+    Counting alerts cannot show this — the verdicts happen to agree here.
+    Only the absence of a readonly open does.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    opens = _spy_db_opens(monkeypatch)
+
+    check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter, now_fn,
+                    redis_url=_REDIS_URL)
+
+    assert opens == [], f"the ledger was opened {len(opens)} time(s)"
+
+
+def test_null_last_signal_ts_survives_an_unreadable_ledger(tmp_path, mock_reporter,
+                                                           now_fn, monkeypatch):
+    """The production case of 2026-08-19, reproduced end to end.
+
+    A live bot that has never signalled, a database the unit cannot open
+    under ProtectHome=read-only, and a threshold the process age has
+    already passed.  The verdict comes from the heartbeat alone, so the
+    unreadable ledger is not a monitoring failure and the oneshot unit
+    must not be left failed by it.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    _break_db_reads(monkeypatch)
+    opens = _spy_db_opens(monkeypatch)
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert failures == []
+    assert opens == [], "the unreadable ledger must not even be reached"
+    msg = _messages(mock_reporter)[0]
+    assert _NEVER_SINCE_START_MARKER in msg
+    assert "could not be read" not in msg
+
+
+def test_missing_key_and_null_take_different_paths(tmp_path, mock_reporter, now_fn,
+                                                   monkeypatch):
+    """The split itself: two payloads that were indistinguishable before.
+
+    Same database, same threshold, same process age.  The four-key payload
+    says nothing and leaves the verdict to the ledger; the five-key one
+    with a null says the bot has been silent for 26 hours.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 24.0}
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26),
+                        omit_last_signal=True))
+    absent_key = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                                 redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    present_null = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                                   redis_url=_REDIS_URL)
+
+    assert absent_key == 0, "no key means unknown, and unknown defers to the ledger"
+    assert present_null == 1, "a null key is a claim, and the claim is stale"
+
+
+def test_never_since_start_text_distinct_from_the_eight(tmp_path, mock_reporter,
+                                                        now_fn, monkeypatch):
+    """Nine events, nine texts: the newcomer reuses no older marker."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+
+    check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter, now_fn,
+                    redis_url=_REDIS_URL)
+
+    msgs = _messages(mock_reporter)
+    assert len(msgs) == 1
+    for marker in _EIGHT_MARKERS:
+        assert marker not in msgs[0], f"never_since_start reuses '{marker}'"
+
+
+def test_never_since_start_deduplicated_across_runs(tmp_path, mock_reporter, now_fn,
+                                                    monkeypatch):
+    """The timer fires hourly; the operator must not hear about it hourly."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 24.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                            24.0, redis_url=_REDIS_URL)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                             24.0, redis_url=_REDIS_URL)
+
+    assert first == 1
+    assert second == 0
+    assert mock_reporter.send_alert.call_count == 1
+
+
+def test_never_since_start_cleared_when_a_signal_arrives(tmp_path, mock_reporter,
+                                                         now_fn, monkeypatch):
+    """R11 has to hold in the new branch too, or a relapse stays muted.
+
+    The recovery that drops recorded events lives behind the ledger, and
+    this branch never reaches it — so the branch has to clear the state
+    itself.  Three runs: silent bot, a real signal, silent bot again.
+    """
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 24.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                            24.0, redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1)))
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                             24.0, redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    third = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                            24.0, redis_url=_REDIS_URL)
+
+    assert first == 1
+    assert second == 0
+    assert third == 1, "the window from the first run must not survive a recovery"
+    assert mock_reporter.send_alert.call_count == 2
+
+
+def test_restart_resets_the_claim_age(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """A restart moves started_ts forward, and the claim's age with it.
+
+    Documented limitation, pinned here as a contract rather than left to be
+    rediscovered: the age is measured from the process start, so a bot
+    restarted more often than the threshold never accumulates enough
+    silence to be reported.  Measuring it otherwise needs a source that
+    outlives the process, which the heartbeat is not.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 24.0}
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(hours=26)))
+    before_restart = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                                     redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), started_delta=timedelta(minutes=5)))
+    after_restart = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                                    redis_url=_REDIS_URL)
+
+    assert before_restart == 1
+    assert after_restart == 0
+
+
+def test_unusable_started_ts_falls_back_to_the_ledger(tmp_path, mock_reporter,
+                                                      now_fn, monkeypatch):
+    """CONTROL: without a usable started_ts the claim cannot be aged.
+
+    Green before this PR and after it — that is the point.  A claim whose
+    age is unknown is no verdict at all, so the checker degrades to
+    exactly what it did before: the ledger decides.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    payload = _hb(now_fn())
+    payload.pop("started_ts")
+    _stub_heartbeat(monkeypatch, "ok", payload)
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 24.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert failures == []
+    assert "has not had a signal" in _messages(mock_reporter)[0]
+
+
+# ---------------------------------------------------------------------------
+# The third case the old code glued to the other two: not a number at all
+# ---------------------------------------------------------------------------
+
+def test_non_numeric_last_signal_ts_is_a_bad_payload(tmp_path, mock_reporter,
+                                                     now_fn, monkeypatch):
+    """A field the bot could never legitimately write means the source is broken.
+
+    Not a claim and not a transitional gap: the serialiser produces epoch
+    seconds or the contract is gone.  Degrading to the ledger would hide a
+    schema break for as long as the ledger keeps answering.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_raw="yesterday"))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = _messages(mock_reporter)[0]
+    assert _BAD_PAYLOAD_MARKER in msg
+    assert "yesterday" in msg, "the operator has to see what was actually there"
+
+
+def test_non_numeric_last_signal_ts_lands_in_failures(tmp_path, mock_reporter,
+                                                      now_fn, monkeypatch):
+    """Shouting is half of it: an unparseable first source has to fail the unit."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_raw=[1, 2, 3]))
+    failures: list[str] = []
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn,
+                    failures=failures, redis_url=_REDIS_URL)
+
+    assert failures == ["atomicortex.db: bad_payload"]
+
+
+def test_bad_payload_text_distinct_from_the_nine(tmp_path, mock_reporter, now_fn,
+                                                 monkeypatch):
+    """Ten events, ten texts — including against the ninth added by this PR."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_raw="yesterday"))
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn,
+                    redis_url=_REDIS_URL)
+
+    msgs = _messages(mock_reporter)
+    assert len(msgs) == 1
+    for marker in _EIGHT_MARKERS + (_NEVER_SINCE_START_MARKER,):
+        assert marker not in msgs[0], f"bad_payload reuses '{marker}'"
+
+
+def test_bad_payload_deduplicated_and_distinct_from_read_error(tmp_path,
+                                                               mock_reporter,
+                                                               now_fn, monkeypatch):
+    """Its own key: suppressed on repeat, and it breaks an older window.
+
+    R10 keys de-duplication on (db, event).  Sharing read_error's key would
+    have meant that a Redis outage already inside its window silently
+    swallows the first report of a corrupted payload — a second, unrelated
+    fault drowning in the window of the first.
+    """
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+
+    _stub_heartbeat(monkeypatch, "error")
+    read_error = check_freshness([db_path], thresholds, mock_reporter, now_fn,
+                                 state, 24.0, redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_raw="yesterday"))
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                            24.0, redis_url=_REDIS_URL)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                             24.0, redis_url=_REDIS_URL)
+
+    assert read_error == 1
+    assert first == 1, "a different event must get through the older window"
+    assert second == 0, "the same event inside the window must not"
+    assert mock_reporter.send_alert.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# main() — the exit code each of the two new events leaves behind
+# ---------------------------------------------------------------------------
+
+def test_main_exits_0_when_the_bot_never_signalled(main_env, monkeypatch):
+    """Known and bad is a starvation report, not a monitoring outage.
+
+    The main_env stub is overridden on purpose: its default payload is the
+    one with no last_signal_ts key at all, and this test needs the
+    opposite — the key present and null.
+    """
+    mod, reporter = main_env
+    now = datetime.now(timezone.utc)
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now, started_delta=timedelta(hours=72)))
+
+    mod.main()  # must not raise SystemExit
+
+    assert reporter.send_alert.call_count == 1
+
+
+def test_main_exits_1_when_last_signal_ts_is_corrupt(main_env, monkeypatch):
+    """An unparseable first source leaves the oneshot unit failed.
+
+    The main_env stub is overridden on purpose: its default payload omits
+    the field entirely, and this test needs the field present holding
+    something that is not a number.
+    """
+    mod, _reporter = main_env
+    now = datetime.now(timezone.utc)
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now, last_signal_raw="yesterday"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+
+    assert excinfo.value.code == 1

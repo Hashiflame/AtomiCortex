@@ -14,11 +14,29 @@ another process's private storage across the filesystem, and under the
 unit's ``ProtectHome=read-only`` a WAL database cannot create its ``-shm``
 sidecar, so the read fails while the bot is perfectly healthy.  When the
 heartbeat answers with a published timestamp it decides freshness on its
-own and SQLite is consulted only to corroborate it.  When it does not —
-no key, unreadable, or no signal published since the process started —
-the SQLite rules below apply unchanged, exactly as before this split.
+own and SQLite is consulted only to corroborate it.
 
-Eight distinct failure modes are reported separately, because the repair
+``last_signal_ts`` carries three different answers, and PR-0.10 stopped
+treating them as one:
+
+  the key is absent       nothing is claimed.  A build from before the
+                          field existed, or a payload written between the
+                          merge and the restart that introduced it.  The
+                          state is UNKNOWN and the SQLite rules below
+                          apply unchanged, exactly as before this split;
+  the key holds null      the bot is stating, about itself, that it has
+                          emitted no signal since ``started_ts``.  That is
+                          a fact, not a gap: the ledger is not consulted
+                          at all, and the claim is aged against the same
+                          threshold every other verdict uses;
+  the key holds a number  the moment the bot persisted its last signal.
+
+Anything else in that field is none of the three.  The bot's own
+serialiser writes epoch seconds or the contract is gone, so an
+unparseable value is a broken first source rather than a claim, and it is
+reported as one.
+
+Ten distinct failure modes are reported separately, because the repair
 is different for each one:
 
   no_file      the expected .db is not on disk at all
@@ -32,12 +50,18 @@ is different for each one:
                or its 60s TTL lapsed
   bridge_lag   the heartbeat published a signal that never reached the
                ledger, by more than the tolerance
+  never_since_start
+               the heartbeat claims no signal at all since the process
+               came up, and the process has been up longer than the
+               threshold
+  bad_payload  ``last_signal_ts`` is present but is not a number: the
+               heartbeat's contract with this checker is broken
 
 Some of them mean the state is UNKNOWN — the check could not do its job
 — and those exit non-zero, leaving the oneshot unit in ``failed`` where
 ``systemctl status`` shows it:
 
-  no_file, no_database, no_heartbeat               ->  exit 1
+  no_file, no_database, no_heartbeat, bad_payload  ->  exit 1
   read_error                                       ->  exit 1 ONLY when
       the heartbeat did not establish freshness.  On the Redis heartbeat
       it is always fatal — that IS the first source failing.  On the .db
@@ -49,7 +73,14 @@ The rest mean the state is known and bad: the check worked, the bot did
 not.  They alert, but the unit still succeeds, because failing it would
 hide a real monitoring outage behind an ordinary starvation:
 
-  no_table, never, stale, bridge_lag               ->  exit 0
+  no_table, never, stale, bridge_lag,
+  never_since_start                                ->  exit 0
+
+``never_since_start`` sits on the exit-0 side for the same reason: the
+bot answered, and the answer was bad.  ``bad_payload`` sits on the
+exit-1 side because the bot answered with something that is not an
+answer, which leaves freshness unestablished — the definition of UNKNOWN
+used everywhere above.
 
 ``bridge_lag`` sits deliberately on the exit-0 side.  Two sources that
 disagree are a known, contradictory state, not an unknown one, and the
@@ -99,12 +130,24 @@ _log = get_logger("signal_freshness")
 # moves from one mode to another is reported at once instead of being
 # muted by the window opened for the previous mode.
 #
-# Of the eight, _EVENT_NO_FILE, _EVENT_NO_DB and _EVENT_NO_HEARTBEAT
-# always say the state is unknown and make main() exit 1, and
-# _EVENT_READ_ERROR says so only while no heartbeat has established
-# freshness.  _EVENT_NO_TABLE, _EVENT_NEVER, _EVENT_STALE and
-# _EVENT_BRIDGE_LAG say the state is known and bad, which is a
-# starvation report, not a monitoring outage.
+# Of the ten, these four always say the state is unknown and make main()
+# exit 1 — the check could not establish freshness at all:
+#
+#   _EVENT_NO_FILE, _EVENT_NO_DB, _EVENT_NO_HEARTBEAT, _EVENT_BAD_PAYLOAD
+#
+# _EVENT_READ_ERROR says so conditionally: exit 1 only while no heartbeat
+# has established freshness, and exit 0 once one has, because then just
+# the corroboration is blind.
+#
+# These five say the state is known and bad — a starvation report, not a
+# monitoring outage — and leave the unit successful:
+#
+#   _EVENT_NO_TABLE, _EVENT_NEVER, _EVENT_STALE, _EVENT_BRIDGE_LAG,
+#   _EVENT_NEVER_SINCE_START
+#
+# _EVENT_NEVER_SINCE_START and _EVENT_BAD_PAYLOAD land on opposite sides
+# of that line although both come from the same field: a null is an
+# answer the bot is entitled to give, and a non-number is not an answer.
 _EVENT_NO_FILE = "no_file"
 _EVENT_NO_TABLE = "no_table"
 _EVENT_NEVER = "never"
@@ -113,6 +156,8 @@ _EVENT_NO_DB = "no_database"
 _EVENT_READ_ERROR = "read_error"
 _EVENT_NO_HEARTBEAT = "no_heartbeat"
 _EVENT_BRIDGE_LAG = "bridge_lag"
+_EVENT_NEVER_SINCE_START = "never_since_start"
+_EVENT_BAD_PAYLOAD = "bad_payload"
 
 # Ledger key for the "no database at all" event.  Not a filename — there
 # is no file to name — so it is bracketed to keep it out of the namespace
@@ -239,6 +284,44 @@ def _epoch_to_dt(value: Any) -> datetime | None:
         return datetime.fromtimestamp(float(value), tz=timezone.utc)
     except (TypeError, ValueError, OSError, OverflowError):
         return None
+
+
+# What ``last_signal_ts`` was found to be.  Before PR-0.10 the first
+# three collapsed into a single None, which is how a bot that had never
+# signalled was mistaken for a bot with nothing to say about signals.
+_LS_ABSENT = "absent"      # the key is not in the payload
+_LS_NEVER = "never"        # the key is there and holds null
+_LS_AT = "at"              # the key is there and holds epoch seconds
+_LS_CORRUPT = "corrupt"    # the key is there and holds something else
+
+# Sentinel for "the key is not in the payload".  A plain ``.get()``
+# default cannot express it: None is itself one of the four outcomes.
+_MISSING = object()
+
+
+def _classify_last_signal(payload: dict) -> tuple[str, datetime | None]:
+    """Tell the four meanings of ``last_signal_ts`` apart.
+
+    Returns ``(outcome, published_at)``; ``published_at`` is not None
+    only for ``_LS_AT``.
+
+    Takes a dict and never None on purpose: whether there is a heartbeat
+    to read at all is decided one level up, from the read's status, and
+    duplicating that check here would give the same question two
+    answers.
+    """
+    raw = payload.get("last_signal_ts", _MISSING)
+    if raw is _MISSING:
+        return _LS_ABSENT, None
+    if raw is None:
+        return _LS_NEVER, None
+
+    published_at = _epoch_to_dt(raw)
+    if published_at is None:
+        # _epoch_to_dt already ruled out None above, so the only way back
+        # is a value it could not convert.
+        return _LS_CORRUPT, None
+    return _LS_AT, published_at
 
 
 def _send_if_due(
@@ -430,22 +513,108 @@ def check_freshness(
 
         published_at: datetime | None = None
         if hb_status == _HB_OK and hb_payload is not None:
-            published_at = _epoch_to_dt(hb_payload.get("last_signal_ts"))
-            if published_at is None:
-                # A live bot that has not published a signal yet: a fresh
-                # process, or one still running a build from before the
-                # field existed.  Both are legitimate transitional states
-                # and neither is a fault, so this is DEBUG and not an
-                # alert — an hourly message about a missing field would
-                # only teach the operator to ignore alerts.
+            outcome, published_at = _classify_last_signal(hb_payload)
+
+            if outcome == _LS_CORRUPT:
+                # The field is written by the bot's own serialiser: epoch
+                # seconds, or the contract is gone.  Falling back to the
+                # ledger would hide a broken schema for as long as the
+                # ledger keeps answering — and under this unit's
+                # ProtectHome=read-only it usually does not answer at
+                # all, so nobody would ever find out.
+                #
+                # Its own event and not _EVENT_READ_ERROR's: a Redis
+                # outage already inside its window would otherwise
+                # swallow the first report of this one, and two unrelated
+                # faults must not share a de-duplication key.
+                raw = hb_payload.get("last_signal_ts")
+                msg = (
+                    f"🚨 Monitoring Failure: heartbeat key '{heartbeat_key}' "
+                    f"carries an unusable last_signal_ts!\n"
+                    f"The field is present but is not a number ({raw!r} of "
+                    f"type {type(raw).__name__}), so the first freshness "
+                    f"source cannot be parsed for '{path.name}'. "
+                    f"Freshness is UNKNOWN."
+                )
+                _log.error(msg)
+                if failures is not None:
+                    failures.append(f"{path.name}: {_EVENT_BAD_PAYLOAD}")
+                if _send_if_due(reporter, state, cooldown_hours, path.name,
+                                _EVENT_BAD_PAYLOAD, msg, now):
+                    alerts += 1
+                continue
+
+            if outcome == _LS_NEVER:
+                # Not a gap in the payload but a statement about the bot
+                # itself: it has emitted nothing since it came up.  The
+                # ledger cannot overrule a bot reporting on its own
+                # output, so it is not consulted at all — which is also
+                # what makes this branch survive an unreadable database.
+                # The claim is aged against the same threshold every
+                # other verdict here uses; a second knob would only be a
+                # second thing to get wrong.
+                started_at = _epoch_to_dt(hb_payload.get("started_ts"))
+                if started_at is not None:
+                    silent_hours = (now - started_at).total_seconds() / 3600.0
+                    if silent_hours > threshold_hours:
+                        msg = (
+                            f"⚠️ Starvation Alert: the bot feeding "
+                            f"'{path.name}' has emitted nothing since it "
+                            f"started {silent_hours:.1f} hours ago! "
+                            f"(Threshold: {threshold_hours}h)\n"
+                            f"Reported by the bot itself, which came up at "
+                            f"{started_at.isoformat()} — the ledger was not "
+                            f"consulted."
+                        )
+                        _log.error(msg)
+                        if _send_if_due(reporter, state, cooldown_hours,
+                                        path.name, _EVENT_NEVER_SINCE_START,
+                                        msg, now):
+                            alerts += 1
+                        continue
+
+                    # A young process that has not signalled yet is not a
+                    # fault.  R11 lives behind the ledger and this branch
+                    # never reaches it, so the recovery has to happen
+                    # here: without it the window opened by an earlier
+                    # claim would outlive the restart that ended it and
+                    # mute the next relapse.
+                    _log.info(
+                        f"Heartbeat '{heartbeat_key}' reports no signal yet, "
+                        f"{silent_hours:.1f}h since start — inside the "
+                        f"{threshold_hours}h threshold for '{path.name}'"
+                    )
+                    if state is not None:
+                        state.clear_db(path.name)
+                    continue
+
+                # A claim that cannot be aged is no verdict.  started_ts
+                # is missing, null or unparseable, so this degrades to
+                # exactly what the checker did before PR-0.10 rather than
+                # inventing an age.
+                _log.debug(
+                    f"Heartbeat '{heartbeat_key}' reports no signal since "
+                    f"start but carries no usable started_ts — falling back "
+                    f"to the ledger for '{path.name}'"
+                )
+
+            elif outcome == _LS_ABSENT:
+                # M9: the field is not there at all — a build from before
+                # it existed, or a payload written between the merge and
+                # the restart.  Nothing is claimed, so nothing is a
+                # fault, and this is DEBUG rather than an alert: an
+                # hourly message about a missing field would only teach
+                # the operator to ignore alerts.
                 _log.debug(
                     f"Heartbeat '{heartbeat_key}' carries no last_signal_ts — "
                     f"falling back to the ledger for '{path.name}'"
                 )
 
         # The heartbeat decides freshness only when it actually published
-        # one.  Everything below this line with published_at None is the
-        # pre-PR-0.9 behaviour, unchanged.
+        # a timestamp.  Reaching here with published_at None means the
+        # payload claimed nothing that could be aged — no key, or a claim
+        # with no usable started_ts — and everything below this line is
+        # then the pre-PR-0.9 behaviour, unchanged.
         if published_at is not None:
             age_hours = (now - published_at).total_seconds() / 3600.0
             if age_hours > threshold_hours:
