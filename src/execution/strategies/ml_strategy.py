@@ -982,6 +982,93 @@ class MLTradingStrategy(Strategy):
                 self.log.warning(f"SignalBridge close_signal failed: {exc}")
 
     # ------------------------------------------------------------------
+    # Signal emission — persist, then publish freshness
+    # ------------------------------------------------------------------
+
+    def _emit_signal(
+        self,
+        decision: RiskDecision,
+        signal: TradeSignal,
+    ) -> int:
+        """Write the signal to the ledger and publish that it happened.
+
+        The single place where a signal becomes visible outside this
+        process, and the reason it is a method rather than a block
+        inlined in ``_open_position``: the 15m and meta strategies reach
+        it through the inherited ``_open_position``, so the
+        persist-then-publish sequence exists exactly once and the three
+        cannot drift apart.
+
+        Returns the ``signal_id``.  Zero means the row was NOT written:
+        ``SignalBridge.log_signal`` catches its own exceptions and
+        returns 0, which used to travel into ``_pending_signal_ids``
+        without a trace.  Now it is an ERROR in the journal, and nothing
+        is published for it — publishing freshness for a signal the
+        ledger never received would make the two sources disagree by
+        our own hand.
+        """
+        if not self._signal_bridge:
+            return 0
+
+        try:
+            signal_id = self._signal_bridge.log_signal(
+                symbol=signal.symbol,
+                direction="long" if signal.direction == 1 else "short",
+                entry_price=decision.entry_price if hasattr(decision, 'entry_price') else signal.entry_price,
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+                confidence=signal.confidence,
+                regime=signal.regime,
+                atr=signal.atr,
+                funding_rate=signal.funding_rate,
+                position_size=decision.position_size,
+                notional=decision.notional,
+                leverage=decision.leverage,
+            )
+        except Exception as exc:
+            self.log.warning(f"SignalBridge log_signal failed: {exc}")
+            return 0
+
+        if signal_id == 0:
+            self.log.error(
+                f"SignalBridge.log_signal returned 0 for {signal.symbol} — "
+                f"the signal was NOT persisted, so no freshness is published "
+                f"for it and the ledger will not show it"
+            )
+            return 0
+
+        # D-14: recorded only once it is a real id.  Zero is the bridge
+        # saying it wrote nothing; parked under the symbol it would later
+        # be handed to mark_rejected() / close_signal() by the order and
+        # position callbacks, which UPDATE by that id.
+        self._pending_signal_ids[signal.symbol] = signal_id
+
+        # Unconditional: whether a heartbeat manager exists is decided
+        # inside the publisher, so a bot running without Redis follows
+        # exactly the same path as one with it.
+        self._publish_signal_ts(time.time())
+        return signal_id
+
+    def _publish_signal_ts(self, signal_ts: float) -> None:
+        """Hand the write moment to the heartbeat, fail-soft.
+
+        ``signal_ts`` is ``time.time()`` — the moment of the write, the
+        same clock reading ``SignalBridge`` stamps into ``created_at``,
+        and deliberately not ``signal.timestamp`` (the bar's time), so
+        the external checker compares like with like.
+
+        A broken heartbeat never stops a trade: the entry order is
+        submitted right after this call, and losing freshness telemetry
+        is cheaper than losing the position.
+        """
+        if self._heartbeat is None:
+            return
+        try:
+            self._heartbeat.report_signal(signal_ts)
+        except Exception as exc:
+            self.log.warning(f"Heartbeat report_signal failed: {exc}")
+
+    # ------------------------------------------------------------------
     # Position management
     # ------------------------------------------------------------------
 
@@ -1039,25 +1126,7 @@ class MLTradingStrategy(Strategy):
 
         # Log signal in bridge for Telegram notification BEFORE submitting order
         # to ensure signal_id exists if submit_order fails synchronously.
-        if self._signal_bridge:
-            try:
-                signal_id = self._signal_bridge.log_signal(
-                    symbol=signal.symbol,
-                    direction="long" if signal.direction == 1 else "short",
-                    entry_price=decision.entry_price if hasattr(decision, 'entry_price') else signal.entry_price,
-                    stop_loss=decision.stop_loss,
-                    take_profit=decision.take_profit,
-                    confidence=signal.confidence,
-                    regime=signal.regime,
-                    atr=signal.atr,
-                    funding_rate=signal.funding_rate,
-                    position_size=decision.position_size,
-                    notional=decision.notional,
-                    leverage=decision.leverage,
-                )
-                self._pending_signal_ids[signal.symbol] = signal_id
-            except Exception as exc:
-                self.log.warning(f"SignalBridge log_signal failed: {exc}")
+        self._emit_signal(decision, signal)
 
         try:
             self.submit_order(entry_order)

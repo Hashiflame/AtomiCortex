@@ -58,7 +58,7 @@ def test_report_bar_updates_fields(heartbeat):
 
 
 @pytest.mark.asyncio
-async def test_loop_writes_valid_json_with_4_keys(heartbeat):
+async def test_loop_writes_valid_json_with_5_keys(heartbeat):
     heartbeat._started_ts = 1000.0
     heartbeat._running = True
 
@@ -79,6 +79,7 @@ async def test_loop_writes_valid_json_with_4_keys(heartbeat):
     assert payload["started_ts"] == 1000.0
     assert payload["last_bar_ts"] is None
     assert payload["bars_seen"] == 0
+    assert payload["last_signal_ts"] is None
 
     # Now with report_bar
     heartbeat.report_bar(1200.0)
@@ -145,3 +146,71 @@ def test_15m_on_bar_reports_heartbeat():
     strategy._heartbeat = None
     with patch.object(strategy, "_detect_regime", return_value=None):
         strategy.on_bar(bar)
+
+
+# ===========================================================================
+# PR-0.9 — the heartbeat also carries the last signal
+# ===========================================================================
+
+def test_report_signal_updates_field(heartbeat):
+    """report_signal overwrites; unlike report_bar it keeps no counter."""
+    assert heartbeat._last_signal_ts is None
+
+    heartbeat.report_signal(100.0)
+    assert heartbeat._last_signal_ts == 100.0
+
+    heartbeat.report_signal(200.0)
+    assert heartbeat._last_signal_ts == 200.0
+
+
+def test_report_signal_does_not_touch_bar_fields(heartbeat):
+    """CONTROL: the two reporters are independent."""
+    heartbeat.report_signal(100.0)
+
+    assert heartbeat._last_bar_ts is None
+    assert heartbeat._bars_seen == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_publishes_last_signal_ts(heartbeat):
+    """The published payload carries whatever report_signal last stored."""
+    heartbeat._started_ts = 1000.0
+    heartbeat._running = True
+
+    async def mock_sleep(*args, **kwargs):
+        heartbeat._running = False
+
+    heartbeat.report_signal(1400.0)
+
+    with patch("time.time", return_value=1500.0):
+        with patch("asyncio.sleep", side_effect=mock_sleep):
+            await heartbeat._heartbeat_loop()
+
+    args, _kwargs = heartbeat._redis.setex.call_args
+    payload = json.loads(args[2])
+    assert payload["last_signal_ts"] == 1400.0
+
+
+@pytest.mark.asyncio
+async def test_payload_has_exactly_five_keys(heartbeat):
+    """Pins the contract the freshness checker reads on the other side."""
+    heartbeat._started_ts = 1000.0
+    heartbeat._running = True
+
+    async def mock_sleep(*args, **kwargs):
+        heartbeat._running = False
+
+    with patch("time.time", return_value=1500.0):
+        with patch("asyncio.sleep", side_effect=mock_sleep):
+            await heartbeat._heartbeat_loop()
+
+    args, _kwargs = heartbeat._redis.setex.call_args
+    payload = json.loads(args[2])
+
+    assert set(payload) == {
+        "process_ts",
+        "started_ts",
+        "last_bar_ts",
+        "bars_seen",
+        "last_signal_ts",
+    }

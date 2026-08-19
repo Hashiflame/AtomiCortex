@@ -108,6 +108,18 @@ class Settings(BaseSettings):
         default=24.0, alias="SIGNAL_ALERT_COOLDOWN_HOURS"
     )
 
+    # How far the freshness published in the heartbeat may run ahead of
+    # the newest row in signals_log before the checker calls it a
+    # divergence.  The bot updates its heartbeat field in memory and
+    # publishes on the next tick, so up to one heartbeat_interval (30s)
+    # of lag is structural; 300s leaves room for that plus a slow write.
+    # It covers that one comparison and nothing else — a signal the bot
+    # says it emitted belongs in the ledger however recently the process
+    # started, so a restart is never a reason to excuse the gap.
+    signal_bridge_lag_tolerance_sec: float = Field(
+        default=300.0, alias="SIGNAL_BRIDGE_LAG_TOLERANCE_SEC"
+    )
+
     # Fail-fast: grace period (seconds) after node start before checking
     # engine connectivity.  Default 45 = timeout_connection(30) + margin.
     startup_grace_sec: float = Field(default=45.0, alias="STARTUP_GRACE_SEC")

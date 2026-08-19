@@ -59,6 +59,7 @@ class HeartbeatManager:
         self._started_ts: float = 0.0
         self._last_bar_ts: float | None = None
         self._bars_seen: int = 0
+        self._last_signal_ts: float | None = None
 
         self._redis: Any = None  # redis.asyncio.Redis instance
         self._task: asyncio.Task | None = None
@@ -115,6 +116,22 @@ class HeartbeatManager:
         self._last_bar_ts = bar_ts
         self._bars_seen += 1
 
+    def report_signal(self, signal_ts: float) -> None:
+        """Called by the strategy once a signal has been persisted.
+
+        Assignment only — no Redis call happens here, exactly as in
+        :meth:`report_bar`.  The value reaches the key on the next tick
+        of :meth:`_heartbeat_loop`, so the freshness a reader sees can
+        lag the write by up to ``heartbeat_interval`` seconds.  The
+        external checker's divergence tolerance is sized around that.
+
+        Unlike bars there is no counter: the checker compares a single
+        timestamp against ``MAX(created_at)`` in the signal ledger, and
+        a count of signals published since start would answer a
+        question nobody asks.
+        """
+        self._last_signal_ts = signal_ts
+
     def is_alive(self) -> bool:
         """Check whether the heartbeat loop has written recently.
 
@@ -141,6 +158,7 @@ class HeartbeatManager:
                     "started_ts": self._started_ts,
                     "last_bar_ts": self._last_bar_ts,
                     "bars_seen": self._bars_seen,
+                    "last_signal_ts": self._last_signal_ts,
                 })
 
                 if self._redis is not None:

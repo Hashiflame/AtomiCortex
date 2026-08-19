@@ -178,6 +178,10 @@ class _StubSettings:
     signal_stale_hours_15m = 6.0
     signal_stale_hours_default = 48.0
     signal_alert_cooldown_hours = 24.0
+    signal_bridge_lag_tolerance_sec = 300.0
+    redis_host = "localhost"
+    redis_port = 6379
+    redis_password = ""
 
 
 @pytest.fixture
@@ -197,6 +201,21 @@ def main_env(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "setup_logging", lambda *a, **kw: None)
     monkeypatch.setattr(mod, "TelegramReporter", lambda *a, **kw: reporter)
     monkeypatch.setattr(sys, "argv", ["check_signal_freshness.py"])
+
+    # PR-0.9: main() reads Redis.  The default stub is a live heartbeat
+    # that has not published a signal yet — Redis is reachable but not
+    # authoritative, so every pre-existing main() test keeps exercising
+    # the SQLite rules unchanged and none of them opens a socket.  Tests
+    # that care about the heartbeat re-stub it via _stub_heartbeat().
+    # raising defaults to True: if the name ever moves, every main() test
+    # fails loudly instead of quietly talking to a real Redis.
+    monkeypatch.setattr(
+        mod,
+        "_read_heartbeat",
+        lambda url, key: ("ok", {"process_ts": 0.0, "started_ts": 0.0,
+                                 "last_bar_ts": None, "bars_seen": 0,
+                                 "last_signal_ts": None}),
+    )
 
     (tmp_path / "data").mkdir()
     (tmp_path / "logs").mkdir()
@@ -748,3 +767,577 @@ def test_read_error_text_distinct_from_all_five(tmp_path, mock_reporter, now_fn,
         "no atomicortex*.db found",          # no_database
     ):
         assert marker not in read_error_msg, f"read_error reuses '{marker}'"
+
+
+# ===========================================================================
+# PR-0.9 — Redis is the first source, SQLite the second
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the PR-0.9 blocks
+# ---------------------------------------------------------------------------
+
+_REDIS_URL = "redis://localhost:6379/0"
+
+
+def _stub_heartbeat(monkeypatch, status: str, payload: dict | None = None):
+    """Replace the checker's Redis read with a fixed answer.
+
+    ``status`` is one of 'ok' / 'absent' / 'error'.  No socket is opened
+    anywhere in this module: check_freshness() is handed a URL, and the
+    only thing that URL reaches is this stub.
+    """
+    import scripts.check_signal_freshness as mod
+
+    monkeypatch.setattr(mod, "_read_heartbeat", lambda url, key: (status, payload))
+
+
+def _hb(now, *, last_signal_delta=None, started_delta=timedelta(hours=10),
+        omit_last_signal=False) -> dict:
+    """Build a heartbeat payload with epoch-second floats (P5)."""
+    payload = {
+        "process_ts": now.timestamp(),
+        "started_ts": (now - started_delta).timestamp(),
+        "last_bar_ts": (now - timedelta(minutes=5)).timestamp(),
+        "bars_seen": 42,
+    }
+    if not omit_last_signal:
+        payload["last_signal_ts"] = (
+            None if last_signal_delta is None
+            else (now - last_signal_delta).timestamp()
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# The three new command-line knobs (R1, M8, R9)
+# ---------------------------------------------------------------------------
+
+def test_parser_heartbeat_key_default():
+    """R1: the key is a literal default, not None — there is no Settings field."""
+    args = get_parser().parse_args([])
+    assert args.heartbeat_key == "atomicortex:heartbeat"
+
+
+def test_parser_accepts_heartbeat_key():
+    """One checker serves one strategy; the key says which one."""
+    args = get_parser().parse_args(["--heartbeat-key", "bot_15m_heartbeat"])
+    assert args.heartbeat_key == "bot_15m_heartbeat"
+
+
+def test_parser_redis_url_defaults_to_none():
+    """M8: no address is baked into the parser — None means 'ask Settings'."""
+    args = get_parser().parse_args([])
+    assert args.redis_url is None
+
+
+def test_parser_accepts_redis_url():
+    """M8: a non-local Redis must be reachable without editing the script."""
+    args = get_parser().parse_args(["--redis-url", "redis://10.0.0.5:6380/1"])
+    assert args.redis_url == "redis://10.0.0.5:6380/1"
+
+
+def test_parser_accepts_bridge_lag_tolerance():
+    """R9: the divergence tolerance is overridable from the command line."""
+    args = get_parser().parse_args(["--bridge-lag-tolerance", "600"])
+    assert args.bridge_lag_tolerance == 600.0
+    assert isinstance(args.bridge_lag_tolerance, float)
+
+
+def test_parser_bridge_lag_tolerance_defaults_to_none():
+    """Same convention as the thresholds: None means 'use Settings'."""
+    args = get_parser().parse_args([])
+    assert args.bridge_lag_tolerance is None
+
+
+# ---------------------------------------------------------------------------
+# R2 — no_heartbeat: the key is gone, so the first source says nothing
+# ---------------------------------------------------------------------------
+
+def test_no_heartbeat_when_key_absent(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R2: an absent key is its own event — the process is dead or the TTL expired."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "absent")
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "heartbeat" in msg.lower()
+    assert "atomicortex:heartbeat" in msg
+
+
+def test_no_heartbeat_lands_in_failures(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R2 + M7: state unknown → exit 1, keyed by the database being checked."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "absent")
+    failures: list[str] = []
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn,
+                    failures=failures, redis_url=_REDIS_URL)
+
+    assert failures == ["atomicortex.db: no_heartbeat"]
+
+
+def test_no_heartbeat_skips_the_rest_of_that_db(tmp_path, mock_reporter, now_fn,
+                                                monkeypatch):
+    """M6: like read_error, it ends the checks for this database.
+
+    The database here is also stale.  Without the skip the operator gets
+    two alerts for one outage, the second of them meaningless: with no
+    heartbeat there is nothing to compare the ledger against.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    _stub_heartbeat(monkeypatch, "absent")
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msgs = _messages(mock_reporter)
+    assert "has not had a signal" not in msgs[0], "stale leaked past the skip"
+
+
+def test_no_heartbeat_control_same_db_alone_is_stale(tmp_path, mock_reporter, now_fn):
+    """CONTROL for the skip above: without Redis that database does alert stale."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    assert alerts == 1
+    assert "has not had a signal" in _messages(mock_reporter)[0]
+
+
+def test_no_heartbeat_deduplicated_across_runs(tmp_path, mock_reporter, now_fn,
+                                               monkeypatch):
+    """The timer fires hourly; the ledger keeps Telegram quiet, not the exit code."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    _stub_heartbeat(monkeypatch, "absent")
+    thresholds = {"atomicortex.db": 48.0}
+
+    first_failures: list[str] = []
+    second_failures: list[str] = []
+    first = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                            24.0, first_failures, redis_url=_REDIS_URL)
+    second = check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                             24.0, second_failures, redis_url=_REDIS_URL)
+
+    assert first == 1
+    assert second == 0
+    assert mock_reporter.send_alert.call_count == 1
+    assert first_failures == second_failures == ["atomicortex.db: no_heartbeat"]
+
+
+# ---------------------------------------------------------------------------
+# R3 — an unreadable Redis is read_error, and the checker is fail-closed
+# ---------------------------------------------------------------------------
+
+def test_redis_error_is_a_read_error(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R3: unlike the watchdog, the checker never treats a blind read as fine."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "error")
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "could not be read" in msg
+    assert "atomicortex:heartbeat" in msg
+
+
+def test_redis_error_lands_in_failures(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R3 + M7: the event name is read_error, the ledger key is the database."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "error")
+    failures: list[str] = []
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn,
+                    failures=failures, redis_url=_REDIS_URL)
+
+    assert failures == ["atomicortex.db: read_error"]
+
+
+# ---------------------------------------------------------------------------
+# R8/R9/R12 — bridge_lag: Redis newer than SQLite beyond the tolerance
+# ---------------------------------------------------------------------------
+
+def test_bridge_lag_when_redis_newer_than_sqlite(tmp_path, mock_reporter, now_fn,
+                                                 monkeypatch):
+    """R8: the bot published a signal the ledger never received."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1) - timedelta(seconds=301)))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "atomicortex.db" in msg
+    assert "301" in msg or "300" in msg
+
+
+def test_bridge_lag_control_sqlite_alone_is_silent(tmp_path, mock_reporter, now_fn):
+    """CONTROL for the whole bridge_lag block — green before the fix and after.
+
+    It proves the database used above is, on its own, perfectly fresh: any
+    alert in those tests comes from the reconciliation and cannot be an
+    ordinary `stale` in disguise.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn)
+
+    assert alerts == 0
+    assert mock_reporter.send_alert.call_count == 0
+
+
+def test_bridge_lag_control_inside_tolerance_is_silent(tmp_path, mock_reporter,
+                                                       now_fn, monkeypatch):
+    """R9: 299s of divergence is the heartbeat tick, not a lost signal."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1) - timedelta(seconds=299)))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 0
+    assert mock_reporter.send_alert.call_count == 0
+
+
+def test_bridge_lag_not_in_failures(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R8: the state is known and contradictory, not unknown — exit stays 0."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1) - timedelta(seconds=600)))
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert failures == []
+
+
+def test_no_bridge_lag_when_sqlite_newer(tmp_path, mock_reporter, now_fn, monkeypatch):
+    """R12: the Telegram bot and the reconciler also write there — normal."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=6)))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 0
+
+
+def test_bridge_lag_reported_after_a_recent_restart(tmp_path, mock_reporter, now_fn,
+                                                    monkeypatch):
+    """A restart is no excuse: a published signal missing from the ledger is lag.
+
+    The bot came up five minutes ago and published a signal two minutes
+    ago, while the newest row is ten hours old.  That signal went
+    somewhere other than the ledger, which is exactly the divergence this
+    check exists to catch — the recency of the restart says nothing about
+    it either way.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=10)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(minutes=2),
+                        started_delta=timedelta(minutes=5)))
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert "Bridge Lag" in _messages(mock_reporter)[0]
+    assert failures == []
+
+
+def test_empty_table_with_authoritative_redis_is_bridge_lag(tmp_path, mock_reporter,
+                                                            now_fn, monkeypatch):
+    """Redis knows a signal happened and signals_log holds nothing at all."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=None)
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(minutes=2)))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "has no signals ever recorded" not in msg, "never leaked instead of bridge_lag"
+
+
+def test_bridge_lag_deduplicated_and_cleared_on_recovery(tmp_path, mock_reporter,
+                                                         now_fn, monkeypatch):
+    """The hourly timer must not turn one divergence into 24 messages."""
+    from src.monitoring.signal_alert_state import SignalAlertState
+
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    state = SignalAlertState(tmp_path / "signal_check_state.json")
+    thresholds = {"atomicortex.db": 48.0}
+    lagging = _hb(now_fn(), last_signal_delta=timedelta(hours=1) - timedelta(seconds=600))
+
+    _stub_heartbeat(monkeypatch, "ok", lagging)
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                           24.0, redis_url=_REDIS_URL) == 1
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                           24.0, redis_url=_REDIS_URL) == 0
+
+    # Sources agree again → the record is dropped, so a relapse is immediate.
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1)))
+    assert check_freshness([db_path], thresholds, mock_reporter, now_fn, state,
+                           24.0, redis_url=_REDIS_URL) == 0
+    assert state.load() == {}, "a reconciled pair must clear its bridge_lag record"
+
+
+# ---------------------------------------------------------------------------
+# The boundary between the two sources
+# ---------------------------------------------------------------------------
+
+def test_sqlite_read_error_not_fatal_when_redis_fresh(tmp_path, mock_reporter,
+                                                      now_fn, monkeypatch):
+    """The VM case: freshness is established, only the reconciliation is blind."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1)))
+    _break_db_reads(monkeypatch)
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert failures == [], "an authoritative Redis must not leave the unit failed"
+
+
+def test_sqlite_read_error_still_fatal_when_redis_silent(tmp_path, mock_reporter,
+                                                         now_fn, monkeypatch):
+    """CONTROL for the case above: without a first source, blind is fatal again."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), last_signal_delta=None))
+    _break_db_reads(monkeypatch)
+    failures: list[str] = []
+
+    check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter, now_fn,
+                    failures=failures, redis_url=_REDIS_URL)
+
+    assert failures == ["atomicortex.db: read_error"]
+
+
+def test_absent_redis_url_preserves_today_behaviour(tmp_path, mock_reporter, now_fn,
+                                                    monkeypatch):
+    """No Redis source configured → the six original events rule alone."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "absent")
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures)
+
+    assert alerts == 0
+    assert failures == []
+
+
+def test_stale_verdict_comes_from_redis_when_authoritative(tmp_path, mock_reporter,
+                                                           now_fn, monkeypatch):
+    """The first source decides starvation; the database only corroborates."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=72),
+                        started_delta=timedelta(hours=100)))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    msg = mock_reporter.send_alert.call_args[0][0]
+    assert "has not had a signal" in msg
+    assert "72.0" in msg
+
+
+def test_two_new_event_texts_are_distinct_from_the_six(tmp_path, mock_reporter,
+                                                       now_fn, monkeypatch):
+    """Eight events, eight texts: neither newcomer reuses an older marker."""
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    thresholds = {"atomicortex.db": 48.0}
+
+    _stub_heartbeat(monkeypatch, "absent")
+    check_freshness([db_path], thresholds, mock_reporter, now_fn, redis_url=_REDIS_URL)
+
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now_fn(), last_signal_delta=timedelta(hours=1) - timedelta(seconds=600)))
+    check_freshness([db_path], thresholds, mock_reporter, now_fn, redis_url=_REDIS_URL)
+
+    msgs = _messages(mock_reporter)
+    assert len(msgs) == 2
+    no_heartbeat_msg, bridge_lag_msg = msgs
+    assert no_heartbeat_msg != bridge_lag_msg
+
+    for msg in (no_heartbeat_msg, bridge_lag_msg):
+        for marker in (
+            "has no signals_log table",      # no_table
+            "has no signals ever recorded",  # never
+            "has not had a signal",          # stale
+            "is missing from disk",          # no_file
+            "no atomicortex*.db found",      # no_database
+            "could not be read",             # read_error
+        ):
+            assert marker not in msg, f"a new event reuses '{marker}'"
+
+
+# ---------------------------------------------------------------------------
+# M9 — the transition window: the bot has not been restarted yet
+# ---------------------------------------------------------------------------
+
+def test_missing_last_signal_ts_field_is_silent(tmp_path, mock_reporter, now_fn,
+                                                monkeypatch):
+    """M9: a four-key payload is a legitimate transitional state, not a fault.
+
+    Between the merge and the bot restart the field simply is not there.
+    An hourly alert about it would teach the operator to ignore alerts.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), omit_last_signal=True))
+    failures: list[str] = []
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, failures=failures, redis_url=_REDIS_URL)
+
+    assert alerts == 0
+    assert failures == []
+    assert mock_reporter.send_alert.call_count == 0
+
+
+def test_missing_last_signal_ts_still_uses_sqlite_verdict(tmp_path, mock_reporter,
+                                                          now_fn, monkeypatch):
+    """M9 does not blind the checker: the second source still rules.
+
+    CONTROL for the silence above — the same four-key payload over a
+    starving database does alert, so the silence is about the field and
+    not about the check having been switched off.
+    """
+    db_path = str(tmp_path / "atomicortex.db")
+    setup_db(db_path, created_at=(now_fn() - timedelta(hours=72)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok", _hb(now_fn(), omit_last_signal=True))
+
+    alerts = check_freshness([db_path], {"atomicortex.db": 48.0}, mock_reporter,
+                             now_fn, redis_url=_REDIS_URL)
+
+    assert alerts == 1
+    assert "has not had a signal" in _messages(mock_reporter)[0]
+
+
+# ---------------------------------------------------------------------------
+# main() — the two new events and the exit code
+# ---------------------------------------------------------------------------
+
+def test_main_exits_1_when_no_heartbeat(main_env, monkeypatch):
+    """R2 through the real entry point: freshness unknown leaves the unit failed."""
+    mod, _reporter = main_env
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=datetime.now(timezone.utc).isoformat())
+    _stub_heartbeat(monkeypatch, "absent")
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_main_exits_0_when_bridge_lag(main_env, monkeypatch):
+    """R8 through the real entry point: contradictory is not unknown."""
+    mod, reporter = main_env
+    now = datetime.now(timezone.utc)
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now - timedelta(hours=1)).isoformat())
+    _stub_heartbeat(monkeypatch, "ok",
+                    _hb(now, last_signal_delta=timedelta(hours=1) - timedelta(seconds=600)))
+
+    mod.main()
+
+    assert reporter.send_alert.call_count == 1
+
+
+def test_main_builds_redis_url_from_settings(main_env, monkeypatch):
+    """M8 + R3: the address comes from Settings, never from a literal here."""
+    mod, _reporter = main_env
+    now = datetime.now(timezone.utc)
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now - timedelta(hours=1)).isoformat())
+
+    class _RemoteSettings(_StubSettings):
+        redis_host = "10.9.8.7"
+        redis_port = 6380
+        redis_password = "p@ss word"
+
+    monkeypatch.setattr(mod, "get_settings", lambda: _RemoteSettings())
+
+    seen: list[tuple[str, str]] = []
+
+    def _spy(url, key):
+        seen.append((url, key))
+        return "ok", _hb(now, last_signal_delta=timedelta(hours=1))
+
+    monkeypatch.setattr(mod, "_read_heartbeat", _spy)
+
+    mod.main()
+
+    assert seen == [
+        ("redis://:p%40ss%20word@10.9.8.7:6380/0", "atomicortex:heartbeat")
+    ]
+
+
+def test_main_passes_cli_redis_url_through(main_env, monkeypatch):
+    """M8: the address main() uses is the one on the command line."""
+    mod, _reporter = main_env
+    now = datetime.now(timezone.utc)
+    db_path = mod._ROOT / "data" / "atomicortex.db"
+    setup_db(str(db_path), created_at=(now - timedelta(hours=1)).isoformat())
+
+    seen: list[tuple[str, str]] = []
+
+    def _spy(url, key):
+        seen.append((url, key))
+        return "ok", _hb(now, last_signal_delta=timedelta(hours=1))
+
+    monkeypatch.setattr(mod, "_read_heartbeat", _spy)
+    monkeypatch.setattr(sys, "argv", [
+        "check_signal_freshness.py",
+        "--redis-url", "redis://10.0.0.5:6380/1",
+        "--heartbeat-key", "bot_15m_heartbeat",
+    ])
+
+    mod.main()
+
+    assert seen == [("redis://10.0.0.5:6380/1", "bot_15m_heartbeat")]
