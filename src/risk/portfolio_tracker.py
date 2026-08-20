@@ -81,6 +81,15 @@ class PortfolioTracker:
         self._consecutive_losses: int = 0
         self._last_loss_time: datetime | None = None
 
+        # S0-2 baseline provenance. Both must exist before the restore runs
+        # below, because _restore_from_store is what sets _peak_restored.
+        #   _peak_restored — the persisted state carried a peak_equity key
+        #     and it was applied; that peak outranks any exchange seed.
+        #   _peak_seeded   — seed_from_authoritative_equity already adopted
+        #     an exchange balance; the seed is once per tracker.
+        self._peak_restored: bool = False
+        self._peak_seeded: bool = False
+
         # Optional crash-safe persistence (None → in-memory only, backward
         # compatible with every existing caller).
         self._store: RiskStateStore | None = (
@@ -191,6 +200,64 @@ class PortfolioTracker:
         # own update_fill / close_position path.
         if target > self._peak_equity:
             self._peak_equity = target
+
+    def seed_from_authoritative_equity(self, equity: float) -> bool:
+        """S0-2: adopt the first authoritative balance as the baseline.
+
+        ``__init__`` has no choice but to take its baseline from the
+        configured ``initial_equity`` — nothing has read the exchange at
+        that point. On an account funded below that figure every process
+        then starts inside a permanent drawdown, because ``sync_equity``
+        only ever raises ``_peak_equity`` and never lowers it: a 5_000
+        balance against a configured 10_000 reads as a 50% drawdown on the
+        first bar, and -15% is the kill switch.
+
+        All three baselines are seeded together. ``_peak_equity`` is the
+        drawdown denominator; ``_day_start_equity`` and ``_initial_equity``
+        are the percent denominators. Seeding only one would measure the
+        drawdown of the real account against the percentages of an
+        imaginary one.
+
+        ``_cash`` is deliberately untouched — ``sync_equity`` owns it and
+        knows to subtract unrealised PnL, which this method does not.
+
+        Returns ``True`` only when the baseline was actually adopted, so
+        the caller can log the event once.
+        """
+        # A peak restored from the state file is history the exchange
+        # balance cannot reconstruct: it may sit above today's equity
+        # precisely because a drawdown is in progress.
+        if self._peak_restored or self._peak_seeded:
+            return False
+
+        try:
+            target = float(equity)
+        except (TypeError, ValueError):
+            return False
+        if target != target or target in (float("inf"), float("-inf")):
+            return False  # NaN / inf — drop silently, as sync_equity does
+
+        # Mirror of get_drawdown's ``peak <= 0 → 0.0`` branch: a
+        # non-positive peak would report zero drawdown forever and disarm
+        # the kill switch. Refusing here keeps the configured peak, which
+        # reports ~100% drawdown and halts — the safe direction.
+        if target <= 0:
+            return False
+
+        self._peak_equity = target
+        self._day_start_equity = target
+        self._initial_equity = target
+        self._peak_seeded = True
+
+        log.info(
+            "PortfolioTracker baseline seeded from exchange equity | "
+            "peak={p} day_start={d} initial={i}",
+            p=self._peak_equity,
+            d=self._day_start_equity,
+            i=self._initial_equity,
+        )
+        self._persist()
+        return True
 
     def close_position(
         self,
@@ -345,6 +412,10 @@ class PortfolioTracker:
             "cash": self._cash,
             "peak_equity": self._peak_equity,
             "day_start_equity": self._day_start_equity,
+            # S0-2: the seeded baseline must survive a restart, otherwise
+            # the percent denominators silently revert to the configured
+            # capital while the peak comes back from this file.
+            "initial_equity": self._initial_equity,
             "daily_realized_pnl": self._daily_realized_pnl,
             "weekly_realized_pnl": self._weekly_realized_pnl,
             "total_realized_pnl": self._total_realized_pnl,
@@ -390,8 +461,15 @@ class PortfolioTracker:
                 self._cash = float(state["cash"])
             if "peak_equity" in state:
                 self._peak_equity = float(state["peak_equity"])
+                # S0-2: the only place a persisted peak is adopted, so the
+                # only honest place to record that one was. Note the file is
+                # shared with CircuitBreaker, which writes its own keys and
+                # never a peak — "the file existed" is not the same claim.
+                self._peak_restored = True
             if "day_start_equity" in state:
                 self._day_start_equity = float(state["day_start_equity"])
+            if "initial_equity" in state:
+                self._initial_equity = float(state["initial_equity"])
             if "daily_realized_pnl" in state:
                 self._daily_realized_pnl = float(state["daily_realized_pnl"])
             if "weekly_realized_pnl" in state:

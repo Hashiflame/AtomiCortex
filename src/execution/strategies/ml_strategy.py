@@ -256,6 +256,10 @@ class MLTradingStrategy(Strategy):
         self._simulated_equity_logged: bool = False
         self._zero_balance_logged: bool = False
 
+        # S0-2: same rule for the baseline-seed notice. The seed itself is
+        # one-shot inside PortfolioTracker; this flag only guards the line.
+        self._baseline_seed_logged: bool = False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -2227,6 +2231,28 @@ class MLTradingStrategy(Strategy):
             )
         try:
             self._equity_curve.append((ts_ns, equity))
+            # S0-2: the first authoritative read seeds the drawdown and
+            # percent baselines, which __init__ could only take from the
+            # configured capital. Strictly before sync_equity: the seed
+            # must fix day_start_equity at the balance as read, not at a
+            # figure sync has already moved.
+            #
+            # Outer barrier for the zero band — the same epsilon that
+            # gates the operator notice above. Seeding a ~0 peak would
+            # make get_drawdown() return 0.0 forever and disarm the kill
+            # switch; refusing keeps the configured peak, which reports
+            # ~100% drawdown and halts. The tracker repeats this check on
+            # its own side, since it owns the invariant.
+            if abs(equity) >= _ZERO_BALANCE_EPSILON:
+                seeded = self._tracker.seed_from_authoritative_equity(equity)
+                if seeded and not self._baseline_seed_logged:
+                    self._baseline_seed_logged = True
+                    self.log.info(
+                        f"risk baseline seeded from exchange equity "
+                        f"{equity:.2f} USDT (was initial_equity "
+                        f"{self._config.initial_equity:.2f}) — drawdown and "
+                        f"percent limits now measure this account"
+                    )
             # H6: Nautilus is the authoritative source for cash balance
             # (the exchange confirms it). Sync the tracker so risk
             # decisions (sizing / drawdown / circuit breaker) see the
