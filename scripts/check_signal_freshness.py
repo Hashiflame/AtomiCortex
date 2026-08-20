@@ -492,10 +492,10 @@ def check_freshness(
             continue
 
         if hb_status == _HB_ERROR:
-            # Deliberately unlike Watchdog._check_heartbeat_detailed,
-            # which fails open here.  Fail-open costs the watchdog a
-            # false emergency close; it costs this check its own
-            # blindness, silently.
+            # Same stance as Watchdog._check_heartbeat_detailed, which
+            # returns UNKNOWN here rather than assuming life: an
+            # unreadable heartbeat is ignorance, and ignorance must be
+            # reported, not swallowed.
             msg = (
                 f"🚨 Monitoring Failure: heartbeat key '{heartbeat_key}' could "
                 f"not be read!\n"

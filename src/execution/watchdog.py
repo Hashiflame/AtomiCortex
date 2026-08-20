@@ -25,12 +25,46 @@ import hmac
 import json
 import time
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlencode
 
 from src.logger import get_logger
 
 _log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat verdict
+# ---------------------------------------------------------------------------
+
+# PR-0.8: a boolean cannot express "I do not know", and every version of
+# it collapses ignorance into one of the two informed answers. Three of
+# the check's exits carry no information about the bot at all; they used
+# to return "alive" and the watchdog stood down. They now return UNKNOWN,
+# which the loop treats as neither life nor death but as a budget.
+
+
+class HeartbeatVerdict(StrEnum):
+    """What the watchdog knows about the bot after one heartbeat read."""
+
+    ALIVE = "alive"
+    DEAD = "dead"
+    UNKNOWN = "unknown"
+
+
+# Reasons behind an informed verdict. Values are historical and must not
+# drift: ``data_stale`` in particular selects the zombie-RUNNING alert.
+REASON_OK: str = "ok"
+REASON_PROCESS_DEAD: str = "process_dead"
+REASON_DATA_STALE: str = "data_stale"
+
+# Reasons behind UNKNOWN. Distinct words so a journal answers *why* the
+# watchdog went blind; ``read_error`` and ``bad_payload`` deliberately
+# match the vocabulary already used by scripts/check_signal_freshness.py.
+REASON_REDIS_DOWN: str = "redis_down"
+REASON_BAD_PAYLOAD: str = "bad_payload"
+REASON_READ_ERROR: str = "read_error"
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +124,12 @@ class WatchdogConfig:
     service_name: str = "4h"
     check_interval: int = 15           # seconds
     max_silence_seconds: int = 60
+    # PR-0.8: how many CONSECUTIVE blind checks (verdict UNKNOWN) the
+    # watchdog tolerates before acting as if the bot were dead. Sized so
+    # the budget spans max_silence_seconds: 4 x 15s = 60s. A Redis restart
+    # is seconds long and never spends it; a Redis that stays down for a
+    # full minute is indistinguishable from a minute of silence.
+    max_unknown_checks: int = 4
     max_bar_silence_seconds: int = 0
     startup_bar_grace_seconds: int = 900
     alert_cooldown_seconds: int = 900
@@ -106,6 +146,16 @@ class Watchdog:
     emergency position closure when the bot becomes unresponsive.
     """
 
+    # O3: bound every Redis call. Without a ceiling a single hung read can
+    # outlast check_interval, the ticks stop being 15s apart, and
+    # max_unknown_checks stops meaning "one minute of blindness".
+    _REDIS_SOCKET_TIMEOUT: float = 5.0
+
+    # O4: how far max_unknown_checks x check_interval may drift from
+    # max_silence_seconds before the operator is warned that the threshold
+    # no longer means what its name says.
+    _UNKNOWN_BUDGET_TOLERANCE: float = 1.5
+
     def __init__(self, config: WatchdogConfig) -> None:
         self._config = config
         self._redis: Any = None
@@ -117,6 +167,13 @@ class Watchdog:
         self._incident_active: bool = False
         self._last_close_found_positions: bool = True
         self._legacy_format_logged: bool = False
+
+        # PR-0.8: consecutive UNKNOWN verdicts, and whether this streak has
+        # already reached Telegram. Both live and die with the process; a
+        # restart only restarts the count, which delays action rather than
+        # bringing it forward.
+        self._unknown_streak: int = 0
+        self._unknown_alerted: bool = False
 
         # Resolve base URL
         mode = config.trading_mode.lower()
@@ -141,6 +198,41 @@ class Watchdog:
             sl=config.max_silence_seconds,
             ci=config.check_interval,
         )
+
+        self._warn_about_blind_spots()
+
+    def _warn_about_blind_spots(self) -> None:
+        """Announce configurations that quietly weaken this watchdog."""
+        cfg = self._config
+
+        # R9: the default stays 0 because the safe value depends on the
+        # timeframe — but a disabled check must not also be a silent one.
+        if cfg.max_bar_silence_seconds <= 0:
+            _log.warning(
+                "data-staleness check disabled | service={svc} | "
+                "max_bar_silence_seconds=0 — a zombie-RUNNING bot that "
+                "stops receiving bars will NOT be detected",
+                svc=cfg.service_name,
+            )
+
+        # O4: the threshold is named in ticks but means wall-clock time.
+        budget = cfg.max_unknown_checks * cfg.check_interval
+        limit = cfg.max_silence_seconds
+        if limit > 0 and (
+            budget > limit * self._UNKNOWN_BUDGET_TOLERANCE
+            or budget * self._UNKNOWN_BUDGET_TOLERANCE < limit
+        ):
+            _log.warning(
+                "unknown-verdict budget {budget}s ({n} x {ci}s) diverges "
+                "from max_silence_seconds={limit}s | service={svc} — the "
+                "watchdog will tolerate a very different amount of "
+                "blindness than it tolerates silence",
+                budget=budget,
+                n=cfg.max_unknown_checks,
+                ci=cfg.check_interval,
+                limit=limit,
+                svc=cfg.service_name,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -373,54 +465,144 @@ class Watchdog:
     # Internal: check loop
     # ------------------------------------------------------------------
 
+    def _incident_alert_text(
+        self, verdict: HeartbeatVerdict, reason: str,
+    ) -> str:
+        """Compose the Telegram body for one incident tick."""
+        cfg = self._config
+        if verdict is HeartbeatVerdict.UNKNOWN:
+            remaining = max(cfg.max_unknown_checks - self._unknown_streak, 0)
+            return (
+                f"⚠️ WATCHDOG BLIND ({reason}) | {cfg.service_name}\n"
+                f"Cannot determine whether the bot is alive\n"
+                f"Emergency close in {remaining} more blind check(s)"
+            )
+        if reason == REASON_DATA_STALE:
+            return (
+                f"⚠️ DATA STALE (zombie-RUNNING?) | {cfg.service_name}\n"
+                f"Silence > {cfg.max_bar_silence_seconds}s\n"
+                "Emergency closing all positions..."
+            )
+        return (
+            f"⚠️ Bot heartbeat missing! | {cfg.service_name}\n"
+            f"Silence > {cfg.max_silence_seconds}s\n"
+            "Emergency closing all positions..."
+        )
+
+    async def _maybe_alert(
+        self, verdict: HeartbeatVerdict, reason: str, *, force: bool,
+    ) -> bool:
+        """Send the incident alert unless the cooldown holds it back.
+
+        ``force`` is the O6 bypass for the first blind tick of a streak:
+        blindness must reach a human a full budget before the machine acts
+        on it, whatever the cooldown says.
+
+        R8: the cooldown only advances on a send that actually left the
+        process. An alert that failed must not buy 900s of silence.
+        """
+        now = time.time()
+        if not force and now - self._last_alert_ts <= self._config.alert_cooldown_seconds:
+            return False
+
+        sent = await self.send_telegram_alert(
+            self._incident_alert_text(verdict, reason),
+        )
+        if sent:
+            self._last_alert_ts = now
+        return sent
+
+    async def _alert_close_failure(self, errors: list[Any]) -> None:
+        """Report a failed emergency close.
+
+        O5: no cooldown of its own and it never touches ``_last_alert_ts``.
+        A close that did not work is a different event from a repeated
+        complaint about silence, and the repeat-close suppressor already
+        bounds how often this can fire.
+        """
+        detail = "\n".join(f"• {err}" for err in errors[:5])
+        await self.send_telegram_alert(
+            f"🚨 EMERGENCY CLOSE FAILED | {self._config.service_name}\n"
+            f"{len(errors)} error(s), retrying on the next check:\n"
+            f"{detail}"
+        )
+
+    async def _run_emergency_close(self, reason: str) -> None:
+        """Close the book, unless the previous attempt proved it empty."""
+        incident: dict[str, Any] = {
+            "timestamp": time.time(),
+            "action": "emergency_close",
+            "reason": reason,
+        }
+
+        if not self._incident_active or self._last_close_found_positions:
+            close_result = await self.emergency_close_all()
+            incident["result"] = close_result
+            self._incidents.append(incident)
+
+            errors = close_result.get("errors", [])
+            if errors:
+                # R7: an empty positions_closed after an error means the
+                # close FAILED, not that the book was empty. Staying armed
+                # is the difference between one retry and none at all.
+                self._last_close_found_positions = True
+                await self._alert_close_failure(errors)
+            else:
+                self._last_close_found_positions = (
+                    len(close_result.get("positions_closed", [])) > 0
+                )
+
+        self._incident_active = True
+
     async def _check_loop(self) -> None:
         """Periodically check the heartbeat key in Redis."""
         while self._running:
             try:
-                alive, reason = await self._check_heartbeat_detailed()
-                if not alive:
+                verdict, reason = await self._check_heartbeat_detailed()
+
+                if verdict is HeartbeatVerdict.DEAD:
+                    self._unknown_streak = 0
+                    self._unknown_alerted = False
                     _log.warning(
                         "HEARTBEAT MISSING — bot may be down! "
                         "Triggering emergency close. Reason: {reason}",
                         reason=reason
                     )
-                    incident = {
-                        "timestamp": time.time(),
-                        "action": "emergency_close",
-                        "reason": reason,
-                    }
+                    await self._maybe_alert(verdict, reason, force=False)
+                    await self._run_emergency_close(reason)
 
-                    # 1. Telegram alert (cooldown)
-                    now = time.time()
-                    if now - self._last_alert_ts > self._config.alert_cooldown_seconds:
-                        if reason == "data_stale":
-                            msg = (
-                                f"⚠️ DATA STALE (zombie-RUNNING?) | {self._config.service_name}\n"
-                                f"Silence > {self._config.max_bar_silence_seconds}s\n"
-                                "Emergency closing all positions..."
-                            )
-                        else:
-                            msg = (
-                                f"⚠️ Bot heartbeat missing! | {self._config.service_name}\n"
-                                f"Silence > {self._config.max_silence_seconds}s\n"
-                                "Emergency closing all positions..."
-                            )
-                        
-                        await self.send_telegram_alert(msg)
-                        self._last_alert_ts = now
-
-                    # 2. Emergency close (idempotent)
-                    if not self._incident_active or self._last_close_found_positions:
-                        close_result = await self.emergency_close_all()
-                        incident["result"] = close_result
-                        self._incidents.append(incident)
-                        self._last_close_found_positions = len(close_result.get("positions_closed", [])) > 0
-                    
-                    self._incident_active = True
-
-                    # 3. Wait before next check to avoid rapid re-triggers
+                    # Wait before next check to avoid rapid re-triggers
                     await asyncio.sleep(self._config.max_silence_seconds)
-                else:
+
+                elif verdict is HeartbeatVerdict.UNKNOWN:
+                    self._unknown_streak += 1
+                    _log.warning(
+                        "HEARTBEAT UNKNOWN ({reason}) — cannot tell whether "
+                        "the bot is alive | blind check {n}/{limit}",
+                        reason=reason,
+                        n=self._unknown_streak,
+                        limit=self._config.max_unknown_checks,
+                    )
+
+                    if await self._maybe_alert(
+                        verdict, reason, force=not self._unknown_alerted,
+                    ):
+                        self._unknown_alerted = True
+
+                    if self._unknown_streak >= self._config.max_unknown_checks:
+                        _log.warning(
+                            "UNKNOWN budget spent ({n} blind checks) — "
+                            "treating as dead",
+                            n=self._unknown_streak,
+                        )
+                        await self._run_emergency_close(reason)
+                        await asyncio.sleep(self._config.max_silence_seconds)
+
+                elif verdict is HeartbeatVerdict.ALIVE:
+                    # R3: only an informed ALIVE clears an incident. A blind
+                    # tick mid-incident is not a recovery.
+                    self._unknown_streak = 0
+                    self._unknown_alerted = False
                     if self._incident_active:
                         _log.info("heartbeat recovered")
                         self._incident_active = False
@@ -431,6 +613,8 @@ class Watchdog:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # The streak is deliberately left untouched: a fault in the
+                # loop itself is not a judgement about the bot.
                 _log.error(
                     "Watchdog check error: {err}", err=str(exc),
                 )
@@ -440,18 +624,23 @@ class Watchdog:
             except asyncio.CancelledError:
                 break
 
-    async def _check_heartbeat_detailed(self) -> tuple[bool, str]:
-        """Return (is_alive, reason) where reason is 'ok', 'process_dead', or 'data_stale'."""
+    async def _check_heartbeat_detailed(self) -> tuple[HeartbeatVerdict, str]:
+        """Return (verdict, reason) for one read of the heartbeat key.
+
+        ALIVE and DEAD are informed judgements about the bot. UNKNOWN is
+        the absence of one — it is never a claim that the bot is running,
+        and the caller must not treat it as such.
+        """
         if self._redis is None:
             self._redis = await self._connect_redis()
             if self._redis is None:
                 _log.warning("Cannot check heartbeat — Redis unavailable")
-                return True, "ok"  # fail-open
+                return HeartbeatVerdict.UNKNOWN, REASON_REDIS_DOWN
 
         try:
             val = await self._redis.get(self._config.heartbeat_key)
             if val is None:
-                return False, "process_dead"
+                return HeartbeatVerdict.DEAD, REASON_PROCESS_DEAD
 
             try:
                 data = json.loads(val)
@@ -461,37 +650,36 @@ class Watchdog:
                 if not getattr(self, "_legacy_format_logged", False):
                     _log.info("legacy heartbeat format")
                     self._legacy_format_logged = True
-                
+
                 beat_ts = float(val)
                 if time.time() - beat_ts > self._config.max_silence_seconds:
-                    return False, "process_dead"
-                return True, "ok"
+                    return HeartbeatVerdict.DEAD, REASON_PROCESS_DEAD
+                return HeartbeatVerdict.ALIVE, REASON_OK
 
             now = time.time()
             if "process_ts" not in data:
                 _log.warning("Heartbeat missing process_ts")
-                return True, "ok" # fail-open for invalid JSON payload
-                
+                return HeartbeatVerdict.UNKNOWN, REASON_BAD_PAYLOAD
+
             if now - data["process_ts"] > self._config.max_silence_seconds:
-                return False, "process_dead"
+                return HeartbeatVerdict.DEAD, REASON_PROCESS_DEAD
 
             if self._config.max_bar_silence_seconds > 0:
                 last_bar = data.get("last_bar_ts")
                 if last_bar is None:
                     if now - data.get("started_ts", now) > self._config.startup_bar_grace_seconds:
-                        return False, "data_stale"
+                        return HeartbeatVerdict.DEAD, REASON_DATA_STALE
                 elif now - last_bar > self._config.max_bar_silence_seconds:
-                    return False, "data_stale"
-                    
-            return True, "ok"
-        except Exception as exc:
-            _log.warning("Heartbeat check error: {err}", err=str(exc))
-            return True, "ok"
+                    return HeartbeatVerdict.DEAD, REASON_DATA_STALE
 
-    async def _check_heartbeat(self) -> bool:
-        """Wrapper around _check_heartbeat_detailed for backward compatibility."""
-        is_alive, _ = await self._check_heartbeat_detailed()
-        return is_alive
+            return HeartbeatVerdict.ALIVE, REASON_OK
+        except Exception as exc:
+            # R4: drop the client. Keeping a handle that has already proved
+            # unusable means ``if self._redis is None`` never fires again
+            # and the blindness becomes permanent.
+            self._redis = None
+            _log.warning("Heartbeat check error: {err}", err=str(exc))
+            return HeartbeatVerdict.UNKNOWN, REASON_READ_ERROR
 
     # ------------------------------------------------------------------
     # Internal: Redis
@@ -506,6 +694,10 @@ class Watchdog:
                 "host": self._config.redis_host,
                 "port": self._config.redis_port,
                 "decode_responses": True,
+                # O3: an unbounded read can outlast check_interval and
+                # stretch the UNKNOWN budget past the minute it stands for.
+                "socket_connect_timeout": self._REDIS_SOCKET_TIMEOUT,
+                "socket_timeout": self._REDIS_SOCKET_TIMEOUT,
             }
             if self._config.redis_password:
                 kwargs["password"] = self._config.redis_password

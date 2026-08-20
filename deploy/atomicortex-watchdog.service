@@ -19,6 +19,7 @@ ExecStart=/home/hashiflame/AtomiCortex/.venv/bin/python \
     --trading-mode testnet \
     --check-interval 15 \
     --max-silence 60 \
+    --max-unknown-checks 4 \
     --max-bar-silence 28800 \
     --startup-bar-grace 17100 \
     --log-level INFO

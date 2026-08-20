@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.execution.heartbeat import HeartbeatManager
-from src.execution.watchdog import Watchdog, WatchdogConfig
+from src.execution.watchdog import (
+    REASON_REDIS_DOWN,
+    HeartbeatVerdict,
+    Watchdog,
+    WatchdogConfig,
+)
 from src.execution.reconciler import (
     InternalPosition,
     PositionReconciler,
@@ -187,7 +192,12 @@ class TestWatchdog:
     async def test_watchdog_triggers_on_silence(
         self, watchdog: Watchdog,
     ) -> None:
-        """When heartbeat is missing, watchdog should call emergency_close_all."""
+        """When heartbeat is missing, watchdog should call emergency_close_all.
+
+        Driven through the real ``_check_loop``: a test that re-implements
+        the trigger path in its own body verifies its own arithmetic, not
+        the watchdog's.
+        """
         # Mock Redis to return None (no heartbeat)
         mock_redis = AsyncMock()
         mock_redis.get = AsyncMock(return_value=None)
@@ -199,14 +209,13 @@ class TestWatchdog:
         })
         watchdog.send_telegram_alert = AsyncMock(return_value=False)
 
-        # Run one check
-        alive = await watchdog._check_heartbeat()
-        assert alive is False
+        watchdog._running = True
 
-        # Simulate the trigger path
-        if not alive:
-            await watchdog.send_telegram_alert("test")
-            await watchdog.emergency_close_all()
+        async def _stop(*args, **kwargs):
+            watchdog._running = False
+
+        with patch("asyncio.sleep", side_effect=_stop):
+            await watchdog._check_loop()
 
         watchdog.emergency_close_all.assert_called_once()
 
@@ -220,8 +229,8 @@ class TestWatchdog:
         mock_redis.get = AsyncMock(return_value=str(time.time()))
         watchdog._redis = mock_redis
 
-        alive = await watchdog._check_heartbeat()
-        assert alive is True
+        verdict, _reason = await watchdog._check_heartbeat_detailed()
+        assert verdict is HeartbeatVerdict.ALIVE
 
     @pytest.mark.asyncio
     async def test_watchdog_stale_heartbeat_triggers(
@@ -234,20 +243,21 @@ class TestWatchdog:
         mock_redis.get = AsyncMock(return_value=old_ts)
         watchdog._redis = mock_redis
 
-        alive = await watchdog._check_heartbeat()
-        assert alive is False
+        verdict, _reason = await watchdog._check_heartbeat_detailed()
+        assert verdict is HeartbeatVerdict.DEAD
 
     @pytest.mark.asyncio
-    async def test_watchdog_redis_unavailable_fail_open(
+    async def test_watchdog_redis_unavailable_is_unknown(
         self, watchdog: Watchdog,
     ) -> None:
-        """If Redis itself is down, watchdog should fail-open (NOT trigger)."""
+        """If Redis itself is down, the watchdog knows nothing about the bot."""
         watchdog._redis = None
 
         with patch.object(watchdog, '_connect_redis', return_value=None):
-            alive = await watchdog._check_heartbeat()
-            # fail-open: assume alive when Redis is down
-            assert alive is True
+            verdict, reason = await watchdog._check_heartbeat_detailed()
+            # Not ALIVE: an unreachable Redis is ignorance, not proof of life.
+            assert verdict is HeartbeatVerdict.UNKNOWN
+            assert reason == REASON_REDIS_DOWN
 
     @pytest.mark.asyncio
     async def test_emergency_close_uses_rest_not_ws(

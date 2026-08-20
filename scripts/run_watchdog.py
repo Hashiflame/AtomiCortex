@@ -121,6 +121,16 @@ def parse_args() -> argparse.Namespace:
         help="Max silence before emergency close (default: 60s)",
     )
     parser.add_argument(
+        "--max-unknown-checks",
+        type=int,
+        default=4,
+        help="Consecutive UNKNOWN heartbeat checks tolerated before the "
+        "watchdog acts as if the bot were dead (default: 4). UNKNOWN means "
+        "the watchdog could not tell — Redis down, unreadable payload, "
+        "failed read. Size it so N x --check-interval matches "
+        "--max-silence, or a WARNING is logged at start-up.",
+    )
+    parser.add_argument(
         "--max-bar-silence",
         type=int,
         default=0,
@@ -211,6 +221,7 @@ async def _main(args: argparse.Namespace) -> None:
         service_name=service_name,
         check_interval=args.check_interval,
         max_silence_seconds=args.max_silence,
+        max_unknown_checks=args.max_unknown_checks,
         max_bar_silence_seconds=args.max_bar_silence,
         startup_bar_grace_seconds=args.startup_bar_grace,
         alert_cooldown_seconds=args.alert_cooldown,
@@ -230,6 +241,7 @@ async def _main(args: argparse.Namespace) -> None:
     log.info(f"  Trading Mode:   {args.trading_mode}")
     log.info(f"  Check Interval: {args.check_interval}s")
     log.info(f"  Max Silence:    {args.max_silence}s")
+    log.info(f"  Unknown Budget: {args.max_unknown_checks} checks")
     log.info("=" * 60)
 
     # Graceful shutdown

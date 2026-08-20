@@ -1,10 +1,15 @@
 import json
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from src.execution.watchdog import Watchdog, WatchdogConfig
+from src.execution.watchdog import (
+    REASON_BAD_PAYLOAD,
+    HeartbeatVerdict,
+    Watchdog,
+    WatchdogConfig,
+)
 
 
 @pytest.fixture
@@ -37,8 +42,8 @@ async def test_fresh_process_fresh_bar_ok(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is True
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.ALIVE
     assert reason == "ok"
 
 
@@ -53,8 +58,8 @@ async def test_fresh_process_stale_bar(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is False
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.DEAD
     assert reason == "data_stale"
 
 
@@ -69,8 +74,8 @@ async def test_stale_process(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is False
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.DEAD
     assert reason == "process_dead"
 
 
@@ -79,8 +84,8 @@ async def test_legacy_float_fresh(watchdog):
     now = time.time()
     watchdog._redis.get.return_value = str(now - 10)  # fresh process, legacy float
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is True
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.ALIVE
     assert reason == "ok"
     assert watchdog._legacy_format_logged is True
 
@@ -94,8 +99,8 @@ async def test_legacy_float_stale(watchdog):
     now = time.time()
     watchdog._redis.get.return_value = str(now - 100)  # stale process (> 60)
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is False
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.DEAD
     assert reason == "process_dead"
 
 
@@ -110,8 +115,8 @@ async def test_none_bar_within_grace_ok(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is True
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.ALIVE
     assert reason == "ok"
 
 
@@ -126,8 +131,8 @@ async def test_none_bar_beyond_grace_stale(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is False
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.DEAD
     assert reason == "data_stale"
 
 
@@ -143,26 +148,13 @@ async def test_max_bar_silence_zero_disables_data_check(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is True
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.ALIVE
     assert reason == "ok"
 
 
 @pytest.mark.asyncio
-async def test_check_heartbeat_bool_wrapper(watchdog):
-    now = time.time()
-    # Mock detailed to return (False, "data_stale")
-    with patch.object(watchdog, "_check_heartbeat_detailed", return_value=(False, "data_stale")):
-        result = await watchdog._check_heartbeat()
-        assert result is False
-
-    with patch.object(watchdog, "_check_heartbeat_detailed", return_value=(True, "ok")):
-        result = await watchdog._check_heartbeat()
-        assert result is True
-
-
-@pytest.mark.asyncio
-async def test_missing_json_fields_fail_open(watchdog):
+async def test_missing_process_ts_is_unknown(watchdog):
     now = time.time()
     # Missing process_ts
     payload = json.dumps({
@@ -172,7 +164,7 @@ async def test_missing_json_fields_fail_open(watchdog):
     })
     watchdog._redis.get.return_value = payload
 
-    # Should fail open when key error happens
-    is_alive, reason = await watchdog._check_heartbeat_detailed()
-    assert is_alive is True
-    assert reason == "ok"
+    # A payload we cannot interpret is ignorance, not proof of life.
+    verdict, reason = await watchdog._check_heartbeat_detailed()
+    assert verdict is HeartbeatVerdict.UNKNOWN
+    assert reason == REASON_BAD_PAYLOAD

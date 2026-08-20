@@ -21,6 +21,7 @@ from scripts.run_watchdog import parse_args, resolve_strategy_args
 from src.execution.watchdog import (
     DEFAULT_HEARTBEAT_KEY,
     STRATEGY_HEARTBEAT_KEYS,
+    WatchdogConfig,
 )
 
 
@@ -200,3 +201,29 @@ class TestArgparseResolveIntegration:
         )
         assert key == DEFAULT_HEARTBEAT_KEY
         assert warn is not None
+
+
+# ---------------------------------------------------------------------------
+# PR-0.8 — the UNKNOWN budget must be reachable from the command line and
+# actually set by the units that ship it.
+# ---------------------------------------------------------------------------
+
+
+class TestMaxUnknownChecks:
+    def test_max_unknown_checks_default_is_4(self):
+        """4 x the 15s default interval = the 60s default silence limit."""
+        assert WatchdogConfig().max_unknown_checks == 4
+
+    def test_max_unknown_checks_flag_parsed(self):
+        args = _argv(["--max-unknown-checks", "7"])
+        assert args.max_unknown_checks == 7
+
+    def test_watchdog_units_pass_max_unknown_checks(self):
+        """Both watchdog units must pin the budget, not inherit it silently."""
+        deploy = _ROOT / "deploy"
+        for name in (
+            "atomicortex-watchdog.service",
+            "atomicortex-watchdog-15m.service",
+        ):
+            text = (deploy / name).read_text(encoding="utf-8")
+            assert "--max-unknown-checks" in text, name
