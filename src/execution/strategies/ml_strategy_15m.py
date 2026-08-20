@@ -59,6 +59,7 @@ from src.execution.strategies.ml_strategy import (
     _bar_to_dict,
     _safe_float,
 )
+from src.features.live_feature_state import bar_open_time_ms
 from src.logger import get_logger
 from src.risk.risk_engine import TradeSignal
 
@@ -281,9 +282,23 @@ class MLTradingStrategy15M(MLTradingStrategy):
         return sym.split("-")[0] if "-" in sym else sym.split(".")[0]
 
     def _bars_to_df(self, bars: list[Bar]) -> pl.DataFrame:
-        """Bar list → raw OHLCV DataFrame (build_from_buffer schema)."""
+        """Bar list → raw OHLCV DataFrame (build_from_buffer schema).
+
+        ``ts_event`` is the bar CLOSE time (Nautilus convention, and what
+        preload now stores); the pipeline's ``open_time`` column is the bar
+        OPEN — offline it comes straight from the Binance kline field of
+        that name, and ``MTFContextBuilder`` derives close_time from it as
+        ``open_time + bar_duration``. ``bar_open_time_ms`` snaps back to the
+        bar grid instead of subtracting the duration blindly, so a Binance
+        close (``open + duration - 1``) and a plain boundary close
+        (``open + duration``) both resolve to the same open.
+        """
+        interval = self._config.interval
         return pl.DataFrame({
-            "open_time": [int(b.ts_event // 1_000_000) for b in bars],  # ns→ms
+            "open_time": [
+                bar_open_time_ms(int(b.ts_event // 1_000_000), interval)
+                for b in bars
+            ],  # ns→ms, then close→open on the bar grid
             "open": [b.open.as_double() for b in bars],
             "high": [b.high.as_double() for b in bars],
             "low": [b.low.as_double() for b in bars],
@@ -510,6 +525,19 @@ class MLTradingStrategy15M(MLTradingStrategy):
         Fetches up to ``min(max_bars, 1500)`` 15m klines so HTF resamples
         have history. Never raises — on failure the strategy warms up
         from live bars instead.
+
+        ``ts_event`` comes from kline index 6 (``close_time``), matching the
+        Nautilus ts_event = bar CLOSE time convention that live bars already
+        carry — a preload keyed on index 0 (open time) would splice two
+        conventions into one buffer. The endpoint returns the still-forming
+        candle as its last element, so any bar whose close time has not
+        passed yet is dropped: ``build_from_buffer`` reads the last row as
+        the current feature vector, and a partial candle there is a partial
+        feature vector.
+
+        Every path that ends with an empty buffer logs a WARNING naming the
+        reason — a silent zero-bar preload is indistinguishable from a
+        successful one at the next log line.
         """
         try:
             import requests
@@ -532,8 +560,39 @@ class MLTradingStrategy15M(MLTradingStrategy):
             )
             resp.raise_for_status()
             klines = resp.json()
+
+            # A truncated trailing row is the only position where a
+            # half-written record can appear — drop just that one.
+            if klines and len(klines[-1]) < 7:
+                self.log.warning(
+                    "15m preload: trailing kline row is truncated "
+                    f"({len(klines[-1])} fields) — dropping it"
+                )
+                klines = klines[:-1]
+
+            # A truncated row anywhere else would leave a hole in the
+            # series; every rolling window is positional, so a hole
+            # silently shifts them all. Refuse the batch instead — and
+            # do not retry, a short row is a format change, not a
+            # network glitch.
+            short_rows = sum(1 for k in klines if len(k) < 7)
+            if short_rows:
+                self._warmup_complete = False
+                self.log.warning(
+                    f"15m preload: {short_rows} kline row(s) missing "
+                    "close_time (index 6) — refusing partial history, "
+                    "warming from live bars"
+                )
+                return
+
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            unclosed = 0
             for k in klines:
-                ts_ns = int(k[0]) * 1_000_000
+                close_ms = int(k[6])
+                if close_ms >= now_ms:
+                    unclosed += 1
+                    continue
+                ts_ns = close_ms * 1_000_000  # close_time ms → ns
                 self._bars.append(Bar(
                     bar_type=self._bar_type,
                     open=Price(float(k[1]), precision=1),
@@ -546,10 +605,19 @@ class MLTradingStrategy15M(MLTradingStrategy):
                 ))
             if len(self._bars) >= self._config.warmup_bars:
                 self._warmup_complete = True
+            if not self._bars:
+                self.log.warning(
+                    f"15m preload: no closed klines from {base} "
+                    f"({len(klines)} received, {unclosed} still forming) "
+                    f"— warming from live bars"
+                )
+                return
             self.log.info(
                 f"15m preload: {len(self._bars)} bars from {base} "
+                f"| dropped {unclosed} not-yet-closed "
                 f"| warmup_complete={self._warmup_complete}"
             )
+            self._log_preload_timestamp_check("binance_api", self._bars[-1])
         except Exception as exc:
             self.log.warning(
                 f"15m preload failed ({exc}) — warming from live bars"
