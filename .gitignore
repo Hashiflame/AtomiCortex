@@ -46,3 +46,5 @@ Thumbs.db
 backtests/
 
 .claude/
+# Local snapshots (DB, models, .env) — never in git
+backups/
