@@ -138,6 +138,66 @@ class ModelRejectedError(Exception):
         )
 
 
+# Reasons a bundle is refused at load time.  Named constants rather than
+# literals at the raise site: ``_load_models`` is under an AST linter that
+# forbids string constants in that function body, and a code the caller
+# matches on has to be spelled in exactly one place anyway.
+LOAD_MISSING = "missing"
+LOAD_NO_ENTRY = "no_registry_entry"
+LOAD_HASH_MISMATCH = "hash_mismatch"
+LOAD_UNREADABLE = "unreadable"
+
+
+class ModelLoadError(RuntimeError):
+    """PR-Э1.3: the strategy refused to take this artifact off disk.
+
+    The mirror image of :class:`ModelRejectedError`: that one guards the
+    write, this one the read.  Neither is a subclass of the other,
+    because "the model we just trained is not good enough to keep" and
+    "the model on the deployment disk is not the one the registry
+    describes" have opposite fixes and must never be caught together.
+
+    ``RuntimeError`` and not a bare ``Exception`` on purpose.
+    ``TradingNode.run()`` carries a ``except RuntimeError`` branch that
+    logs through the kernel logger before handing the exception back to
+    its caller; an exception outside that branch reaches the launcher
+    with nothing in the Nautilus log to say what happened.  The same
+    branch only re-raises under ``raise_exception=True``, which is why
+    ``LiveTrader`` passes it.
+
+    Attributes
+    ----------
+    reason:
+        One of ``LOAD_MISSING``, ``LOAD_NO_ENTRY``,
+        ``LOAD_HASH_MISMATCH``, ``LOAD_UNREADABLE``.
+    path:
+        The file that was NOT loaded — a bundle, or the registry itself
+        when the registry is what could not be read.
+    stem:
+        Which model, or None for a failure that belongs to no single one.
+    detail:
+        What was wrong, in words.  For a hash mismatch it carries both
+        digests in full: this is the only line the operator gets, and a
+        truncated hash cannot be pasted into a command.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        path: Path,
+        stem: str | None = None,
+        detail: str = "",
+    ) -> None:
+        self.reason = reason
+        self.path = Path(path)
+        self.stem = stem
+        self.detail = detail
+        super().__init__(
+            f"[{stem or '-'}] model refused ({reason}): "
+            f"{detail or 'no further detail'}; not loaded: {self.path}"
+        )
+
+
 # Symbol → integer encoding (deterministic)
 SYMBOL_ENCODING: dict[str, int] = {
     "BTCUSDT": 0,

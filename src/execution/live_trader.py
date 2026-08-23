@@ -111,6 +111,9 @@ class LiveTrader:
         self._config = config
         self._node: TradingNode | None = None
         self._startup_checker: EngineConnectionChecker | None = None
+        # PR-Э1.3: set when the strategy refused to load its bundles.
+        # Separate from _startup_checker on purpose — see model_load_error.
+        self._model_load_error: Exception | None = None
         _log.info(
             f"LiveTrader created | mode={config.trading_mode} | "
             f"symbols={config.symbols} | dry_run={config.dry_run}"
@@ -126,6 +129,23 @@ class LiveTrader:
         if self._startup_checker is None:
             return False
         return self._startup_checker.engines_failed
+
+    @property
+    def model_load_error(self) -> Exception | None:
+        """The strategy's refusal to load its models, if it happened.
+
+        Deliberately not folded into ``startup_failed``: the two mean
+        opposite things to systemd.  A failed engine connection is
+        transient and answered with exit 1 and a restart; an unattested
+        model bundle is answered with exit 78, which
+        ``RestartPreventExitStatus=`` turns into a single clean failure.
+        Merging them would either burn the restart budget on something no
+        restart can fix, or stop retrying something a retry would fix.
+
+        The exception itself rather than a bool, so the launcher can put
+        the reason, the path and both hashes into its one critical line.
+        """
+        return self._model_load_error
 
     def build_node(self) -> TradingNode:
         """
@@ -277,11 +297,26 @@ class LiveTrader:
 
         _log.info("Starting TradingNode...")
         try:
-            self._node.run()
+            # raise_exception=True is load-bearing: TradingNode.run()
+            # catches RuntimeError, logs it and re-raises ONLY under this
+            # flag.  With the default the strategy's ModelLoadError would
+            # be logged by Nautilus and then lost, this method would see a
+            # clean return, and the process would exit 0 — a bot that is
+            # not trading and a unit that looks like it stopped on purpose.
+            self._node.run(raise_exception=True)
         except KeyboardInterrupt:
             _log.info("KeyboardInterrupt — stopping...")
         except Exception as exc:
-            _log.error(f"TradingNode run error: {exc}")
+            # Imported here, not at module scope: lgbm_trainer costs ~730 ms
+            # to import and nothing else in this module needs it.  If exc
+            # really is a ModelLoadError the module is already in
+            # sys.modules, so this costs nothing on the path that matters.
+            from src.models.lgbm_trainer import ModelLoadError
+            if isinstance(exc, ModelLoadError):
+                self._model_load_error = exc
+                _log.critical(f"Refusing to trade: {exc}")
+            else:
+                _log.error(f"TradingNode run error: {exc}")
         finally:
             self._dispose()
 

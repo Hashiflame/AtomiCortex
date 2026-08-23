@@ -40,7 +40,18 @@ from nautilus_trader.trading.strategy import Strategy
 
 from src.features.live_feature_state import bar_open_time_ms
 from src.logger import get_logger
-from src.models.model_paths import MODELS_ROOT_4H, PROD_STEMS_4H, prod_path
+from src.models.model_paths import (
+    MODELS_ROOT_4H,
+    PROD_STEMS_4H,
+    REGISTRY_PATH,
+    prod_path,
+)
+from src.models.model_registry import (
+    RegistryError,
+    load_registry,
+    registry_entry_for,
+    sha256_file,
+)
 from src.risk.risk_engine import (
     PortfolioState,
     RiskConfig,
@@ -1715,30 +1726,142 @@ class MLTradingStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _load_models(self) -> None:
-        """Load LightGBM model bundles (legacy pickle OR H13 sidecar)."""
-        from src.models.lgbm_trainer import LGBMTrainer
+        """Load the production bundles, or refuse to start (PR-Э1.3).
+
+        Three conditions each refuse: the file is not on disk, the
+        registry does not describe it, or the file does not hash to what
+        the registry recorded.  Before Э1.3 the first was a warning and
+        the other two did not exist, so a deployment whose models had
+        never arrived started cleanly, subscribed to bars and then
+        skipped every one of them — plain in the log, invisible in the
+        exit code and in ``systemctl status``.
+
+        Verification runs over both stems before anything is loaded and
+        every problem found goes into the one exception raised, because
+        ``RestartPreventExitStatus=78`` in the unit means there is no
+        second start on which the operator would discover the second
+        broken bundle.
+
+        Raises
+        ------
+        ModelLoadError
+            Always, when any stem cannot be attested.  It reaches
+            ``TradingNode.run()`` unchanged and ends as exit code 78.
+        """
+        from src.models.lgbm_trainer import (
+            LOAD_HASH_MISMATCH,
+            LOAD_MISSING,
+            LOAD_NO_ENTRY,
+            LOAD_UNREADABLE,
+            LGBMTrainer,
+            ModelLoadError,
+        )
         models_dir = Path(self._config.models_dir)
         # PROD_STEMS_4H is pinned to exactly two stems; unpacking names
         # the first so the dispatch below carries no literal either.
         trend_stem, _ = PROD_STEMS_4H
+
+        # Read once for the whole call: two reads could disagree, and the
+        # operator would then be reading about a registry state that never
+        # existed as a whole.  A registry file that is absent is not an
+        # error here — it comes back empty and every stem then fails with
+        # the more precise "no entry".
+        try:
+            registry = load_registry(REGISTRY_PATH)
+        except RegistryError as exc:
+            raise ModelLoadError(
+                LOAD_UNREADABLE, REGISTRY_PATH, None, str(exc),
+            ) from exc
+
+        verified: list[tuple[str, Path, dict]] = []
+        problems: list[ModelLoadError] = []
         for regime in PROD_STEMS_4H:
             path = prod_path(models_dir, regime)
-            if path.exists():
+            if not path.is_file():
+                problems.append(ModelLoadError(
+                    LOAD_MISSING, path, regime,
+                    "no such file under the configured models_dir",
+                ))
+                continue
+
+            entry = registry_entry_for(registry, regime)
+            if entry is None:
+                problems.append(ModelLoadError(
+                    LOAD_NO_ENTRY, path, regime,
+                    f"{REGISTRY_PATH} does not describe this model",
+                ))
+                continue
+
+            expected = entry.get("sha256")
+            if not isinstance(expected, str) or not expected:
+                # An entry that cannot authenticate its file is, to this
+                # loader, the same as no entry at all.
+                problems.append(ModelLoadError(
+                    LOAD_NO_ENTRY, path, regime,
+                    f"the entry in {REGISTRY_PATH} carries no usable sha256",
+                ))
+                continue
+
+            try:
+                actual = sha256_file(path)
+            except OSError as exc:
+                problems.append(ModelLoadError(
+                    LOAD_UNREADABLE, path, regime, f"could not be hashed: {exc}",
+                ))
+                continue
+
+            if actual != expected:
+                # Both digests in full: this is the only line the operator
+                # gets, and a truncated hash cannot be pasted anywhere.
+                problems.append(ModelLoadError(
+                    LOAD_HASH_MISMATCH, path, regime,
+                    f"hashes to {actual}, {REGISTRY_PATH} records {expected}",
+                ))
+                continue
+
+            verified.append((regime, path, entry))
+
+        if problems:
+            if len(problems) == 1:
+                raise problems[0]
+            # Fields describe the first artifact honestly; the detail
+            # carries the whole picture, since there is no second start.
+            first = problems[0]
+            raise ModelLoadError(
+                first.reason, first.path, first.stem,
+                " | ".join(str(problem) for problem in problems),
+            )
+
+        for regime, path, entry in verified:
+            try:
                 bundle = LGBMTrainer.load_model_bundle(path)
                 booster = bundle["booster"]
-                features = bundle.get("feature_columns", [])
-                if regime == trend_stem:
-                    self._trend_model = booster
-                    self._trend_features = features
-                else:
-                    self._highvol_model = booster
-                    self._highvol_features = features
-                self.log.info(
-                    f"Loaded {regime} model from {path} "
-                    f"({len(features)} features)"
+            except Exception as exc:
+                raise ModelLoadError(
+                    LOAD_UNREADABLE, path, regime,
+                    f"passed the hash check but could not be read: "
+                    f"{type(exc).__name__}: {exc}",
+                ) from exc
+
+            if booster is None:
+                raise ModelLoadError(
+                    LOAD_UNREADABLE, path, regime,
+                    "the bundle carries no booster — nothing to predict with",
                 )
+
+            features = bundle.get("feature_columns", [])
+            if regime == trend_stem:
+                self._trend_model = booster
+                self._trend_features = features
             else:
-                self.log.warning(f"Model not found: {path}")
+                self._highvol_model = booster
+                self._highvol_features = features
+            self.log.info(
+                f"Loaded {regime} model from {path} "
+                f"| sha256={entry['sha256'][:16]}… "
+                f"| trained={entry.get('trained_git_commit')} "
+                f"({len(features)} features)"
+            )
 
     def _select_model(
         self, regime_label: str,

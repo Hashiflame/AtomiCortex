@@ -122,6 +122,7 @@ def run_main(monkeypatch: pytest.MonkeyPatch) -> Any:
             def __init__(self, config: Any) -> None:
                 outcome.configs.append(config)
                 self.startup_failed = False
+                self.model_load_error = None
 
             def run(self) -> None:
                 return None

@@ -87,7 +87,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models-dir",
         default=str(MODELS_ROOT_4H),
-        help="Path to trained model directory",
+        help=(
+            "Path to trained model directory. Must hold the bundles the "
+            "model registry describes — anything else is refused at startup"
+        ),
     )
     return parser.parse_args()
 
@@ -218,6 +221,19 @@ def main() -> None:
         pass
     except Exception as exc:
         log.error(f"Fatal error: {exc}", exc_info=True)
+
+    # Checked before startup_failed: an unattested model bundle is not
+    # retryable, and 78 is the only code the unit answers by failing once
+    # and staying failed.  If the engine-check branch won this race, a
+    # deployment nobody can repair would be restarted until StartLimitBurst
+    # is spent.
+    if trader.model_load_error is not None:
+        log.critical(
+            f"Refusing to trade: {trader.model_load_error} — restore the "
+            f"bundle or re-run scripts/promote_model.py; a restart cannot "
+            f"fix this"
+        )
+        sys.exit(_EXIT_CONFIG_ERROR)
 
     if trader.startup_failed:
         log.critical(
