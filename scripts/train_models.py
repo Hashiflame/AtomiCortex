@@ -10,7 +10,13 @@ Usage
         --symbols BTCUSDT,ETHUSDT,SOLUSDT \
         --features-dir /mnt/hdd/AtomiCortex/data/features/ml_features \
         --models-dir /mnt/hdd/AtomiCortex/data/features/models \
-        --regimes trend,range,high_vol
+        --regimes trend,range,high_vol \
+        --model-suffix _v4
+
+``--model-suffix`` is required and has no default (PR-Э1.4, A2-036).
+This script trains on the legacy 1-bar ``sign_return`` target, and the
+unsuffixed filename is the one the live 4H strategy loads; ``save_bundle``
+refuses to write it for anything but a triple-barrier model.
 """
 
 from __future__ import annotations
@@ -53,6 +59,19 @@ def _parse_args() -> argparse.Namespace:
         default="trend,range,high_vol",
         help="Comma-separated regimes to train (default: trend,range,high_vol)",
     )
+    # Required, and deliberately without a default (PR-Э1.4, A2-036).
+    # This script trains on the legacy sign_return target, and an empty
+    # suffix names its output exactly like the bundle the live 4H
+    # strategy loads. A default -- even "_vN" -- would put that filename
+    # one forgotten argument away again, so the name is made a decision
+    # the operator has to type.
+    p.add_argument(
+        "--model-suffix",
+        required=True,
+        help="Filename suffix written between regime and .pkl (e.g. '_v4'). "
+             "Required: the unsuffixed name is reserved for the production "
+             "triple-barrier bundles and save_bundle refuses it.",
+    )
     return p.parse_args()
 
 
@@ -70,6 +89,7 @@ def main() -> None:
     print(f"  Regimes     : {', '.join(regimes)}")
     print(f"  Features dir: {args.features_dir}")
     print(f"  Models dir  : {args.models_dir}")
+    print(f"  Suffix      : {args.model_suffix}")
     print(f"{'='*60}\n")
 
     pipeline = TrainingPipeline()
@@ -78,6 +98,7 @@ def main() -> None:
         features_dir=args.features_dir,
         models_dir=args.models_dir,
         regimes=regimes,
+        model_suffix=args.model_suffix,
     )
 
     pipeline.print_report(results)

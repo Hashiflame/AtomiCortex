@@ -592,3 +592,30 @@ class TestBestParamsNotMutated:
 
         # Original dict must be unchanged (no .pop() mutation)
         assert best_params == params_copy
+
+
+# ===========================================================================
+# 8. PR-Э1.4 — the retrain path can be told what to name its output
+# ===========================================================================
+
+
+def test_retrain_with_best_params_accepts_model_suffix() -> None:
+    """A2-036: ``retrain_with_best_params`` is the one writer in this
+    module, and before Э1.4 it had no way to be told anything but the
+    production name.
+
+    A signature check rather than a run: the write itself is covered by
+    ``TestRetrainWithBestParams::test_saves_model`` above, and repeating
+    an Optuna study here would buy nothing for a minute of runtime.
+    """
+    import inspect
+
+    parameters = inspect.signature(
+        OptunaTrainer.retrain_with_best_params
+    ).parameters
+
+    assert "model_suffix" in parameters, (
+        "retrain_with_best_params cannot be told what to name its bundle — "
+        "tune_models.py has nowhere to pass --model-suffix"
+    )
+    assert parameters["model_suffix"].default == ""

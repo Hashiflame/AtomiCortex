@@ -1750,9 +1750,12 @@ class MLTradingStrategy(Strategy):
         """
         from src.models.lgbm_trainer import (
             LOAD_HASH_MISMATCH,
+            LOAD_MANIFEST_MISMATCH,
             LOAD_MISSING,
             LOAD_NO_ENTRY,
             LOAD_UNREADABLE,
+            LOAD_WRONG_TARGET,
+            PROD_TARGET_KIND,
             LGBMTrainer,
             ModelLoadError,
         )
@@ -1819,6 +1822,22 @@ class MLTradingStrategy(Strategy):
                 ))
                 continue
 
+            recorded_target = entry.get("target_kind")
+            if recorded_target != PROD_TARGET_KIND:
+                # Hashing proves WHICH file this is, never WHAT it was
+                # trained on.  A legacy-target bundle hashes perfectly
+                # and then answers a different question every bar, in
+                # the same handwriting.  Checked after the hash: an
+                # entry that describes some other file has nothing
+                # trustworthy to say about its target either.
+                problems.append(ModelLoadError(
+                    LOAD_WRONG_TARGET, path, regime,
+                    f"{REGISTRY_PATH} records target_kind="
+                    f"{recorded_target!r}; this strategy trades "
+                    f"{PROD_TARGET_KIND!r} models only",
+                ))
+                continue
+
             verified.append((regime, path, entry))
 
         if problems:
@@ -1847,6 +1866,42 @@ class MLTradingStrategy(Strategy):
                 raise ModelLoadError(
                     LOAD_UNREADABLE, path, regime,
                     "the bundle carries no booster — nothing to predict with",
+                )
+
+            # The registry entry was copied out of this manifest at
+            # promotion time, so the manifest is the source and the entry
+            # the derivative.  Checking the derivative alone would trust
+            # a copy over the original; checking it first is still worth
+            # it, because that check aggregates and this one cannot.
+            manifest = bundle.get("manifest")
+            if not isinstance(manifest, dict):
+                raise ModelLoadError(
+                    LOAD_WRONG_TARGET, path, regime,
+                    "the bundle carries no manifest — what it was trained "
+                    "to predict cannot be established",
+                )
+
+            bundle_target = manifest.get("target_kind")
+            if bundle_target != PROD_TARGET_KIND:
+                raise ModelLoadError(
+                    LOAD_WRONG_TARGET, path, regime,
+                    f"the bundle manifest records target_kind="
+                    f"{bundle_target!r}; this strategy trades "
+                    f"{PROD_TARGET_KIND!r} models only",
+                )
+
+            # Unreachable while target_kind has two values and the
+            # registry check above runs first: to get here both fields
+            # must equal PROD_TARGET_KIND, and equal values cannot
+            # differ.  Kept for the day the set grows, when the two
+            # checks stop implying each other.
+            if bundle_target != entry.get("target_kind"):
+                raise ModelLoadError(
+                    LOAD_MANIFEST_MISMATCH, path, regime,
+                    f"the bundle manifest records target_kind="
+                    f"{bundle_target!r} while {REGISTRY_PATH} records "
+                    f"{entry.get('target_kind')!r} — the registry does not "
+                    f"describe this file",
                 )
 
             features = bundle.get("feature_columns", [])

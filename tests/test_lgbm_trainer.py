@@ -584,3 +584,31 @@ class TestTrainingPipeline:
 
         assert "all" in results
         assert isinstance(results["all"], EvaluationResult)
+
+    def test_pipeline_suffix_reaches_the_filename(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """PR-Э1.4 / A2-036: the suffix the CLI demands has to arrive.
+
+        A ``run`` that accepted ``model_suffix`` and dropped it on the
+        floor would satisfy every signature check in the suite and still
+        write the production name it was added to prevent.
+        """
+        symbols = ["BTCUSDT"]
+        features_dir = _save_features(tmp_path, symbols, n=300)
+        models_dir = tmp_path / "models"
+
+        monkeypatch.setattr(
+            EvaluationResult, "passes_minimum_thresholds", lambda self: True,
+        )
+
+        TrainingPipeline().run(
+            symbols=symbols,
+            features_dir=features_dir,
+            models_dir=models_dir,
+            regimes=["all"],
+            model_suffix="_v4",
+        )
+
+        assert (models_dir / "all_model_v4.pkl").exists()
+        assert not (models_dir / "all_model.pkl").exists()

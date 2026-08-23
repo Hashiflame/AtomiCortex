@@ -689,3 +689,202 @@ def test_run_live_checks_model_error_before_startup_failed(
 
     assert raised is not None
     assert raised.code == _exit_config_error(run_live)
+
+
+# ===========================================================================
+# 6. PR-Э1.4 — the loader refuses a bundle trained on the wrong target
+# ===========================================================================
+#
+# A2-036: hashing proves WHICH file this is, not WHAT it was trained on.
+# A ``sign_return`` bundle promoted under a production name hashes
+# perfectly and predicts a 1-bar coin flip for a strategy whose entire
+# geometry assumes the triple barrier.  Two gates, on purpose:
+#
+#   point A, in the verification loop -- reads the registry entry, so the
+#   refusal joins the aggregated ``problems`` (``RestartPreventExitStatus=78``
+#   means there is no second start on which to find the second bad stem);
+#   point B, in the load loop -- reads the manifest of the bundle actually
+#   being unpickled, which is the source the registry entry was copied from.
+
+
+def _target_reasons() -> Any:
+    """The Э1.4 refusal codes, imported lazily.
+
+    A separate accessor from ``_reasons()`` above so that, before this PR
+    lands, the two new names failing to resolve cannot take the Э1.3
+    tests down with them.
+    """
+    from src.models import lgbm_trainer as lt
+
+    return SimpleNamespace(
+        wrong_target=lt.LOAD_WRONG_TARGET,
+        manifest_mismatch=lt.LOAD_MANIFEST_MISMATCH,
+    )
+
+
+def _prod_target_kind() -> str:
+    from src.models.lgbm_trainer import PROD_TARGET_KIND
+
+    return PROD_TARGET_KIND
+
+
+def _legacy_target_kind() -> str:
+    from src.models.lgbm_trainer import LEGACY_TARGET_KIND
+
+    return LEGACY_TARGET_KIND
+
+
+def _repackage(tree: _Tree, stem: str, mutate: Any) -> None:
+    """Rewrite a bundle through ``mutate`` and re-attest it.
+
+    The entry is rebuilt with ``build_entry`` so the new bytes hash
+    correctly -- without that the hash gate would fire first and this
+    would be another spelling of ``test_hash_mismatch_...``.  Callers
+    that want the refusal to land in the LOAD phase then restore
+    ``target_kind`` on the entry by hand, because ``build_entry`` copies
+    that field out of the very manifest they just broke.
+    """
+    path = tree.bundle(stem)
+    with open(path, "rb") as fh:
+        bundle = pickle.load(fh)
+    mutate(bundle)
+    with open(path, "wb") as fh:
+        pickle.dump(bundle, fh)
+
+    registry = load_registry(tree.registry)
+    registry["models"][stem] = build_entry(
+        bundle_path=path,
+        manifest=bundle.get("manifest", {}),
+        promoted_at_utc="2026-08-23T00:00:00+00:00",
+        source_path=path,
+        prod_root=tree.prod,
+    )
+    tree.rewrite(registry)
+
+
+# --- point A: the registry entry -------------------------------------------
+
+
+def test_registry_target_kind_sign_return_refuses(tree: _Tree) -> None:
+    """The entry says the file was trained on the legacy target.
+
+    Nothing is wrong with the bytes -- the hash still matches -- so this
+    refusal exists precisely because hashing cannot ask this question.
+    """
+    registry = load_registry(tree.registry)
+    registry["models"][_TREND]["target_kind"] = _legacy_target_kind()
+    tree.rewrite(registry)
+
+    with pytest.raises(_load_error()) as excinfo:
+        _strategy(tree.prod)._load_models()
+
+    exc = excinfo.value
+    assert exc.reason == _target_reasons().wrong_target
+    assert exc.stem == _TREND
+    assert _legacy_target_kind() in str(exc)
+
+
+def test_registry_without_target_kind_refuses(tree: _Tree) -> None:
+    """An entry that does not say what the model targets is not evidence
+    that it targets the right thing."""
+    registry = load_registry(tree.registry)
+    registry["models"][_HIGH_VOL].pop("target_kind")
+    tree.rewrite(registry)
+
+    with pytest.raises(_load_error()) as excinfo:
+        _strategy(tree.prod)._load_models()
+
+    exc = excinfo.value
+    assert exc.reason == _target_reasons().wrong_target
+    assert exc.stem == _HIGH_VOL
+    assert "None" in str(exc)
+
+
+def test_both_stems_wrong_target_aggregate(tree: _Tree) -> None:
+    """Both bad stems in one refusal, like every other verification-phase
+    problem -- there is no second start on which to find the second one."""
+    registry = load_registry(tree.registry)
+    for stem in PROD_STEMS_4H:
+        registry["models"][stem]["target_kind"] = _legacy_target_kind()
+    tree.rewrite(registry)
+
+    with pytest.raises(_load_error()) as excinfo:
+        _strategy(tree.prod)._load_models()
+
+    message = str(excinfo.value)
+    for stem in PROD_STEMS_4H:
+        assert str(tree.bundle(stem)) in message, message
+
+
+# --- point B: the bundle manifest ------------------------------------------
+
+
+def test_bundle_manifest_sign_return_refuses(tree: _Tree) -> None:
+    """The registry is made to agree that this is a production model; the
+    manifest inside the pickle says otherwise, and the manifest is the
+    source the entry was copied from."""
+
+    def _downgrade(bundle: dict) -> None:
+        bundle["manifest"]["target_kind"] = _legacy_target_kind()
+
+    _repackage(tree, _TREND, _downgrade)
+    registry = load_registry(tree.registry)
+    registry["models"][_TREND]["target_kind"] = _prod_target_kind()
+    tree.rewrite(registry)
+
+    with pytest.raises(_load_error()) as excinfo:
+        _strategy(tree.prod)._load_models()
+
+    exc = excinfo.value
+    assert exc.reason == _target_reasons().wrong_target
+    assert exc.stem == _TREND
+    assert "manifest" in str(exc)
+
+
+def test_bundle_without_manifest_refuses(tree: _Tree) -> None:
+    """Э1.4 answer 3: a production bundle with no manifest is refused.
+
+    Pre-Э1.2 bundles only drew a warning from ``load_model_bundle``.  For
+    the 4H line that is now a refusal -- an artifact whose target cannot
+    be established is not a production artifact.  (PR-I for the 1h/15m
+    lines is still open.)
+    """
+
+    def _strip(bundle: dict) -> None:
+        bundle.pop("manifest", None)
+
+    _repackage(tree, _HIGH_VOL, _strip)
+    registry = load_registry(tree.registry)
+    registry["models"][_HIGH_VOL]["target_kind"] = _prod_target_kind()
+    tree.rewrite(registry)
+
+    with pytest.raises(_load_error()) as excinfo:
+        _strategy(tree.prod)._load_models()
+
+    exc = excinfo.value
+    assert exc.reason == _target_reasons().wrong_target
+    assert exc.stem == _HIGH_VOL
+    assert "manifest" in str(exc)
+
+
+# --- the path that must stay open ------------------------------------------
+
+
+def test_real_prod_bundles_pass_the_target_gate(tree: _Tree) -> None:
+    """The deployed artifacts clear both gates.
+
+    Not a tautology: it runs over copies of the real ``models/prod``
+    bundles and their real manifests, so a gate that refused everything
+    would be caught here rather than on the VM.
+    """
+    for stem in PROD_STEMS_4H:
+        with open(tree.bundle(stem), "rb") as fh:
+            manifest = pickle.load(fh)["manifest"]
+        assert manifest["target_kind"] == _prod_target_kind()
+        assert tree.entry(stem)["target_kind"] == _prod_target_kind()
+
+    strategy = _strategy(tree.prod)
+    strategy._load_models()
+
+    assert strategy._trend_model is not None
+    assert strategy._highvol_model is not None

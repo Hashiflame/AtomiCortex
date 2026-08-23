@@ -843,3 +843,62 @@ class TestProductionCallersSave:
             f"{rel_path} trains a model but never calls save_bundle — "
             "the artifact would never reach disk"
         )
+
+
+# ===========================================================================
+# 11. PR-Э1.4 — target_kind is a named constant, not a literal
+# ===========================================================================
+
+
+def _target_kinds():
+    """The two target-kind constants, imported lazily.
+
+    Module-level import would turn "the constants do not exist yet" into
+    a collection error for the whole file instead of a failure in the
+    two tests that need them.
+    """
+    from src.models.lgbm_trainer import LEGACY_TARGET_KIND, PROD_TARGET_KIND
+
+    return SimpleNamespace(prod=PROD_TARGET_KIND, legacy=LEGACY_TARGET_KIND)
+
+
+class TestTargetKindConstants:
+    """Э1.4: three consumers now read this value -- the manifest that
+    writes it, the registry gate and the manifest gate in the 4H loader.
+    Three literals in two modules is the shape A2-031 grew out of."""
+
+    def test_manifest_target_kind_uses_the_constant(self, tmp_path: Path):
+        """Both branches of the ternary come from the constants."""
+        kinds = _target_kinds()
+
+        legacy_trainer, _ = _make_trainer(tmp_path / "legacy")
+        legacy_run = _run(legacy_trainer)
+        legacy_path = legacy_trainer.save_bundle(
+            legacy_run.booster, legacy_run.result,
+            legacy_run.train_df, legacy_run.test_df,
+            allow_failing=True,
+        )
+        with open(legacy_path, "rb") as f:
+            legacy_manifest = pickle.load(f)["manifest"]
+        assert legacy_manifest["target_kind"] == kinds.legacy
+
+        tb_trainer, _ = _make_trainer(
+            tmp_path / "tb", n=600, use_triple_barrier=True,
+        )
+        tb_run = _run(tb_trainer)
+        tb_path = tb_trainer.save_bundle(
+            tb_run.booster, tb_run.result, tb_run.train_df, tb_run.test_df,
+            allow_failing=True,
+        )
+        with open(tb_path, "rb") as f:
+            tb_manifest = pickle.load(f)["manifest"]
+        assert tb_manifest["target_kind"] == kinds.prod
+
+    def test_target_kind_has_exactly_two_values(self):
+        """The field is two-valued and the two are not the same string --
+        a loader that gates on one of them gates on a real distinction."""
+        kinds = _target_kinds()
+
+        assert isinstance(kinds.prod, str) and kinds.prod
+        assert isinstance(kinds.legacy, str) and kinds.legacy
+        assert kinds.prod != kinds.legacy

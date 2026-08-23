@@ -280,10 +280,20 @@ cp .env.example .env
 python scripts/build_features.py
 
 # Train LightGBM models
-python scripts/train_models.py
+# --model-suffix is required: the unsuffixed filename is reserved for the
+# production triple-barrier bundles (A2-036).
+python scripts/train_models.py \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --features-dir data/features/ml_features \
+    --models-dir data/features/models \
+    --model-suffix _v4
 
 # Optuna hyperparameter tuning
-python scripts/tune_models.py
+python scripts/tune_models.py \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --features-dir data/features/ml_features \
+    --models-dir data/features/models \
+    --model-suffix _v4
 
 # Validate trained models
 python scripts/validate_ml_models.py

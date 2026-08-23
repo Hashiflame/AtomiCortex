@@ -31,6 +31,7 @@ class TrainingPipeline:
         features_dir: Path,
         models_dir: Path,
         regimes: list[str] | None = None,
+        model_suffix: str = "",
     ) -> dict[str, EvaluationResult]:
         """Train one model per regime and evaluate each.
 
@@ -41,9 +42,18 @@ class TrainingPipeline:
         features_dir:
             Path to directory with ``{SYMBOL}_4h_features.parquet`` files.
         models_dir:
-            Path to save trained models (``{regime}_model.pkl``).
+            Path to save trained models
+            (``{regime}_model{model_suffix}.pkl``).
         regimes:
             List of regimes to train, e.g. ``["trend", "range", "high_vol"]``.
+        model_suffix:
+            Filename suffix written between the regime and ``.pkl``.
+            Optional here and mandatory at the CLI (PR-Э1.4, A2-036):
+            this pipeline trains on the legacy ``sign_return`` target, so
+            an unsuffixed run used to hand a 1-bar coin flip the exact
+            filename the live 4H strategy loads. ``save_bundle`` now
+            refuses those two names outright — the suffix is how a
+            caller stays on the right side of that.
 
         Returns
         -------
@@ -66,6 +76,7 @@ class TrainingPipeline:
             config = ModelConfig(
                 regime=regime,
                 symbols=symbols,
+                model_suffix=model_suffix,
             )
 
             trainer = LGBMTrainer(

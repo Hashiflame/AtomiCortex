@@ -11,9 +11,16 @@ Usage
         --features-dir /home/hashiflame/AtomiCortex/data/features/ml_features \
         --models-dir /home/hashiflame/AtomiCortex/data/features/models \
         --regimes trend,range,high_vol \
+        --model-suffix _v4 \
         --n-trials 100 \
         --n-jobs 4 \
         --timeout 3600
+
+``--model-suffix`` is required and has no default (PR-Э1.4, A2-036).
+The retrain step trains on the legacy 1-bar ``sign_return`` target, and
+the unsuffixed filename is the one the live 4H strategy loads;
+``save_bundle`` refuses to write it for anything but a triple-barrier
+model.
 
 Phase 3 — Step 3.7.
 """
@@ -155,6 +162,10 @@ def create_objective(
             confidence_threshold=base_config.confidence_threshold,
             random_state=base_config.random_state,
             lgbm_params=lgbm_defaults,
+            # Inherited rather than defaulted: no trial writes today, but
+            # a config that carries the empty suffix is one save_bundle
+            # away from a production filename (PR-Э1.4, A2-036).
+            model_suffix=base_config.model_suffix,
         )
         trial_trainer = LGBMTrainer(
             config=trial_config,
@@ -268,6 +279,7 @@ class OptunaTrainer:
         symbols: list[str],
         features_dir: Path,
         models_dir: Path,
+        model_suffix: str = "",
     ) -> OptunaResult:
         """Run Optuna for a single regime and return the best result.
 
@@ -283,6 +295,7 @@ class OptunaTrainer:
             regime=regime,
             symbols=symbols,
             threshold_atr_multiplier=FIXED_ATR_THRESHOLD,
+            model_suffix=model_suffix,
         )
         trainer = LGBMTrainer(
             config=config,
@@ -384,6 +397,7 @@ class OptunaTrainer:
         features_dir: Path,
         models_dir: Path,
         regimes: list[str] | None = None,
+        model_suffix: str = "",
     ) -> dict[str, OptunaResult]:
         """Tune each regime sequentially and return a dict of results."""
         if regimes is None:
@@ -400,6 +414,7 @@ class OptunaTrainer:
                     symbols=symbols,
                     features_dir=features_dir,
                     models_dir=models_dir,
+                    model_suffix=model_suffix,
                 )
                 results[regime] = result
             except Exception as exc:
@@ -419,10 +434,16 @@ class OptunaTrainer:
         symbols: list[str],
         features_dir: Path,
         models_dir: Path,
+        model_suffix: str = "",
     ) -> EvaluationResult:
         """Retrain on FULL data (train+val) with the best parameters.
 
-        The final production model is saved to ``models_dir/{regime}_model.pkl``.
+        The model is saved to
+        ``models_dir/{regime}_model{model_suffix}.pkl``.  Not a production
+        artifact: this path trains on the legacy ``sign_return`` target,
+        and since PR-Э1.4 the unsuffixed production names are reserved
+        for triple-barrier models.  Promotion is a separate, deliberate
+        step (``scripts/promote_model.py``).
 
         Parameters
         ----------
@@ -438,6 +459,11 @@ class OptunaTrainer:
             Path to feature parquet files.
         models_dir:
             Path to save the final model.
+        model_suffix:
+            Filename suffix written between the regime and ``.pkl``.
+            Optional here and mandatory at the CLI: an empty suffix names
+            the bundle like a production artifact, which ``save_bundle``
+            now refuses for this target.
 
         Returns
         -------
@@ -463,6 +489,7 @@ class OptunaTrainer:
             symbols=symbols,
             threshold_atr_multiplier=FIXED_ATR_THRESHOLD,
             lgbm_params=lgbm_params,
+            model_suffix=model_suffix,
         )
 
         trainer = LGBMTrainer(
@@ -539,6 +566,18 @@ def _parse_args() -> argparse.Namespace:
         "--regimes",
         default="trend,range,high_vol",
         help="Comma-separated regimes (default: trend,range,high_vol)",
+    )
+    # Required, and deliberately without a default (PR-Э1.4, A2-036).
+    # The retrain below trains on the legacy sign_return target, and an
+    # empty suffix names its output exactly like the bundle the live 4H
+    # strategy loads. A default would put that filename one forgotten
+    # argument away again.
+    p.add_argument(
+        "--model-suffix",
+        required=True,
+        help="Filename suffix written between regime and .pkl (e.g. '_v4'). "
+             "Required: the unsuffixed name is reserved for the production "
+             "triple-barrier bundles and save_bundle refuses it.",
     )
     p.add_argument(
         "--n-trials",
@@ -620,6 +659,7 @@ def main() -> None:
     print(f"  Workers:    {args.n_jobs}")
     print(f"  Timeout:    {args.timeout}s per regime")
     print(f"  Storage:    {args.storage or 'in-memory'}")
+    print(f"  Suffix:     {args.model_suffix}")
     print(f"  ATR thr:    {FIXED_ATR_THRESHOLD} (fixed, not tuned)")
     print(f"{'═' * 60}")
 
@@ -636,6 +676,7 @@ def main() -> None:
         features_dir=args.features_dir,
         models_dir=args.models_dir,
         regimes=regimes,
+        model_suffix=args.model_suffix,
     )
 
     # ── Retrain with best params ──────────────────────────────────────
@@ -649,6 +690,7 @@ def main() -> None:
                 symbols=symbols,
                 features_dir=args.features_dir,
                 models_dir=args.models_dir,
+                model_suffix=args.model_suffix,
             )
             retrain_results[regime] = eval_result
         except Exception as exc:

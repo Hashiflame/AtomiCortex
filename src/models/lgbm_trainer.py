@@ -37,7 +37,11 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 from src.logger import get_logger
 from src.models.dataset_builder import DatasetBuilder
-from src.models.model_paths import bundle_filename
+from src.models.model_paths import (
+    PROD_STEMS_4H,
+    SUFFIX_PROD,
+    bundle_filename,
+)
 from src.models.temporal_split import (
     compute_default_oos_start_ms,
     temporal_split_multi,
@@ -95,7 +99,12 @@ class ModelRejectedError(Exception):
     reason:
         ``"thresholds"`` — failed the go-live gate;
         ``"no_feature_columns"`` — the bundle would be unusable for
-        inference. The latter is not waivable by ``allow_failing``.
+        inference;
+        ``"prod_name_wrong_target"`` — the artifact would take a reserved
+        4H production filename without the triple-barrier target it
+        implies (PR-Э1.4, A2-036). Only ``"thresholds"`` is waivable by
+        ``allow_failing``: the other two describe the artifact, not its
+        quality.
     path:
         The file that was NOT written.
     regime:
@@ -138,6 +147,16 @@ class ModelRejectedError(Exception):
         )
 
 
+# What a model was trained to predict.  Two values, and the manifest field
+# below is the only thing that distinguishes them once training is over:
+# a booster gives no hint of its own label definition.
+#
+# Named because Э1.4 gave the string three consumers in two modules -- the
+# manifest that writes it, and both target gates in the 4H loader -- which
+# is the shape A2-031 grew out of for filenames.
+PROD_TARGET_KIND = "triple_barrier"
+LEGACY_TARGET_KIND = "sign_return"
+
 # Reasons a bundle is refused at load time.  Named constants rather than
 # literals at the raise site: ``_load_models`` is under an AST linter that
 # forbids string constants in that function body, and a code the caller
@@ -146,6 +165,13 @@ LOAD_MISSING = "missing"
 LOAD_NO_ENTRY = "no_registry_entry"
 LOAD_HASH_MISMATCH = "hash_mismatch"
 LOAD_UNREADABLE = "unreadable"
+# Э1.4: the artifact is attested and readable, but was not trained on the
+# target this strategy trades -- or does not say what it was trained on.
+LOAD_WRONG_TARGET = "wrong_target_kind"
+# Э1.4: the bundle and the registry describe different targets.  Distinct
+# from the above because the fix is: there the model is wrong, here the
+# registry is.
+LOAD_MANIFEST_MISMATCH = "manifest_registry_mismatch"
 
 
 class ModelLoadError(RuntimeError):
@@ -169,7 +195,8 @@ class ModelLoadError(RuntimeError):
     ----------
     reason:
         One of ``LOAD_MISSING``, ``LOAD_NO_ENTRY``,
-        ``LOAD_HASH_MISMATCH``, ``LOAD_UNREADABLE``.
+        ``LOAD_HASH_MISMATCH``, ``LOAD_UNREADABLE``,
+        ``LOAD_WRONG_TARGET``, ``LOAD_MANIFEST_MISMATCH``.
     path:
         The file that was NOT loaded — a bundle, or the registry itself
         when the registry is what could not be read.
@@ -885,7 +912,10 @@ class LGBMTrainer:
             and the ``open_time`` data window are read from them.
         filename:
             Override the artifact name (e.g. ``"trend_model_1h.pkl"``).
-            Defaults to ``"{regime}_model{model_suffix}.pkl"``.
+            Defaults to ``"{regime}_model{model_suffix}.pkl"``. Either way
+            the resulting name is what Gate 2 below judges — a production
+            name reached through this override is refused exactly as one
+            reached through an empty suffix.
         allow_failing:
             PR-H escape hatch. False (default) keeps the go-live gate
             armed. True writes a model that failed the thresholds and
@@ -900,11 +930,15 @@ class LGBMTrainer:
         ------
         ModelRejectedError
             ``reason="no_feature_columns"`` when the bundle would carry
-            no feature list, or ``reason="thresholds"`` when the model
-            failed :meth:`EvaluationResult.passes_minimum_thresholds`
-            (or no result was supplied at all). Both checks run before
-            any file is touched, so the bundle already on disk survives
-            a rejected save untouched.
+            no feature list; ``reason="prod_name_wrong_target"`` when the
+            artifact would take one of the reserved 4H production names
+            without having been trained on the triple barrier (PR-Э1.4);
+            or ``reason="thresholds"`` when the model failed
+            :meth:`EvaluationResult.passes_minimum_thresholds` (or no
+            result was supplied at all). All three checks run before any
+            file is touched, so the bundle already on disk survives a
+            rejected save untouched. Only the last is waivable by
+            ``allow_failing``.
         """
         # model_suffix lets v3 retrains coexist with production weights
         # (empty string → legacy "{regime}_model.pkl"; "_v3" → "_v3.pkl").
@@ -939,8 +973,40 @@ class LGBMTrainer:
                 ),
             )
 
-        # --- Gate 2: go-live thresholds (PR-H) ------------------------
-        # Both checks sit above _build_manifest and above the
+        # --- Gate 2: the reserved production names (PR-Э1.4) ----------
+        # A2-036: the 4H strategy opens exactly two files, and its whole
+        # trade geometry assumes the label those files carry. A model
+        # trained on the legacy 1-bar sign(return) target under one of
+        # those names is not a weak model -- it is a different question
+        # answered in the same handwriting, and nothing downstream can
+        # tell. So the names are reserved.
+        #
+        # Keyed on the FINAL filename, not on config.model_suffix: the
+        # 1H and 15m scripts legitimately leave the suffix empty and name
+        # their artifact through ``filename=``, and a config-keyed test
+        # would refuse two paths that never approach a reserved name.
+        #
+        # allow_failing does NOT waive it, for the same reason Gate 1 is
+        # not waivable: this is a statement about which artifact is being
+        # written, not about how well it scored.
+        if not self.config.use_triple_barrier and name in {
+            bundle_filename(stem, SUFFIX_PROD) for stem in PROD_STEMS_4H
+        }:
+            raise ModelRejectedError(
+                reason="prod_name_wrong_target",
+                path=model_path,
+                regime=self.config.regime,
+                result=result,
+                detail=(
+                    f"{name} is reserved for models trained on the triple "
+                    f"barrier; this one targets "
+                    f"{LEGACY_TARGET_KIND} — write it under a suffix "
+                    f"(--model-suffix) and promote it deliberately"
+                ),
+            )
+
+        # --- Gate 3: go-live thresholds (PR-H) ------------------------
+        # All three gates sit above _build_manifest and above the
         # use_native_save branch on purpose: nothing may touch the
         # filesystem before the verdict, or a rejected save would leave
         # an orphan .lgb beside an untouched .pkl.
@@ -1047,7 +1113,7 @@ class LGBMTrainer:
                 "use_triple_barrier": cfg.use_triple_barrier,
             },
             "target_kind": (
-                "triple_barrier" if cfg.use_triple_barrier else "sign_return"
+                PROD_TARGET_KIND if cfg.use_triple_barrier else LEGACY_TARGET_KIND
             ),
             "forward_bars": cfg.forward_bars,
             # The threshold eval actually ran at — NOT any production

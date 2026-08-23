@@ -22,6 +22,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 from src.models import model_paths as mp
 from src.models.model_paths import (
     CANDIDATE_SUBDIR,
@@ -360,3 +362,143 @@ def test_linter_patterns_match_model_paths_module() -> None:
     assert _FILENAME_RE.search(bundle_filename(META_STEM, SUFFIX_V3))
     source = _MODEL_PATHS_MODULE.read_text(encoding="utf-8")
     assert _ROOT_RE.search(source)
+
+
+# ---------------------------------------------------------------------------
+# 5. PR-Э1.4 — the training scripts cannot produce a production name
+# ---------------------------------------------------------------------------
+#
+# A2-036: the two scripts whose output carried a production filename were
+# the two that trained on the legacy target.  Д-1 takes the default away:
+# ``--model-suffix`` is required and has no fallback, so a production name
+# can no longer be reached by leaving an argument out.  These linters keep
+# it that way -- a ``default=`` restored in a later edit would look entirely
+# harmless in a diff.
+
+_SUFFIX_FLAG = "--model-suffix"
+
+# Every file that reaches ``save_bundle`` through ``ModelConfig`` on the 4H
+# line.  ``train_models.py`` builds no ModelConfig of its own today (it goes
+# through TrainingPipeline); it is listed so that the day it does, the
+# keyword is not optional.
+_SUFFIX_AWARE_MODULES = (
+    "scripts/train_models.py",
+    "scripts/tune_models.py",
+    "src/models/training_pipeline.py",
+)
+
+_SUFFIX_CLI_SCRIPTS = ("scripts/train_models.py", "scripts/tune_models.py")
+
+
+def _calls_to(rel_path: str, *, attr: str | None = None, name: str | None = None):
+    """Every ``ast.Call`` in the module addressed to ``attr``/``name``.
+
+    Parsed rather than grepped for the reason the linters above are:
+    reformatting an argument list must not change the answer.
+    """
+    tree = ast.parse((_REPO_ROOT / rel_path).read_text(encoding="utf-8"))
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if attr is not None and isinstance(func, ast.Attribute) and func.attr == attr:
+            out.append(node)
+        elif name is not None and isinstance(func, ast.Name) and func.id == name:
+            out.append(node)
+    return out
+
+
+def _model_suffix_arguments(rel_path: str):
+    """The ``add_argument`` call(s) declaring ``--model-suffix``."""
+    return [
+        node
+        for node in _calls_to(rel_path, attr="add_argument")
+        if node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == _SUFFIX_FLAG
+    ]
+
+
+@pytest.mark.parametrize("rel_path", _SUFFIX_CLI_SCRIPTS)
+def test_train_scripts_require_model_suffix(rel_path: str) -> None:
+    """The flag exists and is mandatory."""
+    declarations = _model_suffix_arguments(rel_path)
+    assert len(declarations) == 1, (
+        f"{rel_path}: expected exactly one {_SUFFIX_FLAG} declaration, "
+        f"found {len(declarations)}"
+    )
+
+    required = [
+        kw for kw in declarations[0].keywords
+        if kw.arg == "required"
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value is True
+    ]
+    assert required, (
+        f"{rel_path}: {_SUFFIX_FLAG} must be required=True — an optional "
+        "suffix is a production filename one forgotten argument away"
+    )
+
+
+@pytest.mark.parametrize("rel_path", _SUFFIX_CLI_SCRIPTS)
+def test_model_suffix_has_no_default(rel_path: str) -> None:
+    """No ``default=`` at all, not even an empty string.
+
+    ``required=True`` and ``default=""`` together are not a contradiction
+    argparse would catch, and the default is what a later reader would
+    trust.
+    """
+    declarations = _model_suffix_arguments(rel_path)
+    assert declarations, f"{rel_path}: no {_SUFFIX_FLAG} declaration"
+
+    defaults = [kw for kw in declarations[0].keywords if kw.arg == "default"]
+    assert not defaults, (
+        f"{rel_path}: {_SUFFIX_FLAG} carries a default at line "
+        f"{defaults[0].value.lineno} — the flag exists to make the name a "
+        "decision, and a default un-makes it"
+    )
+
+
+@pytest.mark.parametrize("rel_path", _SUFFIX_AWARE_MODULES)
+def test_model_config_calls_carry_model_suffix(rel_path: str) -> None:
+    """Every ``ModelConfig`` built here names the suffix explicitly.
+
+    Including the two in ``tune_models.py`` that never reach the disk: the
+    linter forbids the file the *ability* to produce a production name, and
+    a config that inherits the empty default has that ability the moment
+    someone adds a ``save_bundle`` beside it.
+    """
+    calls = _calls_to(rel_path, name="ModelConfig")
+    without = [
+        node.lineno
+        for node in calls
+        if not any(kw.arg == "model_suffix" for kw in node.keywords)
+    ]
+    assert not without, (
+        f"{rel_path}: ModelConfig at line(s) {without} does not pass "
+        "model_suffix — it would inherit the empty default and name its "
+        "bundle like a production artifact"
+    )
+
+
+def test_training_pipeline_run_accepts_optional_model_suffix() -> None:
+    """``run`` takes the suffix, and takes it optionally.
+
+    Optional because the two existing test call sites and any future
+    library caller pass four keywords; required only at the CLI, which is
+    where the operator actually chooses a name.
+    """
+    import inspect
+
+    from src.models.training_pipeline import TrainingPipeline
+
+    parameters = inspect.signature(TrainingPipeline.run).parameters
+    assert "model_suffix" in parameters, (
+        "TrainingPipeline.run does not accept model_suffix — train_models.py "
+        "has nowhere to pass it"
+    )
+
+    suffix = parameters["model_suffix"]
+    assert suffix.default == "", suffix.default
+    assert list(parameters).index("model_suffix") > list(parameters).index("regimes")

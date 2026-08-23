@@ -429,3 +429,137 @@ class TestPipelineOnRejection:
         rejected = [m for m in loguru_warnings if "rejected" in m.lower()]
         assert len(rejected) == 1
         assert "Training failed" not in rejected[0]
+
+
+# ===========================================================================
+# 7. PR-Э1.4 — the two production names are reserved for triple_barrier
+# ===========================================================================
+#
+# A2-036: ``train_models.py`` and ``tune_models.py`` wrote ``sign_return``
+# models straight to ``trend_model.pkl`` / ``high_vol_model.pkl`` -- the two
+# files the 4H loader reads.  The reservation is expressed here rather than
+# in the scripts because it is the artifact that is illegal, not the caller:
+# whoever computes that name, with that target, is refused.
+#
+# Keyed on the FINAL filename, never on ``config.model_suffix``: the 1H and
+# 15m scripts legitimately leave the suffix empty and take their name from
+# ``filename=``, so a config-keyed predicate would refuse two production
+# paths that never approach a reserved name (test_filename_override_... below).
+
+
+def _prod_reserved_names() -> list[str]:
+    """The names the 4H loader opens, built through the one primitive."""
+    from src.models.model_paths import PROD_STEMS_4H, SUFFIX_PROD, bundle_filename
+
+    return [bundle_filename(stem, SUFFIX_PROD) for stem in PROD_STEMS_4H]
+
+
+def _trained_config(
+    base: Path, *, n: int = 300, **config_kwargs,
+) -> SimpleNamespace:
+    """A trainer that has run train(), over an arbitrary ModelConfig.
+
+    ``_trained`` above is fixed to the default config; the reservation
+    turns on ``use_triple_barrier`` and on the regime, so this section
+    needs both to be free.
+    """
+    features_dir = _save_features(base, n=n)
+    models_dir = base / "models"
+    config = ModelConfig(symbols=["BTCUSDT"], **config_kwargs)
+    trainer = LGBMTrainer(
+        config=config, features_dir=features_dir, models_dir=models_dir,
+    )
+    train_df, test_df = trainer.prepare_data()
+    booster = trainer.train(train_df)
+    return SimpleNamespace(
+        trainer=trainer,
+        models_dir=models_dir,
+        booster=booster,
+        train_df=train_df,
+        test_df=test_df,
+    )
+
+
+class TestProdNameReservation:
+
+    @pytest.mark.parametrize("stem", ["trend", "high_vol"])
+    def test_prod_name_on_sign_return_rejected(self, tmp_path: Path, stem: str):
+        """The defect itself: a 1-bar sign(return) model under the name the
+        live 4H strategy loads."""
+        run = _trained_config(tmp_path, regime=stem)
+
+        with pytest.raises(_gate_error()) as excinfo:
+            run.trainer.save_bundle(
+                run.booster, _passing_result(stem),
+                run.train_df, run.test_df,
+            )
+
+        exc = excinfo.value
+        assert exc.reason == "prod_name_wrong_target"
+        assert exc.path == run.models_dir / f"{stem}_model.pkl"
+        assert list(run.models_dir.glob("*")) == []
+
+    def test_allow_failing_does_not_waive_prod_reservation(self, tmp_path: Path):
+        """Like the empty-feature-columns gate, this is a statement about
+        the artifact, not about its metrics -- the research escape hatch
+        has nothing to say about it."""
+        run = _trained_config(tmp_path, regime="trend")
+
+        with pytest.raises(_gate_error()) as excinfo:
+            run.trainer.save_bundle(
+                run.booster, _passing_result("trend"),
+                run.train_df, run.test_df,
+                allow_failing=True,
+            )
+
+        assert excinfo.value.reason == "prod_name_wrong_target"
+        assert list(run.models_dir.glob("*")) == []
+
+    def test_prod_name_on_triple_barrier_written(self, tmp_path: Path):
+        """Positive control: the reservation reserves, it does not forbid.
+
+        Keyed on the name, so the name is what this test supplies -- a
+        triple-barrier model is entitled to it.
+        """
+        run = _trained_config(tmp_path, n=600, regime="all", use_triple_barrier=True)
+
+        path = run.trainer.save_bundle(
+            run.booster, _passing_result(), run.train_df, run.test_df,
+            filename=_prod_reserved_names()[0],
+        )
+
+        assert path.name == _prod_reserved_names()[0]
+        assert path.exists()
+
+    def test_suffixed_name_on_sign_return_written(self, tmp_path: Path):
+        """What the scripts do after Д-1: same model, a name nothing loads."""
+        run = _trained_config(tmp_path, regime="trend", model_suffix="_v4")
+
+        path = run.trainer.save_bundle(
+            run.booster, _passing_result("trend"), run.train_df, run.test_df,
+        )
+
+        assert path.name == "trend_model_v4.pkl"
+        assert path.exists()
+        assert not (run.models_dir / "trend_model.pkl").exists()
+
+    def test_filename_override_is_not_reserved(self, tmp_path: Path):
+        """Regression against the config-keyed predicate that was rejected.
+
+        ``train_1h_models.py`` and ``train_15m_models.py`` build their
+        ModelConfig with an empty ``model_suffix`` and a ``sign_return``
+        target, then name the artifact through ``filename=``.  A gate
+        reading ``config.model_suffix`` would refuse both of them for a
+        name neither one ever produces.
+        """
+        from src.models.model_paths import SUFFIX_1H, bundle_filename
+
+        run = _trained_config(tmp_path, regime="trend")
+
+        path = run.trainer.save_bundle(
+            run.booster, _passing_result("trend"), run.train_df, run.test_df,
+            filename=bundle_filename("trend", SUFFIX_1H),
+        )
+
+        assert path.name == "trend_model_1h.pkl"
+        assert path.exists()
