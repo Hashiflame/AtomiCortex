@@ -1,0 +1,69 @@
+{
+  "models": {
+    "high_vol": {
+      "barriers": {
+        "max_holding": 4,
+        "pt": 1.25,
+        "sl": 1.0,
+        "use_triple_barrier": true
+      },
+      "best_iteration": 145,
+      "eval": {
+        "accuracy": 58.72,
+        "avg_confidence": 0.6573,
+        "profit_factor": 1.404,
+        "signal_rate": 0.7733,
+        "win_rate": 60.15
+      },
+      "feature_columns_hash": "3429c552be803bcd5c52ef747c01e6cf1dbe65285d55257c71586b1c6db9b036",
+      "interval": "4h",
+      "manifest_schema_version": 1,
+      "n_features": 46,
+      "num_trees": 145,
+      "passes": true,
+      "path": "models/prod/high_vol_model.pkl",
+      "promoted_at_utc": "2026-08-23T14:35:58.944796+00:00",
+      "promoted_from": "data/features/models/v3/high_vol_model_v3.pkl",
+      "regime": "high_vol",
+      "sha256": "657dbdaa7488173b594850e92d24adbac2b9794eae67ee0154e6f5736ec41dac",
+      "size_bytes": 172614,
+      "target_kind": "triple_barrier",
+      "trained_at_utc": "2026-08-14T17:09:41.788808+00:00",
+      "trained_git_commit": "e67a451",
+      "written_despite_failing": false
+    },
+    "trend": {
+      "barriers": {
+        "max_holding": 6,
+        "pt": 1.0,
+        "sl": 0.8,
+        "use_triple_barrier": true
+      },
+      "best_iteration": 196,
+      "eval": {
+        "accuracy": 53.85,
+        "avg_confidence": 0.6132,
+        "profit_factor": 1.3249,
+        "signal_rate": 0.629,
+        "win_rate": 54.83
+      },
+      "feature_columns_hash": "3429c552be803bcd5c52ef747c01e6cf1dbe65285d55257c71586b1c6db9b036",
+      "interval": "4h",
+      "manifest_schema_version": 1,
+      "n_features": 46,
+      "num_trees": 196,
+      "passes": true,
+      "path": "models/prod/trend_model.pkl",
+      "promoted_at_utc": "2026-08-23T14:35:58.944796+00:00",
+      "promoted_from": "data/features/models/v3/trend_model_v3.pkl",
+      "regime": "trend",
+      "sha256": "df72a65afedd5a4341a1662121e848836cd0768005d1f9135c60b434b11b1b96",
+      "size_bytes": 363142,
+      "target_kind": "triple_barrier",
+      "trained_at_utc": "2026-08-14T17:09:29.289016+00:00",
+      "trained_git_commit": "e67a451",
+      "written_despite_failing": false
+    }
+  },
+  "schema_version": 1
+}

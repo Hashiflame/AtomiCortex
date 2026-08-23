@@ -31,6 +31,7 @@ from src.models.model_paths import (
     MODELS_ROOT_4H,
     MODELS_ROOT_15M,
     PROD_STEMS_4H,
+    REGISTRY_PATH,
     STEMS_1H,
     STEMS_15M,
     SUFFIX_1H,
@@ -269,6 +270,7 @@ def test_roots_are_relative_paths() -> None:
         "CANDIDATES_ROOT_4H",
         "MODELS_ROOT_1H",
         "MODELS_ROOT_15M",
+        "REGISTRY_PATH",
     ):
         root = getattr(mp, name)
         assert isinstance(root, Path), name
@@ -286,6 +288,31 @@ def test_prod_and_candidates_roots_are_distinct_symbols() -> None:
     assert isinstance(vars(mp).get("MODELS_ROOT_4H"), Path)
     assert isinstance(vars(mp).get("CANDIDATES_ROOT_4H"), Path)
     assert MODELS_ROOT_4H is not None and CANDIDATES_ROOT_4H is not None
+
+
+def test_prod_root_is_models_prod() -> None:
+    """Э1.2: production bundles live in a git-tracked root of their own.
+
+    Literal on purpose, for the same reason as the meta path below: this
+    string is what ``.gitignore`` negates and what the systemd unit's
+    ``WorkingDirectory=`` resolves against, so the two cannot be kept in
+    step by a constant alone.
+    """
+    assert str(MODELS_ROOT_4H) == "models/prod"
+    assert MODELS_ROOT_4H != CANDIDATES_ROOT_4H, (
+        "the production root and the candidate root have gone back to being "
+        "the same directory — promotion would be a no-op"
+    )
+
+
+def test_registry_path_is_under_deploy() -> None:
+    """The registry is a deployment artifact, not a data file.
+
+    Literal for the same reason as above: ``tests/test_model_registry.py``
+    and any future reader have to agree on where it is, and a rename that
+    only moves the constant would silently orphan the committed file.
+    """
+    assert str(REGISTRY_PATH) == "deploy/model_registry.json"
 
 
 # ---------------------------------------------------------------------------

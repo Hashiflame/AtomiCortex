@@ -65,9 +65,11 @@ SUFFIX_15M = "_15m"
 # Roots
 # ---------------------------------------------------------------------------
 
-# Э1.2 moves this one to models/prod (tracked in git); CANDIDATES_ROOT_4H
-# below stays where it is, which is why they are two names and not one.
-MODELS_ROOT_4H = Path("data/features/models")
+# Tracked in git, unlike everything under data/: this is the artifact the VM
+# pulls, so the bundle the bot loads is pinned by the same commit as the code
+# that loads it. CANDIDATES_ROOT_4H below stays under data/, which is why
+# these are two names and not one.
+MODELS_ROOT_4H = Path("models/prod")
 
 # Where retrain_v3.py writes and where the meta artifacts live. Untracked.
 CANDIDATES_ROOT_4H = Path("data/features/models")
@@ -78,6 +80,13 @@ MODELS_ROOT_15M = Path("data/models/15m")
 # "candidate", not "v3": the subdirectory means "trained but not promoted",
 # which outlives the name of any particular model line.
 CANDIDATE_SUBDIR = "v3"
+
+
+# What describes the promoted bundles: one entry per stem, carrying the
+# hash and the provenance of the file actually on disk. Tracked next to the
+# systemd units rather than beside the bundles, so a diff of the deployment
+# shows the model change as text.
+REGISTRY_PATH = Path("deploy/model_registry.json")
 
 
 # ---------------------------------------------------------------------------

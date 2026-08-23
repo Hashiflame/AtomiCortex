@@ -24,6 +24,10 @@ logs/
 
 # ML модели
 *.pkl
+# ...except the promoted production bundles: they are the artifact the
+# VM pulls, and models/ is not an ignored directory, so this negation
+# actually takes effect (one inside data/ would not).
+!models/prod/*.pkl
 *.joblib
 *.model
 mlruns/
