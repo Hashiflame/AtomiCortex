@@ -47,6 +47,7 @@ from src.models.lgbm_trainer import (
     EvaluationResult,
 )
 from src.models.ml_validator import MLValidator, WalkForwardMLResult, WindowMLResult
+from src.models.model_paths import MODELS_ROOT_1H, path_1h
 from src.models.statistical_tests import (
     StatTestResult,
     calculate_dsr,
@@ -239,7 +240,7 @@ def _run_purged_kfold(
             trainer = LGBMTrainer(
                 config=config,
                 features_dir=Path("."),
-                models_dir=Path("data/models/1h"),
+                models_dir=MODELS_ROOT_1H,
                 use_mtf_params=True,  # DSR/PBO on production reg. params
             )
             model = trainer.train(train_df)
@@ -312,7 +313,7 @@ def _run_walk_forward(
             trainer = LGBMTrainer(
                 config=config,
                 features_dir=Path("."),
-                models_dir=Path("data/models/1h"),
+                models_dir=MODELS_ROOT_1H,
                 use_mtf_params=True,  # DSR/PBO on production reg. params
             )
             model = trainer.train(train_df)
@@ -697,7 +698,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--models-dir",
-        default="data/models/1h",
+        default=str(MODELS_ROOT_1H),
         type=Path,
         help="Directory with trained models",
     )
@@ -774,7 +775,7 @@ def main() -> None:
         print(f"  Validating: {regime}")
         print(f"{'─'*60}")
 
-        model_path = models_dir / f"{regime}_model_1h.pkl"
+        model_path = path_1h(models_dir, regime)
         dataset_path = dataset_base / f"dataset_{regime}.parquet"
 
         result = validate_model(

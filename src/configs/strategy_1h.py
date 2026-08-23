@@ -5,6 +5,8 @@ All parameters tuned for 1H timeframe specifics.
 from dataclasses import dataclass, field
 from typing import List
 
+from src.models.model_paths import MODELS_ROOT_1H, path_1h
+
 
 @dataclass
 class MLStrategyConfig1H:
@@ -74,5 +76,5 @@ class MLStrategyConfig1H:
     heartbeat_key: str = "bot_1h_heartbeat"
 
     # Model paths
-    trend_model_path: str = "data/models/1h/trend_model_1h.pkl"
-    high_vol_model_path: str = "data/models/1h/high_vol_model_1h.pkl"
+    trend_model_path: str = str(path_1h(MODELS_ROOT_1H, "trend"))
+    high_vol_model_path: str = str(path_1h(MODELS_ROOT_1H, "high_vol"))

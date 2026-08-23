@@ -35,6 +35,7 @@ if str(_ROOT) not in sys.path:
 from src.configs.strategy_1h import MLStrategyConfig1H
 from src.logger import get_logger, setup_logging
 from src.models.lgbm_trainer import LGBMTrainer, ModelConfig, EvaluationResult
+from src.models.model_paths import MODELS_ROOT_1H, SUFFIX_1H, bundle_filename
 from src.models.ml_validator import MLValidator, WalkForwardMLResult
 from src.models.temporal_split import (
     compute_default_oos_start_ms,
@@ -145,7 +146,7 @@ def train_regime_model(
         # "{regime}_model.pkl" to rename away.
         new_path = trainer.save_bundle(
             model, result, train_df, test_df,
-            filename=f"{regime}_model_1h.pkl",
+            filename=bundle_filename(regime, SUFFIX_1H),
         )
         _log.info(f"  Model saved: {new_path}")
 
@@ -344,7 +345,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--models-dir",
-        default="data/models/1h",
+        default=str(MODELS_ROOT_1H),
         type=Path,
         help="Directory to save trained models",
     )

@@ -41,6 +41,11 @@ if str(_ROOT) not in sys.path:
 from src.logger import get_logger, setup_logging
 from src.models.dataset_builder import DatasetBuilder
 from src.models.lgbm_trainer import EvaluationResult, LGBMTrainer, ModelConfig
+from src.models.model_paths import (
+    CANDIDATES_ROOT_4H,
+    SUFFIX_V3,
+    bundle_filename,
+)
 from src.models.statistical_tests import calculate_dsr
 
 _log = get_logger(__name__)
@@ -304,7 +309,10 @@ def run_grid(
               f"DSR={dsr:.3f} (n_trials={len(proxies)})")
 
         # Refit best config and save to v3 dir under the canonical name.
-        print(f"  ► Refit + save → {v3_dir}/{regime}_model_v3.pkl")
+        print(
+            f"  ► Refit + save → "
+            f"{v3_dir}/{bundle_filename(regime, SUFFIX_V3)}"
+        )
         winner = LGBMTrainer(
             config=_build_config(regime, symbols, **{
                 "pt": best["cell"]["pt"],
@@ -362,7 +370,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--features-dir", type=Path,
                    default=Path("data/features/ml_features"))
     p.add_argument("--models-dir", type=Path,
-                   default=Path("data/features/models"))
+                   default=CANDIDATES_ROOT_4H)
     p.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     p.add_argument("--regimes", default=",".join(DEFAULT_REGIMES))
     p.add_argument("--dry-run", action="store_true",

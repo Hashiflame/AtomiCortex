@@ -45,22 +45,29 @@ if str(_ROOT) not in sys.path:
 from src.logger import get_logger, setup_logging
 from src.models.dataset_builder import DatasetBuilder
 from src.models.lgbm_trainer import SYMBOL_ENCODING
+from src.models.model_paths import (
+    CANDIDATES_ROOT_4H,
+    SUFFIX_V3,
+    SUFFIX_V3_SELECTED,
+    bundle_filename,
+    candidate_dir,
+)
 
 _log = get_logger(__name__)
 
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 DEFAULT_FEATURES_DIR = Path("data/features/ml_features")
-DEFAULT_MODELS_DIR = Path("data/features/models/v3")
+DEFAULT_MODELS_DIR = candidate_dir(CANDIDATES_ROOT_4H)
 
 # Per-regime base-model config — must match Block-2/Block-3 winners.
 REGIME_BASE: dict[str, dict[str, Any]] = {
     "trend": {
-        "model_path": "trend_model_v3_sel.pkl",
+        "model_path": bundle_filename("trend", SUFFIX_V3_SELECTED),
         "regime_values": ["trend_up", "trend_down"],
         "barrier": {"pt": 1.25, "sl": 1.0, "hold": 4},
     },
     "high_vol": {
-        "model_path": "high_vol_model_v3.pkl",
+        "model_path": bundle_filename("high_vol", SUFFIX_V3),
         "regime_values": ["high_vol"],
         "barrier": {"pt": 1.25, "sl": 1.0, "hold": 6},
     },

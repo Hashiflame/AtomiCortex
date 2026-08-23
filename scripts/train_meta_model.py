@@ -42,11 +42,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.logger import get_logger, setup_logging
+from src.models.model_paths import (
+    CANDIDATES_ROOT_4H,
+    META_STEM,
+    SUFFIX_V3,
+    bundle_filename,
+    candidate_dir,
+)
 
 _log = get_logger(__name__)
 
-DEFAULT_DATASET = Path("data/features/models/v3/meta_dataset.parquet")
-DEFAULT_MODELS_DIR = Path("data/features/models/v3")
+DEFAULT_DATASET = candidate_dir(CANDIDATES_ROOT_4H) / "meta_dataset.parquet"
+DEFAULT_MODELS_DIR = candidate_dir(CANDIDATES_ROOT_4H)
 
 META_LGBM_PARAMS: dict[str, Any] = {
     "objective": "binary",
@@ -253,7 +260,7 @@ def train(
         "cost_bps": cost_bps,
         "lgbm_params": META_LGBM_PARAMS,
     }
-    out_path = models_dir / "meta_model_v3.pkl"
+    out_path = models_dir / bundle_filename(META_STEM, SUFFIX_V3)
     with open(out_path, "wb") as f:
         pickle.dump(bundle, f)
     _log.info(f"Saved meta model: {out_path}")

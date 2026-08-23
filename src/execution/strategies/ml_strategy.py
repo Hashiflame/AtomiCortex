@@ -40,6 +40,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 from src.features.live_feature_state import bar_open_time_ms
 from src.logger import get_logger
+from src.models.model_paths import MODELS_ROOT_4H, PROD_STEMS_4H, prod_path
 from src.risk.risk_engine import (
     PortfolioState,
     RiskConfig,
@@ -102,7 +103,7 @@ class MLStrategyConfig(StrategyConfig, frozen=True):
     bar_type: str = "BTCUSDT-PERP.BINANCE-4-HOUR-LAST-EXTERNAL"
     interval: str = "4h"
     confidence_threshold: float = 0.55
-    models_dir: str = "./data/features/models"
+    models_dir: str = str(MODELS_ROOT_4H)
     features_dir: str = "./data/features/ml_features"
     risk_per_trade: float = 0.01
     max_leverage: int = 10
@@ -1717,13 +1718,16 @@ class MLTradingStrategy(Strategy):
         """Load LightGBM model bundles (legacy pickle OR H13 sidecar)."""
         from src.models.lgbm_trainer import LGBMTrainer
         models_dir = Path(self._config.models_dir)
-        for regime in ["trend", "high_vol"]:
-            path = models_dir / f"{regime}_model.pkl"
+        # PROD_STEMS_4H is pinned to exactly two stems; unpacking names
+        # the first so the dispatch below carries no literal either.
+        trend_stem, _ = PROD_STEMS_4H
+        for regime in PROD_STEMS_4H:
+            path = prod_path(models_dir, regime)
             if path.exists():
                 bundle = LGBMTrainer.load_model_bundle(path)
                 booster = bundle["booster"]
                 features = bundle.get("feature_columns", [])
-                if regime == "trend":
+                if regime == trend_stem:
                     self._trend_model = booster
                     self._trend_features = features
                 else:

@@ -48,3 +48,7 @@ backtests/
 .claude/
 # Local snapshots (DB, models, .env) — never in git
 backups/
+
+# Рабочие файлы сессий (артефакты ревью, выгрузки) — чистятся вручную
+tmp/*
+!tmp/.gitkeep

@@ -61,6 +61,7 @@ from src.execution.strategies.ml_strategy import (
 )
 from src.features.live_feature_state import bar_open_time_ms
 from src.logger import get_logger
+from src.models.model_paths import MODELS_ROOT_15M, path_15m
 from src.risk.risk_engine import TradeSignal
 
 _log = get_logger(__name__)
@@ -90,8 +91,8 @@ class MLStrategy15MConfig(MLStrategyConfig, frozen=True):
     signal_db_path: str = "data/atomicortex_15m.db"
     heartbeat_key: str = "bot_15m_heartbeat"
     # Models (two types)
-    trend_model_path: str = "data/models/15m/trend_model_15m.pkl"
-    orb_model_path: str = "data/models/15m/orb_model_15m.pkl"
+    trend_model_path: str = str(path_15m(MODELS_ROOT_15M, "trend"))
+    orb_model_path: str = str(path_15m(MODELS_ROOT_15M, "orb"))
     # 15m valid trend regimes (RegimeDetector15M output, lowercase)
     trend_regimes: tuple[str, ...] = ("trend_up", "trend_down")
 

@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 
 from src.logger import get_logger
+from src.models.model_paths import CANDIDATES_ROOT_4H, meta_path
 from src.execution.strategies.ml_strategy import (
     MLStrategyConfig,
     MLTradingStrategy,
@@ -180,7 +181,7 @@ class MetaSignalGate:
 class MetaMLStrategyConfig(MLStrategyConfig, frozen=True):
     """Extends MLStrategyConfig with meta-gate parameters."""
 
-    meta_model_path: str = "./data/features/models/v3/meta_model_v3.pkl"
+    meta_model_path: str = str(meta_path(CANDIDATES_ROOT_4H))
     meta_threshold: float = 0.60
     meta_min_size: float = 0.25  # never trade below 25% of base risk
     # Disable meta gate at runtime (lets the same class run as plain

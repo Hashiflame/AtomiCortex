@@ -48,12 +48,18 @@ if str(_ROOT) not in sys.path:
 from src.logger import get_logger, setup_logging
 from src.models.dataset_builder import DatasetBuilder
 from src.models.lgbm_trainer import LABEL_TO_CLASS, SYMBOL_ENCODING
+from src.models.model_paths import (
+    CANDIDATES_ROOT_4H,
+    SUFFIX_V3,
+    bundle_filename,
+    candidate_dir,
+)
 
 _log = get_logger(__name__)
 
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 DEFAULT_FEATURES_DIR = Path("data/features/ml_features")
-DEFAULT_MODELS_DIR = Path("data/features/models/v3")
+DEFAULT_MODELS_DIR = candidate_dir(CANDIDATES_ROOT_4H)
 
 # Pre-vetoed drops (from baseline trend_model_v3 inspection):
 #   - 6 zero-MDI features
@@ -243,7 +249,7 @@ def select_for_regime(
     )
 
     # Load v3 booster — defines the feature order for X.
-    bundle_path = models_dir / f"{regime}_model_v3.pkl"
+    bundle_path = models_dir / bundle_filename(regime, SUFFIX_V3)
     with open(bundle_path, "rb") as f:
         bundle = pickle.load(f)
     booster = bundle["booster"]

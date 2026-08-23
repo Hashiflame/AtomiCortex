@@ -34,6 +34,7 @@ import src.patches.nautilus_enums  # Hotfix for TRADING_HALT
 from src.config import get_settings
 from src.execution.live_trader import LiveTrader, LiveTraderConfig
 from src.logger import setup_logging, get_logger
+from src.models.model_paths import MODELS_ROOT_4H
 
 # Exit code for a refusal no restart can fix — EX_CONFIG from sysexits.h.
 # Mirrored by RestartPreventExitStatus= in deploy/atomicortex-bot.service so
@@ -85,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--models-dir",
-        default="./data/features/models",
+        default=str(MODELS_ROOT_4H),
         help="Path to trained model directory",
     )
     return parser.parse_args()

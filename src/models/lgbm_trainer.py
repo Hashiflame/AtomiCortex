@@ -37,6 +37,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 from src.logger import get_logger
 from src.models.dataset_builder import DatasetBuilder
+from src.models.model_paths import bundle_filename
 from src.models.temporal_split import (
     compute_default_oos_start_ms,
     temporal_split_multi,
@@ -847,8 +848,8 @@ class LGBMTrainer:
         """
         # model_suffix lets v3 retrains coexist with production weights
         # (empty string → legacy "{regime}_model.pkl"; "_v3" → "_v3.pkl").
-        name = filename or (
-            f"{self.config.regime}_model{self.config.model_suffix}.pkl"
+        name = filename or bundle_filename(
+            self.config.regime, self.config.model_suffix
         )
         model_path = self.models_dir / name
 

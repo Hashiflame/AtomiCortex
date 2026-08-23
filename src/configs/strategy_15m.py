@@ -14,6 +14,8 @@ Key differences from 1H:
 from dataclasses import dataclass, field
 from typing import List
 
+from src.models.model_paths import MODELS_ROOT_15M, path_15m
+
 
 @dataclass
 class MLStrategyConfig15M:
@@ -86,5 +88,5 @@ class MLStrategyConfig15M:
     heartbeat_key: str = "bot_15m_heartbeat"
 
     # Model paths — two model types
-    trend_model_path: str = "data/models/15m/trend_model_15m.pkl"
-    orb_model_path: str = "data/models/15m/orb_model_15m.pkl"
+    trend_model_path: str = str(path_15m(MODELS_ROOT_15M, "trend"))
+    orb_model_path: str = str(path_15m(MODELS_ROOT_15M, "orb"))

@@ -38,6 +38,7 @@ from src.config import get_settings
 from src.execution.startup_check import EngineConnectionChecker
 from src.execution.strategies.ml_strategy import MLStrategyConfig, MLTradingStrategy
 from src.logger import get_logger, setup_logging
+from src.models.model_paths import MODELS_ROOT_4H
 
 _log = get_logger(__name__)
 
@@ -74,7 +75,7 @@ class LiveTraderConfig:
     risk_per_trade: float = 0.01
     max_leverage: int = 10
     max_open_positions: int = 3
-    models_dir: str = "./data/features/models"
+    models_dir: str = str(MODELS_ROOT_4H)
     features_dir: str = "./data/features/ml_features"
 
     # Fail-fast grace period (seconds).  None → read from Settings
